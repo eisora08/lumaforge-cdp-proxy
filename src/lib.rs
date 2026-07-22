@@ -3,8 +3,8 @@ mod discovery;
 mod hook;
 
 use std::ffi::c_void;
-use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
-use windows_sys::Win32::System::Threading::CreateThread;
+use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
@@ -18,14 +18,35 @@ unsafe extern "system" fn DllMain(
 ) -> i32 {
     match fdw_reason {
         DLL_PROCESS_ATTACH => {
-            CreateThread(
-                std::ptr::null(),
-                0,
-                Some(proxy_thread),
+            let pid = GetCurrentProcessId();
+
+            let mut exe_buf = [0u16; 260];
+            let mut exe_len = GetModuleFileNameW(
                 std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
+                exe_buf.as_mut_ptr(),
+                exe_buf.len() as u32,
             );
+            if exe_len > 0 {
+                exe_len = exe_len.min(259);
+            }
+            let exe_path = String::from_utf16_lossy(&exe_buf[..exe_len as usize]);
+
+            log_to_temp(&format!(
+                "[steamcdp] DLL loaded in PID {} exe=\"{}\"",
+                pid, exe_path
+            ));
+
+            match hook::install_hook() {
+                Ok(()) => {
+                    log_to_temp(&format!(
+                        "[steamcdp] Hooks installed synchronously in PID {}",
+                        pid
+                    ));
+                }
+                Err(e) => {
+                    log_to_temp(&format!("[steamcdp] Failed to install hooks: {}", e));
+                }
+            }
         }
         DLL_PROCESS_DETACH => {}
         _ => {}
@@ -33,31 +54,10 @@ unsafe extern "system" fn DllMain(
     1
 }
 
-unsafe extern "system" fn proxy_thread(_param: *mut c_void) -> u32 {
-    let port = discovery::resolve_debug_port();
-    let _ = hook::DEBUG_PORT.set(port);
-    discovery::publish_port(port);
-
-    match hook::install_hook() {
-        Ok(()) => {
-            log_to_temp(&format!(
-                "[steamcdp] CreateProcessW hook installed, CDP port: {}",
-                port
-            ));
-        }
-        Err(e) => {
-            log_to_temp(&format!("[steamcdp] Failed to install hook: {}", e));
-        }
-    }
-
-    // TODO: Initialize CDP connection (cdp.rs)
-
-    0
-}
-
 pub(crate) fn log_to_temp(msg: &str) {
     use std::fs::OpenOptions;
     use std::io::Write;
+    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
 
     unsafe {
         let mut buf = [0u16; 260];

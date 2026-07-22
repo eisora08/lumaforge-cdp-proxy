@@ -52,6 +52,7 @@ logs/
 *.backup
 *.old
 *.orig
+*.txt
 
 deploy/
 artifacts/
