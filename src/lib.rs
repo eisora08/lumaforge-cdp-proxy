@@ -3,11 +3,60 @@ mod discovery;
 mod hook;
 
 use std::ffi::c_void;
+use std::mem;
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+    TH32CS_SNAPPROCESS, PROCESSENTRY32W,
+};
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
+
+// Función para terminar procesos steamwebhelper.exe existentes
+unsafe fn kill_existing_webhelpers() {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot == INVALID_HANDLE_VALUE {
+        log_to_temp("[steamcdp] Failed to create process snapshot");
+        return;
+    }
+
+    let mut entry: PROCESSENTRY32W = mem::zeroed();
+    entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    if Process32FirstW(snapshot, &mut entry) == 0 {
+        CloseHandle(snapshot);
+        return;
+    }
+
+    let mut killed_count = 0;
+    loop {
+        let name = String::from_utf16_lossy(&entry.szExeFile);
+        if name.to_lowercase().contains("steamwebhelper.exe") {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
+            if !handle.is_null() {
+                if TerminateProcess(handle, 0) != 0 {
+                    killed_count += 1;
+                }
+                CloseHandle(handle);
+            }
+        }
+        if Process32NextW(snapshot, &mut entry) == 0 {
+            break;
+        }
+    }
+    CloseHandle(snapshot);
+
+    if killed_count > 0 {
+        log_to_temp(&format!(
+            "[steamcdp] Terminated {} existing steamwebhelper processes",
+            killed_count
+        ));
+    }
+}
 
 #[no_mangle]
 #[allow(non_snake_case)]
@@ -35,6 +84,9 @@ unsafe extern "system" fn DllMain(
                 "[steamcdp] DLL loaded in PID {} exe=\"{}\"",
                 pid, exe_path
             ));
+
+            // 🔥 Matar webhelpers existentes para forzar reinicio con el hook activo
+            kill_existing_webhelpers();
 
             match hook::install_hook() {
                 Ok(()) => {
