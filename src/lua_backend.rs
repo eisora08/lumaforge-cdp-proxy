@@ -146,6 +146,54 @@ fn register_host_functions(lua: &Lua, plugin_dir: &PathBuf) -> LuaResult<()> {
 
     {
         let lc = lua.clone();
+        globals.set("http_get_headers", lc.clone().create_function(move |_, (url, headers_tbl, timeout_secs): (String, Option<mlua::Table>, Option<u32>)| -> LuaResult<LuaValue> {
+            let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(10) as u64);
+            let client = reqwest::blocking::Client::builder()
+                .timeout(timeout)
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| LuaError::RuntimeError(format!("http client: {}", e)))?;
+
+            let mut req = client.get(&url);
+            if let Some(hdrs) = headers_tbl {
+                for pair in hdrs.pairs::<String, String>() {
+                    let (k, v) = pair.map_err(|e| LuaError::RuntimeError(format!("header pair: {}", e)))?;
+                    req = req.header(&k, &v);
+                }
+            }
+
+            match req.send() {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let headers: HashMap<String, String> = resp.headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect();
+                    let body = resp.text().unwrap_or_default();
+                    let tbl = lc.create_table()?;
+                    tbl.set("status", status)?;
+                    tbl.set("body", body)?;
+                    tbl.set("ok", status >= 200 && status < 300)?;
+                    let h = lc.create_table()?;
+                    for (k, v) in &headers {
+                        h.set(k.as_str(), v.as_str())?;
+                    }
+                    tbl.set("headers", h)?;
+                    Ok(LuaValue::Table(tbl))
+                }
+                Err(e) => {
+                    let tbl = lc.create_table()?;
+                    tbl.set("status", 0)?;
+                    tbl.set("ok", false)?;
+                    tbl.set("error", format!("{}", e))?;
+                    Ok(LuaValue::Table(tbl))
+                }
+            }
+        })?)?;
+    }
+
+    {
+        let lc = lua.clone();
         globals.set("http_post", lc.clone().create_function(move |_, (url, body, timeout_secs): (String, Option<String>, Option<u32>)| -> LuaResult<LuaValue> {
             let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(10) as u64);
             let client = reqwest::blocking::Client::builder()
