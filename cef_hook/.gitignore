@@ -53,7 +53,7 @@ logs/
 *.old
 *.orig
 *.txt
-*.ps1
+
 deploy/
 artifacts/
 releases/

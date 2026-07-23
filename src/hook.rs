@@ -1,11 +1,14 @@
 use minhook::MinHook;
-use rand::Rng;
 use std::ffi::c_void;
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
-use windows_sys::Win32::System::Threading::{PROCESS_INFORMATION, STARTUPINFOW};
-
+use windows_sys::Win32::System::Threading::{PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, CreateRemoteThread, WaitForSingleObject, PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_QUERY_INFORMATION};
+use windows_sys::Win32::System::Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE};
+use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, GetLastError};
+use std::sync::Once;
 // --- Contadores para logs ---
 static CREATE_PROCESS_W_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 static CREATE_PROCESS_AS_USER_W_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -228,7 +231,95 @@ unsafe extern "system" fn hook_create_process_w(
         ));
     }
 
-    match new_cmd {
+    let is_webhelper = new_cmd.is_some();
+
+    //  NUEVO: Iniciar el thread de CDP solo una vez
+    static INJECTION_STARTED: Once = Once::new();
+    if is_webhelper {
+        INJECTION_STARTED.call_once(|| {
+            let port = port;
+            std::thread::spawn(move || {
+                let max_attempts = 10;
+                let mut attempt = 0;
+
+                loop {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(2000));
+
+                    match crate::cdp::CdpClient::connect(port) {
+                        Ok(mut client) => {
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] Connected to CDP (attempt {})",
+                                attempt
+                            ));
+                            match crate::injector::inject_all_plugins(&mut client) {
+                                Ok(()) => {
+                                    crate::log_to_temp("[steamcdp] Injection complete");
+                                }
+                                Err(e) => {
+                                    crate::log_to_temp(&format!("[steamcdp] Injection error: {}", e));
+                                }
+                            }
+
+                            let mut injected_targets: std::collections::HashSet<String> =
+                                std::collections::HashSet::new();
+                            if let Ok(targets) = client.get_targets() {
+                                for t in &targets {
+                                    if t.target_type == "page" {
+                                        injected_targets.insert(t.id.clone());
+                                    }
+                                }
+                            }
+
+                            crate::log_to_temp("[steamcdp] Watching for webhelper restarts + new targets...");
+                            while client.is_alive() {
+                                std::thread::sleep(std::time::Duration::from_secs(3));
+
+                                if let Ok(new_targets) = client.get_targets() {
+                                    for t in &new_targets {
+                                        if t.target_type == "page" && !injected_targets.contains(&t.id) {
+                                            crate::log_to_temp(&format!(
+                                                "[steamcdp] New page target detected: id={}, url={}",
+                                                t.id, &t.url[..t.url.len().min(100)]
+                                            ));
+                                            let plugins = match crate::plugin_loader::load_enabled_plugins() {
+                                                Ok(p) => p,
+                                                Err(e) => {
+                                                    crate::log_to_temp(&format!("[steamcdp] Failed to load plugins: {}", e));
+                                                    continue;
+                                                }
+                                            };
+                                            if let Err(e) = crate::injector::inject_into_target(&mut client, t, &plugins, injected_targets.len() + 1) {
+                                                crate::log_to_temp(&format!("[steamcdp] Injection into new target failed: {}", e));
+                                            } else {
+                                                injected_targets.insert(t.id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            crate::log_to_temp("[steamcdp] CDP connection lost, reconnecting...");
+                            attempt = 0;
+                        }
+                        Err(e) => {
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] CDP connect attempt {} failed: {}",
+                                attempt, e
+                            ));
+                            if attempt >= max_attempts {
+                                crate::log_to_temp("[steamcdp] Max attempts reached, giving up");
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(3000));
+                            continue;
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    let result = match new_cmd {
         Some(modified) => {
             let mut cmd_utf16: Vec<u16> = modified.encode_utf16().chain(Some(0)).collect();
             original(
@@ -256,7 +347,21 @@ unsafe extern "system" fn hook_create_process_w(
             lp_startup_info,
             lp_process_information,
         ),
+    };
+
+    if result != 0 && is_webhelper {
+        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
+        
+        if !inject_handle.is_null() {
+            if let Some(dll_path) = get_cef_hook_dll_path() {
+                inject_dll_into_process(inject_handle, &dll_path);
+            }
+            CloseHandle(inject_handle);
+        }
     }
+    
+    result
 }
 
 // Hook para CreateProcessAsUserW
@@ -308,7 +413,9 @@ unsafe extern "system" fn hook_create_process_as_user_w(
         ));
     }
 
-    match new_cmd {
+    let is_webhelper = new_cmd.is_some();
+
+    let result = match new_cmd {
         Some(modified) => {
             let mut cmd_utf16: Vec<u16> = modified.encode_utf16().chain(Some(0)).collect();
             original(
@@ -338,7 +445,21 @@ unsafe extern "system" fn hook_create_process_as_user_w(
             lp_startup_info,
             lp_process_information,
         ),
+    };
+
+    if result != 0 && is_webhelper {
+        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
+        
+        if !inject_handle.is_null() {
+            if let Some(dll_path) = get_cef_hook_dll_path() {
+                inject_dll_into_process(inject_handle, &dll_path);
+            }
+            CloseHandle(inject_handle);
+        }
     }
+    
+    result
 }
 
 // Hook para CreateProcessA
@@ -390,7 +511,9 @@ unsafe extern "system" fn hook_create_process_a(
         ));
     }
 
-    match new_cmd {
+    let is_webhelper = new_cmd.is_some();
+
+    let result = match new_cmd {
         Some(modified) => {
             let mut cmd_cstr: Vec<u8> = modified.into_bytes();
             cmd_cstr.push(0);
@@ -419,7 +542,21 @@ unsafe extern "system" fn hook_create_process_a(
             lp_startup_info,
             lp_process_information,
         ),
+    };
+
+    if result != 0 && is_webhelper {
+        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
+        
+        if !inject_handle.is_null() {
+            if let Some(dll_path) = get_cef_hook_dll_path() {
+                inject_dll_into_process(inject_handle, &dll_path);
+            }
+            CloseHandle(inject_handle);
+        }
     }
+    
+    result
 }
 
 // Hook para CreateProcessWithTokenW
@@ -469,7 +606,9 @@ unsafe extern "system" fn hook_create_process_with_token_w(
         ));
     }
 
-    match new_cmd {
+    let is_webhelper = new_cmd.is_some();
+
+    let result = match new_cmd {
         Some(modified) => {
             let mut cmd_utf16: Vec<u16> = modified.encode_utf16().chain(Some(0)).collect();
             original(
@@ -495,7 +634,21 @@ unsafe extern "system" fn hook_create_process_with_token_w(
             lp_startup_info,
             lp_process_information,
         ),
+    };
+
+    if result != 0 && is_webhelper {
+        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
+        
+        if !inject_handle.is_null() {
+            if let Some(dll_path) = get_cef_hook_dll_path() {
+                inject_dll_into_process(inject_handle, &dll_path);
+            }
+            CloseHandle(inject_handle);
+        }
     }
+    
+    result
 }
 
 // Hook para CreateProcessWithLogonW
@@ -547,7 +700,9 @@ unsafe extern "system" fn hook_create_process_with_logon_w(
         ));
     }
 
-    match new_cmd {
+    let is_webhelper = new_cmd.is_some();
+
+    let result = match new_cmd {
         Some(modified) => {
             let mut cmd_utf16: Vec<u16> = modified.encode_utf16().chain(Some(0)).collect();
             original(
@@ -577,7 +732,21 @@ unsafe extern "system" fn hook_create_process_with_logon_w(
             lp_startup_info,
             lp_process_information,
         ),
+    };
+
+    if result != 0 && is_webhelper {
+        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
+        
+        if !inject_handle.is_null() {
+            if let Some(dll_path) = get_cef_hook_dll_path() {
+                inject_dll_into_process(inject_handle, &dll_path);
+            }
+            CloseHandle(inject_handle);
+        }
     }
+    
+    result
 }
 
 // Hook para CreateProcessInternalW (kernelbase.dll)
@@ -641,7 +810,9 @@ unsafe extern "system" fn hook_create_process_internal_w(
         ));
     }
 
-    match new_cmd {
+    let is_webhelper = new_cmd.is_some();
+
+    let result = match new_cmd {
         Some(modified) => {
             let mut cmd_utf16: Vec<u16> = modified.encode_utf16().chain(Some(0)).collect();
             original(
@@ -673,7 +844,21 @@ unsafe extern "system" fn hook_create_process_internal_w(
             lp_process_information,
             lp_process_information_extra,
         ),
+    };
+
+    if result != 0 && is_webhelper {
+        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
+        
+        if !inject_handle.is_null() {
+            if let Some(dll_path) = get_cef_hook_dll_path() {
+                inject_dll_into_process(inject_handle, &dll_path);
+            }
+            CloseHandle(inject_handle);
+        }
     }
+    
+    result
 }
 
 // Hook para OutputDebugStringW (opcional)
@@ -790,9 +975,89 @@ pub fn install_hook() -> Result<(), String> {
     Ok(())
 }
 
-// --- Función pública para obtener el puerto ---
-pub fn get_debug_port() -> Option<u16> {
-    DEBUG_PORT.get().copied()
+// --- Inyección de DLL en proceso webhelper ---
+unsafe fn inject_dll_into_process(process_handle: HANDLE, dll_path: &str) -> bool {
+    let dll_path_wide: Vec<u16> = dll_path.encode_utf16().chain(Some(0)).collect();
+    let size = dll_path_wide.len() * 2;
+    
+    let remote_mem = VirtualAllocEx(
+        process_handle,
+        std::ptr::null_mut(),
+        size,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+    );
+    
+    if remote_mem.is_null() {
+        crate::log_to_temp(&format!("[steamcdp] Failed to allocate memory in webhelper process: {}", GetLastError()));
+        return false;
+    }
+    
+    if WriteProcessMemory(
+        process_handle,
+        remote_mem,
+        dll_path_wide.as_ptr() as *const c_void,
+        size,
+        std::ptr::null_mut(),
+    ) == 0
+    {
+        crate::log_to_temp(&format!("[steamcdp] Failed to write DLL path to webhelper process: {}", GetLastError()));
+        VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
+        return false;
+    }
+    
+    let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
+    if kernel32.is_null() {
+        crate::log_to_temp("[steamcdp] Failed to get kernel32.dll handle");
+        VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
+        return false;
+    }
+    
+    let load_library_w = GetProcAddress(kernel32, b"LoadLibraryW\0".as_ptr());
+    let load_library_w_fn = match load_library_w {
+        Some(f) => f,
+        None => {
+            crate::log_to_temp("[steamcdp] Failed to get LoadLibraryW address");
+            VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
+            return false;
+        }
+    };
+    
+    let mut thread_id = 0u32;
+    let thread_handle = CreateRemoteThread(
+        process_handle,
+        std::ptr::null(),
+        0,
+        Some(mem::transmute(load_library_w_fn)),
+        remote_mem,
+        0,
+        &mut thread_id,
+    );
+    
+    if thread_handle.is_null() {
+        crate::log_to_temp(&format!("[steamcdp] Failed to create remote thread in webhelper: {}", GetLastError()));
+        VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
+        return false;
+    }
+    
+    WaitForSingleObject(thread_handle, 5000);
+    CloseHandle(thread_handle);
+    VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
+    
+    crate::log_to_temp(&format!("[steamcdp] Successfully injected DLL into webhelper: {}", dll_path));
+    true
+}
+
+fn get_cef_hook_dll_path() -> Option<String> {
+    let exe_path = std::env::current_exe().ok()?;
+    let exe_dir = exe_path.parent()?;
+    let dll_path = exe_dir.join("lumaforge_cef_hook.dll");
+    
+    if dll_path.exists() {
+        Some(dll_path.to_string_lossy().to_string())
+    } else {
+        None
+    }
 }
 
 // --- Pruebas unitarias ---

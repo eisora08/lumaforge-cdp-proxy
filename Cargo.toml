@@ -7,6 +7,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 name = "user32"
 
+[[bin]]
+name = "steam_launcher"
+path = "src/bin/steam_launcher.rs"
+
 [dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -19,9 +23,19 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Pipes",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
 ] }
 minhook = "0.8"
-rand = "0.8"   
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tungstenite = { version = "0.21", features = ["native-tls"] }
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+url = "2.5"
+mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"] }
+base64 = "0.22"
 
 [build-dependencies]
 cc = "1"

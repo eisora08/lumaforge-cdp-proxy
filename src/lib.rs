@@ -1,6 +1,12 @@
+mod bridge;
 mod cdp;
 mod discovery;
 mod hook;
+mod injector;
+mod ipc;
+mod lua_backend;
+mod plugin;
+mod plugin_loader;
 
 use std::ffi::c_void;
 use std::mem;
@@ -85,9 +91,10 @@ unsafe extern "system" fn DllMain(
                 pid, exe_path
             ));
 
-            // 🔥 Matar webhelpers existentes para forzar reinicio con el hook activo
+            // Matar webhelpers existentes para forzar reinicio
             kill_existing_webhelpers();
 
+            // Instalar hooks
             match hook::install_hook() {
                 Ok(()) => {
                     log_to_temp(&format!(
@@ -99,6 +106,36 @@ unsafe extern "system" fn DllMain(
                     log_to_temp(&format!("[steamcdp] Failed to install hooks: {}", e));
                 }
             }
+
+            // 🔥 Iniciar el servidor IPC y bridge en threads separados
+            std::thread::spawn(|| {
+                if let Err(e) = crate::ipc::start_ipc_server() {
+                    log_to_temp(&format!("[steamcdp] IPC server error: {}", e));
+                }
+            });
+
+            // Initialize Lua backends for plugins that have them
+            match plugin_loader::load_all_plugins() {
+                Ok(plugins) => {
+                    for p in &plugins {
+                        if let Some(ref bc) = p.backend_config {
+                            match lua_backend::load_lua_backend(&p._id, &p._dir, bc) {
+                                Ok(()) => {
+                                    log_to_temp(&format!("[steamcdp] Lua backend loaded for {}", p._id));
+                                }
+                                Err(e) => {
+                                    log_to_temp(&format!("[steamcdp] Lua backend error for {}: {}", p._id, e));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log_to_temp(&format!("[steamcdp] Plugin load error: {}", e));
+                }
+            }
+
+            crate::bridge::start_bridge_server();
         }
         DLL_PROCESS_DETACH => {}
         _ => {}
