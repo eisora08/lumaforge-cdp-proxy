@@ -232,6 +232,22 @@ fn register_host_functions(lua: &Lua, plugin_dir: &PathBuf) -> LuaResult<()> {
         Ok(std::path::Path::new(&path).is_dir())
     })?)?;
 
+    globals.set("file_mtime", lua.create_function(move |_, path: String| -> LuaResult<i64> {
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                match meta.modified() {
+                    Ok(time) => {
+                        let duration = time.duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|e| LuaError::RuntimeError(format!("mtime conversion: {}", e)))?;
+                        Ok(duration.as_secs() as i64)
+                    }
+                    Err(e) => Err(LuaError::RuntimeError(format!("file_mtime: {}", e))),
+                }
+            }
+            Err(e) => Err(LuaError::RuntimeError(format!("file_mtime: {}", e))),
+        }
+    })?)?;
+
     globals.set("list_dir", lua.create_function(move |_, path: String| -> LuaResult<Vec<String>> {
         let mut entries = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&path) {
