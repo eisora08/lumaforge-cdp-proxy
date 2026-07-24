@@ -10,6 +10,8 @@ pub struct Target {
     pub url: String,
     #[serde(rename = "type")]
     pub target_type: String,
+    #[serde(default)]
+    pub title: String,
 }
 
 pub struct CdpClient {

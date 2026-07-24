@@ -252,7 +252,7 @@ unsafe extern "system" fn hook_create_process_w(
                                 "[steamcdp] Connected to CDP (attempt {})",
                                 attempt
                             ));
-                            match crate::injector::inject_all_plugins(&mut client) {
+                            match crate::injector::inject_all(&mut client) {
                                 Ok(()) => {
                                     crate::log_to_temp("[steamcdp] Injection complete");
                                 }
@@ -271,7 +271,8 @@ unsafe extern "system" fn hook_create_process_w(
                                 }
                             }
 
-                            crate::log_to_temp("[steamcdp] Watching for webhelper restarts + new targets...");
+                            crate::log_to_temp("[steamcdp] Watching for new targets...");
+                            let (theme_dir, theme_patches) = crate::injector::load_theme_patches();
                             while client.is_alive() {
                                 std::thread::sleep(std::time::Duration::from_secs(3));
 
@@ -279,18 +280,12 @@ unsafe extern "system" fn hook_create_process_w(
                                     for t in &new_targets {
                                         if t.target_type == "page" && !injected_targets.contains(&t.id) {
                                             crate::log_to_temp(&format!(
-                                                "[steamcdp] New page target detected: id={}, url={}",
-                                                t.id, &t.url[..t.url.len().min(100)]
+                                                "[steamcdp] New target: id={}, title=\"{}\", url={}",
+                                                t.id, t.title, &t.url[..t.url.len().min(100)]
                                             ));
-                                            let plugins = match crate::plugin_loader::load_enabled_plugins() {
-                                                Ok(p) => p,
-                                                Err(e) => {
-                                                    crate::log_to_temp(&format!("[steamcdp] Failed to load plugins: {}", e));
-                                                    continue;
-                                                }
-                                            };
-                                            if let Err(e) = crate::injector::inject_into_target(&mut client, t, &plugins, injected_targets.len() + 1) {
-                                                crate::log_to_temp(&format!("[steamcdp] Injection into new target failed: {}", e));
+                                            let plugins = crate::plugin_loader::load_enabled_plugins().unwrap_or_default();
+                                            if let Err(e) = crate::injector::inject_into_target(&mut client, t, &plugins, &theme_dir, &theme_patches, injected_targets.len() + 1) {
+                                                crate::log_to_temp(&format!("[steamcdp] New target injection failed: {}", e));
                                             } else {
                                                 injected_targets.insert(t.id.clone());
                                             }

@@ -7,6 +7,7 @@ mod ipc;
 mod lua_backend;
 mod plugin;
 mod plugin_loader;
+pub mod theme;
 
 use std::ffi::c_void;
 use std::mem;
@@ -104,6 +105,16 @@ unsafe extern "system" fn DllMain(
                 }
                 Err(e) => {
                     log_to_temp(&format!("[steamcdp] Failed to install hooks: {}", e));
+                }
+            }
+
+            // Initialize theme system and export for cef_hook
+            match theme::export_theme_for_cef_hook() {
+                Ok(()) => {
+                    log_to_temp("[steamcdp] Theme exported for cef_hook");
+                }
+                Err(e) => {
+                    log_to_temp(&format!("[steamcdp] Theme export failed: {}", e));
                 }
             }
 

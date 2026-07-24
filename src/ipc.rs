@@ -90,7 +90,8 @@ fn write_theme_reload_signal() -> Result<(), String> {
 }
 
 fn handle_command(command: &str) -> String {
-    match command.trim() {
+    let cmd = command.trim();
+    match cmd {
         "reload" => {
             crate::log_to_temp("[steamcdp] IPC: reload command received");
             match crate::plugin_loader::load_enabled_plugins() {
@@ -118,6 +119,115 @@ fn handle_command(command: &str) -> String {
                     format!(r#"{{"status":"ok","plugins":{:?}}}"#, names)
                 }
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        // ── Theme commands ──
+        "list-themes" => {
+            let themes = crate::theme::list_available_themes();
+            let active = crate::theme::read_active_theme_name().unwrap_or_default();
+            format!(
+                r#"{{"status":"ok","active":"{}","themes":{}}}"#,
+                active,
+                serde_json::to_string(&themes).unwrap_or_else(|_| "[]".to_string())
+            )
+        }
+        "active-theme" => {
+            match crate::theme::load_active_theme() {
+                Some(theme) => {
+                    format!(
+                        r#"{{"status":"ok","name":"{}","patches":{},"conditions":{},"webkit_css":{},"webkit_js":{},"root_colors":{}}}"#,
+                        theme.name,
+                        theme.manifest.patches.len(),
+                        theme.manifest.conditions.len(),
+                        theme.manifest.webkit_css.is_some(),
+                        theme.manifest.webkit_js.is_some(),
+                        theme.manifest.root_colors.is_some(),
+                    )
+                }
+                None => r#"{"status":"error","message":"No active theme"}"#.to_string(),
+            }
+        }
+        _ if cmd.starts_with("set-theme ") => {
+            let theme_name = cmd.strip_prefix("set-theme ").unwrap_or("").trim();
+            if theme_name.is_empty() {
+                return r#"{"status":"error","message":"Theme name required"}"#.to_string();
+            }
+            match crate::theme::write_active_theme_name(theme_name) {
+                Ok(()) => {
+                    // Re-export manifest for cef_hook
+                    if let Err(e) = crate::theme::export_theme_for_cef_hook() {
+                        crate::log_to_temp(&format!("[steamcdp] Theme export failed after set: {}", e));
+                    }
+                    // Signal reload
+                    let _ = write_theme_reload_signal();
+                    format!(r#"{{"status":"ok","message":"Theme set to '{}'","theme":"{}"}}"#, theme_name, theme_name)
+                }
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        _ if cmd.starts_with("set-condition ") => {
+            // format: set-condition <condition_name> <value>
+            let rest = cmd.strip_prefix("set-condition ").unwrap_or("").trim();
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                return r#"{"status":"error","message":"Usage: set-condition <name> <value>"}"#.to_string();
+            }
+            let cond_name = parts[0];
+            let cond_value = parts[1];
+            let theme_name = crate::theme::read_active_theme_name().unwrap_or_default();
+            let mut config = crate::theme::ThemeConditionConfig::load();
+            config.set_selection(&theme_name, cond_name, cond_value);
+            match config.save() {
+                Ok(()) => {
+                    // Re-export manifest with new condition values
+                    if let Err(e) = crate::theme::export_theme_for_cef_hook() {
+                        crate::log_to_temp(&format!("[steamcdp] Theme export failed after condition: {}", e));
+                    }
+                    let _ = write_theme_reload_signal();
+                    format!(
+                        r#"{{"status":"ok","message":"Condition '{}' set to '{}'","theme":"{}"}}"#,
+                        cond_name, cond_value, theme_name
+                    )
+                }
+                Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        _ if cmd.starts_with("get-condition ") => {
+            let cond_name = cmd.strip_prefix("get-condition ").unwrap_or("").trim();
+            let theme_name = crate::theme::read_active_theme_name().unwrap_or_default();
+            let config = crate::theme::ThemeConditionConfig::load();
+            let value = config.selections
+                .get(&theme_name)
+                .and_then(|c| c.get(cond_name))
+                .cloned()
+                .unwrap_or_default();
+            format!(
+                r#"{{"status":"ok","condition":"{}","value":"{}","theme":"{}"}}"#,
+                cond_name, value, theme_name
+            )
+        }
+        "theme-info" => {
+            match crate::theme::load_active_theme() {
+                Some(theme) => {
+                    let conditions: Vec<String> = theme.manifest.conditions.keys().cloned().collect();
+                    let patches_info: Vec<String> = theme.manifest.patches.iter()
+                        .map(|p| format!("regex='{}' css={:?} js={:?}", p.match_regex_string, p.target_css, p.target_js))
+                        .collect();
+                    format!(
+                        r#"{{"status":"ok","name":"{}","author":"{}","description":"{}","patches":{},"conditions":{},"webkit_css":{},"webkit_js":{},"root_colors":{},"condition_names":{},"patch_details":{}}}"#,
+                        theme.manifest.name,
+                        theme.manifest.author,
+                        theme.manifest.description,
+                        theme.manifest.patches.len(),
+                        theme.manifest.conditions.len(),
+                        theme.manifest.webkit_css.is_some(),
+                        theme.manifest.webkit_js.is_some(),
+                        theme.manifest.root_colors.is_some(),
+                        serde_json::to_string(&conditions).unwrap_or_default(),
+                        serde_json::to_string(&patches_info).unwrap_or_default(),
+                    )
+                }
+                None => r#"{"status":"error","message":"No active theme"}"#.to_string(),
             }
         }
         _ => r#"{"status":"error","message":"Unknown command"}"#.to_string(),
