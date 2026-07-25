@@ -727,6 +727,7 @@ fn inject_theme_html(
     window_title: &str,
     url: &str,
     plugins: &[LoadedPlugin],
+    css_only: bool,
 ) -> String {
     let mut result = html.to_string();
     let theme_dir = theme_state.theme_dir_str();
@@ -762,22 +763,26 @@ fn inject_theme_html(
                 ));
             }
             if let Some(ref js_path) = patch.target_js {
-                let vfs_url = build_vfs_css_url(&theme_dir, js_path);
-                body_inject.push_str(&format!(
-                    "<script type=\"module\" data-lumaforge=\"patch-js\" src=\"{}\"></script>\n",
-                    vfs_url
-                ));
+                if !css_only {
+                    let vfs_url = build_vfs_css_url(&theme_dir, js_path);
+                    body_inject.push_str(&format!(
+                        "<script type=\"module\" data-lumaforge=\"patch-js\" src=\"{}\"></script>\n",
+                        vfs_url
+                    ));
+                }
             }
         }
     }
 
     // 4. Webkit JS (global)
-    if let Some(ref webkit_js) = theme_state.webkit_js_path {
-        let vfs_url = build_vfs_css_url(&theme_dir, webkit_js);
-        body_inject.push_str(&format!(
-            "<script type=\"module\" data-lumaforge=\"webkit-js\" src=\"{}\"></script>\n",
-            vfs_url
-        ));
+    if !css_only {
+        if let Some(ref webkit_js) = theme_state.webkit_js_path {
+            let vfs_url = build_vfs_css_url(&theme_dir, webkit_js);
+            body_inject.push_str(&format!(
+                "<script type=\"module\" data-lumaforge=\"webkit-js\" src=\"{}\"></script>\n",
+                vfs_url
+            ));
+        }
     }
 
     // 5. Legacy fallback: if root_colors_content has CSS but no theme_dir for VFS,
@@ -816,24 +821,28 @@ fn inject_theme_html(
     }
 
     // 7. Condition JS
-    for js_path in &theme_state.condition_js {
-        let vfs_url = build_vfs_css_url(&theme_dir, js_path);
-        body_inject.push_str(&format!(
-            "<script type=\"module\" data-lumaforge=\"condition-js\" src=\"{}\"></script>\n",
-            vfs_url
-        ));
+    if !css_only {
+        for js_path in &theme_state.condition_js {
+            let vfs_url = build_vfs_css_url(&theme_dir, js_path);
+            body_inject.push_str(&format!(
+                "<script type=\"module\" data-lumaforge=\"condition-js\" src=\"{}\"></script>\n",
+                vfs_url
+            ));
+        }
     }
 
     // 8. Plugins
-    for plugin in plugins {
-        let matches = plugin.target_url.as_ref().map_or(true, |pattern| {
-            url.contains(pattern.as_str())
-        });
-        if matches {
-            body_inject.push_str(&format!(
-                "<script data-lumaforge-plugin=\"{}\">\n{}\n</script>\n",
-                plugin.name, plugin.code
-            ));
+    if !css_only {
+        for plugin in plugins {
+            let matches = plugin.target_url.as_ref().map_or(true, |pattern| {
+                url.contains(pattern.as_str())
+            });
+            if matches {
+                body_inject.push_str(&format!(
+                    "<script data-lumaforge-plugin=\"{}\">\n{}\n</script>\n",
+                    plugin.name, plugin.code
+                ));
+            }
         }
     }
 
@@ -1125,6 +1134,7 @@ fn register_theme_injection_script(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
     theme_state: &ThemeState,
+    inject_existing: bool,
 ) {
     let theme_dir = theme_state.theme_dir_str();
 
@@ -1292,7 +1302,9 @@ fn register_theme_injection_script(
     ));
 
     // Now inject into all EXISTING page targets
-    inject_into_existing_targets(socket, msg_id, &js);
+    if inject_existing {
+        inject_into_existing_targets(socket, msg_id, &js);
+    }
 }
 
 /// Iterate all CDP targets and evaluate the injection script in each page target
@@ -1644,12 +1656,25 @@ fn handle_fetch_paused(
 
     let body_str = String::from_utf8_lossy(&decoded_body).to_string();
 
+    // Store pages: only inject CSS (no JS) — JS injection breaks Steam's agecheck redirect
+    let is_store_page = lower_url.contains("store.steampowered.com/app/")
+        || lower_url.contains("store.steampowered.com/sub/")
+        || lower_url.contains("store.steampowered.com/pack/")
+        || lower_url.contains("store.steampowered.com/dlc/")
+        || lower_url.contains("store.steampowered.com/bundle/")
+        || lower_url.contains("store.steampowered.com/explore")
+        || lower_url.contains("store.steampowered.com/search")
+        || lower_url.contains("store.steampowered.com/category/")
+        || lower_url.contains("store.steampowered.com/tags/")
+        || lower_url.contains("store.steampowered.com/recommended")
+        || lower_url.contains("store.steampowered.com/apphover");
+
     // Get window title from the URL or page context
     // For now, we use the URL as a hint; the real title comes from Page.frameNavigated
     // or we can try to extract it from the HTML
     let window_title = extract_title_from_html(&body_str);
 
-    let modified = inject_theme_html(&body_str, theme_state, &window_title, url, &theme_state.plugins.clone());
+    let modified = inject_theme_html(&body_str, theme_state, &window_title, url, &theme_state.plugins.clone(), false);
 
     let encoded = STANDARD.encode(modified.as_bytes());
     let mut fulfill_params = json!({
@@ -1776,7 +1801,7 @@ fn handle_cdp_connection(port: u16) {
         register_webkit_js(&mut socket, &mut msg_id, &theme_state);
 
         // Register persistent theme injection for ALL documents (including internal Steam windows)
-        register_theme_injection_script(&mut socket, &mut msg_id, &theme_state);
+        register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, true);
 
         install_bridge_shim(&mut socket, &mut msg_id);
 
@@ -1787,7 +1812,7 @@ fn handle_cdp_connection(port: u16) {
             if loop_iter % 5 == 0 {
                 if check_theme_reload_signal(&mut theme_state) {
                     register_webkit_js(&mut socket, &mut msg_id, &theme_state);
-                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state);
+                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, true);
                 }
                 load_plugins(&mut theme_state);
             }
@@ -1832,7 +1857,12 @@ fn handle_cdp_connection(port: u16) {
                                     load_theme_manifest(&mut theme_state);
                                     load_plugins(&mut theme_state);
                                     register_webkit_js(&mut socket, &mut msg_id, &theme_state);
-                                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state);
+                                    // Re-register only the persistent script — addScriptToEvaluateOnNewDocument
+                                    // handles new documents automatically. We must NOT call
+                                    // inject_into_existing_targets here because it does Page.reload
+                                    // on all targets, causing an infinite reload loop (frameNavigated
+                                    // → reload → frameNavigated → ...).
+                                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, false);
                                     install_bridge_shim(&mut socket, &mut msg_id);
                                 }
                             }

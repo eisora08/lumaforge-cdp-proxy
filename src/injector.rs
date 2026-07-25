@@ -109,6 +109,14 @@ pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     let plugins = load_enabled_plugins().unwrap_or_default();
     let (theme_dir, patches) = load_theme_patches();
 
+    // Skip injection entirely when there's nothing to inject — avoids unnecessary
+    // CDP connections, Page.enable, and Page.setBypassCSP that can break page
+    // functionality (e.g., Steam agecheck pages).
+    if plugins.is_empty() && patches.is_empty() {
+        crate::log_to_temp("[steamcdp] No plugins or theme patches, skipping injection");
+        return Ok(());
+    }
+
     let targets = client.get_targets()?;
     let pages: Vec<&Target> = targets
         .iter()
