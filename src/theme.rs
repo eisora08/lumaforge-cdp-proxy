@@ -48,8 +48,9 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
     manifest.insert("name".into(), serde_json::Value::String(theme.name.clone()));
     manifest.insert("dir".into(), serde_json::Value::String(theme.dir.to_string_lossy().into_owned()));
 
-    // Patches
-    let patches: Vec<Value> = theme.manifest.patches.iter().map(|p| {
+    // Patches — explicit + auto-generated defaults when UseDefaultPatches is true
+    let use_defaults = theme.manifest.use_default_patches.unwrap_or(true);
+    let mut patches: Vec<Value> = theme.manifest.patches.iter().map(|p| {
         let mut obj = serde_json::Map::new();
         obj.insert("matchRegex".into(), Value::String(p.match_regex_string.clone()));
         if let Some(ref css) = p.target_css {
@@ -62,6 +63,43 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
         }
         Value::Object(obj)
     }).collect();
+
+    // Auto-generate default patches for Millennium-compatible themes
+    if use_defaults && patches.is_empty() {
+        let defaults: Vec<(&str, Option<&str>, Option<&str>)> = vec![
+            (".*", Some("elements/config.css"), None),
+            ("^Steam$", Some("libraryroot.custom.css"), None),
+            ("^Steam$", Some("elements/sidebar.css"), None),
+            ("^Steam$", Some("elements/library.css"), None),
+            ("^Steam$", Some("elements/gamepage.css"), None),
+            ("^Steam$", Some("elements/downloads.css"), None),
+            (".friendsui-container", Some("friends.custom.css"), None),
+            ("^notificationtoasts_", Some("elements/notifications.css"), None),
+            (".*", Some("elements/scrollbar.css"), None),
+            (".*", Some("elements/overlay.css"), None),
+            (".*", Some("elements/miniprofile.css"), None),
+        ];
+
+        for (regex, css_opt, js_opt) in defaults {
+            let mut obj = serde_json::Map::new();
+            obj.insert("matchRegex".into(), Value::String(regex.to_string()));
+            if let Some(css_rel) = css_opt {
+                let full = theme.resolve_path(css_rel);
+                if full.exists() {
+                    obj.insert("targetCss".into(), Value::String(full.to_string_lossy().into_owned()));
+                }
+            }
+            if let Some(js_rel) = js_opt {
+                let full = theme.resolve_path(js_rel);
+                if full.exists() {
+                    obj.insert("targetJs".into(), Value::String(full.to_string_lossy().into_owned()));
+                }
+            }
+            if obj.contains_key("targetCss") || obj.contains_key("targetJs") {
+                patches.push(Value::Object(obj));
+            }
+        }
+    }
     manifest.insert("patches".into(), Value::Array(patches));
 
     // Webkit CSS/JS
@@ -268,7 +306,7 @@ pub struct SkinJson {
     pub webkit_js: Option<String>,
 
     /// Whether to merge with Millennium's default patches
-    #[serde(default)]
+    #[serde(default, alias = "UseDefaultPatches")]
     pub use_default_patches: Option<bool>,
 
     /// Patches: per-window CSS/JS injection rules
@@ -323,7 +361,7 @@ pub struct Condition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConditionValue {
-    #[serde(default)]
+    #[serde(default, alias = "TargetCss")]
     pub target_css: Option<ConditionTarget>,
     #[serde(default, alias = "TargetJs")]
     pub target_js: Option<ConditionTarget>,
@@ -510,6 +548,39 @@ pub struct ThemeConditionConfig {
 
 impl ThemeConditionConfig {
     pub fn load() -> Self {
+        // Try reading from Millennium's active.json first
+        let base = match themes_base_dir() {
+            Some(b) => b,
+            None => return Self::default(),
+        };
+        let active_path = base.join("active.json");
+        if let Ok(raw) = fs::read_to_string(&active_path) {
+            let content = raw.trim_start_matches('\u{FEFF}');
+            if let Ok(parsed) = serde_json::from_str::<Value>(content) {
+                if let Some(conditions) = parsed.get("themes")
+                    .and_then(|t| t.get("conditions"))
+                    .and_then(|c| c.as_object())
+                {
+                    let selections: HashMap<String, HashMap<String, String>> = conditions
+                        .iter()
+                        .map(|(theme, theme_conds)| {
+                            let conds: HashMap<String, String> = theme_conds
+                                .as_object()
+                                .map(|m| m.iter()
+                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                    .collect())
+                                .unwrap_or_default();
+                            (theme.clone(), conds)
+                        })
+                        .collect();
+                    if !selections.is_empty() {
+                        return Self { selections };
+                    }
+                }
+            }
+        }
+
+        // Fallback to theme-conditions.json
         let runtime = match runtime_dir() {
             Some(r) => r,
             None => return Self::default(),
@@ -523,11 +594,32 @@ impl ThemeConditionConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let runtime = runtime_dir().ok_or("No LOCALAPPDATA")?;
-        let _ = fs::create_dir_all(&runtime);
-        let path = runtime.join("theme-conditions.json");
-        let json = serde_json::to_string_pretty(self).unwrap_or_default();
-        fs::write(&path, json).map_err(|e| format!("save conditions: {}", e))
+        // Write back to active.json (Millennium format)
+        let base = themes_base_dir().ok_or("No themes base dir")?;
+        let active_path = base.join("active.json");
+
+        let raw = fs::read_to_string(&active_path).map_err(|e| format!("read active.json: {}", e))?;
+        let content = raw.trim_start_matches('\u{FEFF}');
+        let mut parsed: Value = serde_json::from_str(&content)
+            .map_err(|e| format!("parse active.json: {}", e))?;
+
+        // Build the conditions object from our selections
+        let mut conditions_obj = serde_json::Map::new();
+        for (theme, theme_conds) in &self.selections {
+            let conds: serde_json::Map<String, Value> = theme_conds
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect();
+            conditions_obj.insert(theme.clone(), Value::Object(conds));
+        }
+
+        // Insert into themes.conditions
+        if let Some(themes) = parsed.get_mut("themes") {
+            themes["conditions"] = Value::Object(conditions_obj);
+        }
+
+        let json = serde_json::to_string_pretty(&parsed).map_err(|e| format!("serialize: {}", e))?;
+        fs::write(&active_path, json).map_err(|e| format!("write active.json: {}", e))
     }
 
     /// Get the selected value for a condition, falling back to default
