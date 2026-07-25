@@ -1587,35 +1587,34 @@ fn handle_fetch_paused(
     }
 
     // ── Skip sensitive URLs where HTML injection can break page functionality ──
-    let skip_injection = lower_url.contains("/agecheck/")
-        || lower_url.contains("/login")
-        || lower_url.contains("login.steampowered")
-        || lower_url.contains("help.steampowered.com")
-        || lower_url.contains("/checkout/")
-        || lower_url.contains("/mobileauth/")
-        || lower_url.contains("/two_factor/")
-        || lower_url.contains("/steamguard/")
-        || lower_url.contains("/imagematch/")
-        || lower_url.contains("/forgot")
-        // CDN/video/audio domains — not Steam pages, no need to inject
-        || lower_url.contains("akamaized.net")
-        || lower_url.contains("fastly.")
-        || lower_url.contains("cloudflare")
-        || lower_url.contains("video.")
-        || lower_url.contains(".mpd")
-        || lower_url.contains(".m3u8")
-        || lower_url.contains("segment/")
-        || lower_url.contains("/broadcast/");
-    if skip_injection {
-        let continue_msg = json!({
-            "id": *msg_id,
-            "method": "Fetch.continueResponse",
-            "params": {"requestId": request_id_str}
-        });
-        *msg_id += 1;
-        send_cdp(socket, &continue_msg);
-        return;
-    }
+    // let skip_injection = lower_url.contains("/login")
+    //     || lower_url.contains("login.steampowered")
+    //     || lower_url.contains("help.steampowered.com")
+    //     || lower_url.contains("/checkout/")
+    //     || lower_url.contains("/mobileauth/")
+    //     || lower_url.contains("/two_factor/")
+    //     || lower_url.contains("/steamguard/")
+    //     || lower_url.contains("/imagematch/")
+    //     || lower_url.contains("/forgot")
+    //     // CDN/video/audio domains — not Steam pages, no need to inject
+    //     || lower_url.contains("akamaized.net")
+    //     || lower_url.contains("fastly.")
+    //     || lower_url.contains("cloudflare")
+    //     || lower_url.contains("video.")
+    //     || lower_url.contains(".mpd")
+    //     || lower_url.contains(".m3u8")
+    //     || lower_url.contains("segment/")
+    //     || lower_url.contains("/broadcast/");
+    // if skip_injection {
+    //     let continue_msg = json!({
+    //         "id": *msg_id,
+    //         "method": "Fetch.continueResponse",
+    //         "params": {"requestId": request_id_str}
+    //     });
+    //     *msg_id += 1;
+    //     send_cdp(socket, &continue_msg);
+    //     return;
+    // }
 
     // ── HTML interception: inject theme ──
     log_to_temp(&format!("[cef_hook] Intercepting HTML: {}", &url[..url.len().min(120)]));
