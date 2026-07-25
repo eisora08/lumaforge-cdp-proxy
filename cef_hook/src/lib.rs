@@ -1628,19 +1628,40 @@ fn handle_fetch_paused(
     let current_id = *msg_id;
     *msg_id += 1;
 
+    // Helper: always continueResponse on failure so the page doesn't hang
+    let do_continue = |socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, msg_id: &mut u64| {
+        let continue_msg = json!({
+            "id": *msg_id,
+            "method": "Fetch.continueResponse",
+            "params": {"requestId": request_id_str}
+        });
+        *msg_id += 1;
+        send_cdp(socket, &continue_msg);
+    };
+
     if !send_cdp(socket, &get_body) {
+        log_to_temp(&format!("[cef_hook] Failed to send getResponseBody, continuing response"));
+        do_continue(socket, msg_id);
         return;
     }
 
     let body_response = recv_cdp_response(socket, current_id);
     let body_msg = match body_response {
         Some(m) => m,
-        None => return,
+        None => {
+            log_to_temp(&format!("[cef_hook] Timeout getting body, continuing response: {}", &url[..url.len().min(80)]));
+            do_continue(socket, msg_id);
+            return;
+        }
     };
 
     let result = match body_msg.get("result") {
         Some(r) => r,
-        None => return,
+        None => {
+            log_to_temp(&format!("[cef_hook] No result in body response, continuing: {}", &url[..url.len().min(80)]));
+            do_continue(socket, msg_id);
+            return;
+        }
     };
     let body = result.get("body").and_then(|b| b.as_str()).unwrap_or("");
     let is_base64 = result
@@ -1656,22 +1677,7 @@ fn handle_fetch_paused(
 
     let body_str = String::from_utf8_lossy(&decoded_body).to_string();
 
-    // Store pages: only inject CSS (no JS) — JS injection breaks Steam's agecheck redirect
-    let is_store_page = lower_url.contains("store.steampowered.com/app/")
-        || lower_url.contains("store.steampowered.com/sub/")
-        || lower_url.contains("store.steampowered.com/pack/")
-        || lower_url.contains("store.steampowered.com/dlc/")
-        || lower_url.contains("store.steampowered.com/bundle/")
-        || lower_url.contains("store.steampowered.com/explore")
-        || lower_url.contains("store.steampowered.com/search")
-        || lower_url.contains("store.steampowered.com/category/")
-        || lower_url.contains("store.steampowered.com/tags/")
-        || lower_url.contains("store.steampowered.com/recommended")
-        || lower_url.contains("store.steampowered.com/apphover");
-
-    // Get window title from the URL or page context
-    // For now, we use the URL as a hint; the real title comes from Page.frameNavigated
-    // or we can try to extract it from the HTML
+    // Get window title from the HTML
     let window_title = extract_title_from_html(&body_str);
 
     let modified = inject_theme_html(&body_str, theme_state, &window_title, url, &theme_state.plugins.clone(), false);
@@ -1683,9 +1689,22 @@ fn handle_fetch_paused(
         "body": encoded
     });
 
+    // Strip encoding/length headers — CDP returns decoded body
+    // Original headers would tell the browser to double-decode
     if let Some(headers) = response_headers {
-        if let Some(obj) = fulfill_params.as_object_mut() {
-            obj.insert("responseHeaders".to_string(), headers);
+        if let Value::Array(arr) = &headers {
+            let filtered: Vec<Value> = arr.iter().filter(|item| {
+                if let Value::Object(map) = item {
+                    let name = map.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    return name != "content-encoding"
+                        && name != "content-length"
+                        && name != "transfer-encoding";
+                }
+                true
+            }).cloned().collect();
+            if let Some(obj) = fulfill_params.as_object_mut() {
+                obj.insert("responseHeaders".to_string(), Value::Array(filtered));
+            }
         }
     }
 
@@ -1695,7 +1714,10 @@ fn handle_fetch_paused(
         "params": fulfill_params
     });
     *msg_id += 1;
-    send_cdp(socket, &fulfill);
+    if !send_cdp(socket, &fulfill) {
+        log_to_temp(&format!("[cef_hook] fulfillRequest failed, continuing response"));
+        do_continue(socket, msg_id);
+    }
 }
 
 /// Try to extract a window title hint from the HTML
