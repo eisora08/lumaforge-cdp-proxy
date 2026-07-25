@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use serde_json::{json, Value};
+use serde_json::json;
 
 const BRIDGE_PORT: u16 = 21775;
 const CORS_HEADERS: &str = "\
@@ -115,6 +115,11 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         query,
     };
 
+    // Rust-native routes: intercept binary-heavy operations before Lua
+    if let Some(rust_resp) = crate::package_installer::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
     if let Some(lua_resp) = crate::lua_backend::handle_lua_request(&lua_req) {
         return (lua_resp.status, lua_resp.body);
     }
@@ -127,11 +132,6 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         handle_sources(app_id)
     } else if clean_path == "/api/providers" {
         handle_providers()
-    } else if clean_path == "/api/download" && method == "POST" {
-        handle_download(body)
-    } else if clean_path.starts_with("/api/download-status/") {
-        let request_id = clean_path.trim_start_matches("/api/download-status/");
-        handle_download_status(request_id)
     } else if clean_path.starts_with("/api/open-library/") && method == "POST" {
         let _app_id = clean_path.trim_start_matches("/api/open-library/");
         (200, json!({"ok": true}).to_string())
@@ -164,34 +164,6 @@ fn handle_providers() -> (u16, String) {
         "ok": true,
         "providers": [],
         "message": "No providers connected. Start LumaLite to enable download sources."
-    });
-    (200, response.to_string())
-}
-
-fn handle_download(body: &str) -> (u16, String) {
-    let parsed: Result<Value, _> = serde_json::from_str(body);
-    let app_id = parsed.as_ref().ok()
-        .and_then(|v| v.get("appId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    crate::log_to_temp(&format!("[bridge] Download requested for app {}", app_id));
-
-    let response = json!({
-        "ok": false,
-        "error": "bridge_standalone",
-        "message": "Download requires LumaLite backend. Connect LumaLite to enable downloads."
-    });
-    (200, response.to_string())
-}
-
-fn handle_download_status(_request_id: &str) -> (u16, String) {
-    let response = json!({
-        "ok": true,
-        "status": "failed",
-        "progress": 0,
-        "message": "Download requires LumaLite backend",
-        "errorCode": "NO_BACKEND"
     });
     (200, response.to_string())
 }

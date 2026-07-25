@@ -5,6 +5,7 @@ mod hook;
 mod injector;
 mod ipc;
 mod lua_backend;
+mod package_installer;
 mod plugin;
 mod plugin_loader;
 pub mod theme;
