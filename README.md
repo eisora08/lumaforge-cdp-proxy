@@ -7,7 +7,7 @@ LumaForge CDP Proxy is an experimental Windows proxy, launcher, and plugin runti
 
 ## Latest release
 
-Current development release: **v0.2.0-alpha.1**
+Current development release: **v0.2.0-alpha.2**
 
 Download published builds from the [GitHub Releases](https://github.com/eisora08/lumaforge-cdp-proxy/releases) page.
 
