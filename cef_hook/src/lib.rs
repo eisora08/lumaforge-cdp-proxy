@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tungstenite::{connect, Message};
 use serde_json::{json, Value};
+use serde::Deserialize;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 fn log_to_temp(msg: &str) {
@@ -89,19 +90,25 @@ struct PatchEntry {
     target_js: Option<String>,
 }
 
+#[derive(Clone)]
+struct ConditionEntry {
+    affects: Vec<String>,
+    src: String,
+}
+
 struct ThemeState {
     theme_name: Option<String>,
     theme_dir: Option<PathBuf>,
     patches: Vec<PatchEntry>,
     webkit_css_path: Option<String>,
     webkit_js_path: Option<String>,
-    root_colors_path: Option<String>,
     root_colors_content: Option<String>,
-    condition_css: Vec<String>,
+    condition_css: Vec<ConditionEntry>,
     condition_js: Vec<String>,
     slider_css: String,
     last_signal_mtime: Option<u64>,
-    manifest_mtime: Option<u64>,
+    active_json_mtime: Option<u64>,
+    skin_json_mtime: Option<u64>,
     plugins: Vec<LoadedPlugin>,
     plugins_mtime: Option<u64>,
 }
@@ -114,13 +121,13 @@ impl ThemeState {
             patches: Vec::new(),
             webkit_css_path: None,
             webkit_js_path: None,
-            root_colors_path: None,
             root_colors_content: None,
             condition_css: Vec::new(),
             condition_js: Vec::new(),
             slider_css: String::new(),
             last_signal_mtime: None,
-            manifest_mtime: None,
+            active_json_mtime: None,
+            skin_json_mtime: None,
             plugins: Vec::new(),
             plugins_mtime: None,
         }
@@ -129,6 +136,107 @@ impl ThemeState {
     fn theme_dir_str(&self) -> String {
         self.theme_dir.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
     }
+}
+
+// ─── skin.json serde types (PascalCase like Millennium) ─────────────────────
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+struct SkinJson {
+    #[serde(alias = "Steam-WebKit", alias = "webkitCSS")]
+    steam_webkit: Option<String>,
+    #[serde(alias = "webkitJS")]
+    webkit_js: Option<String>,
+    #[serde(alias = "RootColors")]
+    root_colors: Option<String>,
+    #[serde(alias = "UseDefaultPatches")]
+    use_default_patches: Option<bool>,
+    #[serde(alias = "Patches")]
+    patches: Vec<SkinPatch>,
+    #[serde(alias = "Conditions")]
+    conditions: Option<Value>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+struct SkinPatch {
+    #[serde(alias = "MatchRegexString")]
+    match_regex_string: Option<String>,
+    #[serde(alias = "TargetCss")]
+    target_css: Option<String>,
+    #[serde(alias = "TargetJs")]
+    target_js: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+struct ConditionTargetCss {
+    #[serde(alias = "affects")]
+    affects: Option<Vec<String>>,
+    #[serde(alias = "src")]
+    src: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+struct ConditionValue {
+    #[serde(alias = "TargetCss")]
+    target_css: Option<ConditionTargetCss>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+struct SkinSlider {
+    #[serde(alias = "cssVariable")]
+    css_variable: Option<String>,
+    #[serde(alias = "currentValue")]
+    current_value: Option<f64>,
+    #[serde(alias = "defaultValue")]
+    default_value: Option<f64>,
+    #[serde(alias = "unit")]
+    unit: Option<String>,
+    #[serde(alias = "min")]
+    min: Option<f64>,
+    #[serde(alias = "max")]
+    max: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(default)]
+struct SkinCondition {
+    #[serde(default)]
+    values: Option<Value>,
+    #[serde(default)]
+    slider: Option<SkinSlider>,
+    #[serde(default)]
+    default: Option<String>,
+}
+
+// ─── Default patches (same as Millennium ThemeParser.ts) ────────────────────
+
+struct DefaultPatch {
+    match_regex: &'static str,
+    target_css: &'static str,
+    target_js: Option<&'static str>,
+}
+
+fn get_default_patches() -> Vec<DefaultPatch> {
+    vec![
+        DefaultPatch { match_regex: "^Steam$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "^OverlayBrowser_Browser$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "^SP Overlay:", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "Menu$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "Supernav$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "^notificationtoasts_", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "^SteamBrowser_Find$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "^OverlayTab\\d+_Find$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: "^Steam Big Picture Mode$", target_css: "bigpicture.custom.css", target_js: Some("bigpicture.custom.js") },
+        DefaultPatch { match_regex: "^QuickAccess_", target_css: "bigpicture.custom.css", target_js: Some("bigpicture.custom.js") },
+        DefaultPatch { match_regex: "^MainMenu_", target_css: "bigpicture.custom.css", target_js: Some("bigpicture.custom.js") },
+        DefaultPatch { match_regex: ".friendsui-container", target_css: "friends.custom.css", target_js: Some("friends.custom.js") },
+        DefaultPatch { match_regex: ".ModalDialogPopup", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch { match_regex: ".FullModalOverlay", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+    ]
 }
 
 fn file_mtime_secs(path: &PathBuf) -> Option<u64> {
@@ -144,106 +252,234 @@ fn runtime_dir() -> Option<PathBuf> {
     Some(PathBuf::from(local_appdata).join("LumaForge").join("runtime"))
 }
 
+fn themes_base_dir() -> Option<PathBuf> {
+    let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
+    Some(PathBuf::from(local_appdata).join("LumaForge").join("themes"))
+}
+
 fn load_theme_manifest(state: &mut ThemeState) {
-    let runtime = match runtime_dir() {
-        Some(r) => r,
+    let themes_dir = match themes_base_dir() {
+        Some(d) => d,
         None => return,
     };
 
-    let manifest_path = runtime.join("theme-manifest.json");
-    let new_mtime = file_mtime_secs(&manifest_path);
+    // 1. Read active.json to get active theme name + conditions
+    let active_json_path = themes_dir.join("active.json");
+    let active_json_mtime = file_mtime_secs(&active_json_path);
 
-    if new_mtime == state.manifest_mtime && state.theme_dir.is_some() {
+    if active_json_mtime == state.active_json_mtime && state.theme_dir.is_some() {
         return;
     }
-    state.manifest_mtime = new_mtime;
+    state.active_json_mtime = active_json_mtime;
 
-    let content = match fs::read_to_string(&manifest_path) {
+    let active_json_content = match fs::read_to_string(&active_json_path) {
         Ok(c) => c,
         Err(_) => {
-            log_to_temp("[cef_hook] No theme-manifest.json found, loading legacy theme");
+            log_to_temp("[cef_hook] No active.json found, loading legacy theme");
             load_legacy_theme(state);
             return;
         }
     };
 
-    let manifest: Value = match serde_json::from_str(&content) {
+    // Strip UTF-8 BOM if present, then trim whitespace
+    let active_json_content = active_json_content.trim_start_matches('\u{FEFF}').trim();
+
+    let active_json: Value = match serde_json::from_str(active_json_content) {
         Ok(v) => v,
         Err(e) => {
-            log_to_temp(&format!("[cef_hook] Failed to parse theme-manifest.json: {}", e));
+            log_to_temp(&format!("[cef_hook] Failed to parse active.json: {} (len={}), retrying...", e, active_json_content.len()));
+            let mut last_err = e.to_string();
+            let mut parsed_value = None;
+            for delay_ms in [50, 150, 300, 500, 1000] {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let retry_content = match fs::read_to_string(&active_json_path) {
+                    Ok(c) => c,
+                    Err(_) => { last_err = "file not found".to_string(); continue; }
+                };
+                let retry_content = retry_content.trim_start_matches('\u{FEFF}').trim();
+                log_to_temp(&format!("[cef_hook] Retry at {}ms: len={}", delay_ms, retry_content.len()));
+                if retry_content.is_empty() {
+                    last_err = "empty file".to_string();
+                    continue;
+                }
+                match serde_json::from_str::<Value>(retry_content) {
+                    Ok(v) => { parsed_value = Some(v); break; }
+                    Err(e2) => { last_err = e2.to_string(); }
+                }
+            }
+            match parsed_value {
+                Some(v) => v,
+                None => {
+                    log_to_temp(&format!("[cef_hook] All retries failed ({}), keeping previous state", last_err));
+                    return;
+                }
+            }
+        }
+    };
+
+    let theme_name = active_json
+        .get("themes").and_then(|t| t.get("activeTheme"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let theme_name = match theme_name {
+        Some(n) => n,
+        None => {
+            log_to_temp("[cef_hook] No activeTheme in active.json");
+            load_legacy_theme(state);
             return;
         }
     };
 
-    state.theme_name = manifest.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-    state.theme_dir = manifest.get("dir").and_then(|v| v.as_str()).map(|s| PathBuf::from(s));
+    let theme_dir = themes_dir.join(&theme_name);
+    let skin_json_path = theme_dir.join("skin.json");
 
-    state.patches.clear();
-    if let Some(patches_arr) = manifest.get("patches").and_then(|p| p.as_array()) {
-        for patch_val in patches_arr {
-            let match_regex = patch_val.get("matchRegex").and_then(|v| v.as_str()).unwrap_or(".*").to_string();
-            let target_css = patch_val.get("targetCss").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let target_js = patch_val.get("targetJs").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let skin_json_mtime = file_mtime_secs(&skin_json_path);
+    if skin_json_mtime == state.skin_json_mtime && state.theme_name.as_deref() == Some(&theme_name) {
+        return;
+    }
+    state.skin_json_mtime = skin_json_mtime;
+
+    // 2. Read skin.json directly
+    let skin_content = match fs::read_to_string(&skin_json_path) {
+        Ok(c) => c,
+        Err(_) => {
+            log_to_temp(&format!("[cef_hook] No skin.json at {:?}, loading legacy", skin_json_path));
+            load_legacy_theme(state);
+            return;
+        }
+    };
+
+    let skin: SkinJson = match serde_json::from_str(&skin_content) {
+        Ok(s) => s,
+        Err(e) => {
+            log_to_temp(&format!("[cef_hook] Failed to parse skin.json: {}", e));
+            return;
+        }
+    };
+
+    state.theme_name = Some(theme_name.clone());
+    state.theme_dir = Some(theme_dir.clone());
+
+    // 3. Webkit CSS (global — injected into ALL documents)
+    state.webkit_css_path = skin.steam_webkit.as_ref().map(|rel| {
+        theme_dir.join(rel).to_string_lossy().into_owned()
+    });
+    state.webkit_js_path = skin.webkit_js.as_ref().map(|rel| {
+        theme_dir.join(rel).to_string_lossy().into_owned()
+    });
+
+    // 4. RootColors — read the :root CSS inline
+    state.root_colors_content = skin.root_colors.as_ref().and_then(|rel| {
+        let path = theme_dir.join(rel);
+        fs::read_to_string(&path).ok().filter(|s| !s.is_empty())
+    });
+
+    // 5. Build patches — explicit + UseDefaultPatches defaults
+    let use_defaults = skin.use_default_patches.unwrap_or(true);
+    let mut patches: Vec<PatchEntry> = skin.patches.iter().filter_map(|sp| {
+        let regex = sp.match_regex_string.clone().unwrap_or_else(|| ".*".to_string());
+        let target_css = sp.target_css.as_ref().map(|rel| {
+            theme_dir.join(rel).to_string_lossy().into_owned()
+        });
+        let target_js = sp.target_js.as_ref().map(|rel| {
+            theme_dir.join(rel).to_string_lossy().into_owned()
+        });
+        if target_css.is_some() || target_js.is_some() {
+            Some(PatchEntry { match_regex: regex, target_css, target_js })
+        } else {
+            None
+        }
+    }).collect();
+
+    // When UseDefaultPatches is true, merge defaults like Millennium
+    if use_defaults && patches.is_empty() {
+        for dp in get_default_patches() {
+            let css_path = theme_dir.join(dp.target_css);
+            let target_css = if css_path.exists() {
+                Some(css_path.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            let target_js = dp.target_js.and_then(|js_rel| {
+                let js_path = theme_dir.join(js_rel);
+                if js_path.exists() {
+                    Some(js_path.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            });
             if target_css.is_some() || target_js.is_some() {
-                state.patches.push(PatchEntry { match_regex, target_css, target_js });
+                patches.push(PatchEntry {
+                    match_regex: dp.match_regex.to_string(),
+                    target_css,
+                    target_js,
+                });
             }
         }
     }
 
-    state.webkit_css_path = manifest.get("webkitCss").and_then(|v| v.as_str()).map(|s| s.to_string());
-    state.webkit_js_path = manifest.get("webkitJs").and_then(|v| v.as_str()).map(|s| s.to_string());
-    state.root_colors_path = manifest.get("rootColors").and_then(|v| v.as_str()).map(|s| s.to_string());
+    state.patches = patches;
 
-    // Load root colors content
-    state.root_colors_content = state.root_colors_path.as_ref().and_then(|p| {
-        fs::read_to_string(p).ok().filter(|s| !s.is_empty())
-    });
-
-    // ── Parse conditions ──
+    // 6. Parse conditions from skin.json + active.json selections
     state.condition_css.clear();
     state.condition_js.clear();
     state.slider_css.clear();
 
-    let mut slider_vars: Vec<(String, String, String)> = Vec::new(); // (var_name, value, unit)
+    let saved_conditions = active_json
+        .get("themes").and_then(|t| t.get("conditions"))
+        .and_then(|c| c.get(&theme_name));
 
-    if let Some(conditions) = manifest.get("conditions").and_then(|c| c.as_object()) {
-        for (_name, cond_val) in conditions {
-            let cond = match cond_val.as_object() {
-                Some(o) => o,
-                None => continue,
+    let mut slider_vars: Vec<(String, String)> = Vec::new();
+
+    if let Some(skin_conditions) = skin.conditions.as_ref().and_then(|c| c.as_object()) {
+        for (cond_name, cond_val) in skin_conditions {
+            let cond: SkinCondition = match serde_json::from_value(cond_val.clone()) {
+                Ok(c) => c,
+                Err(_) => continue,
             };
 
-            // Dropdown condition with selected value
-            if let Some(selected) = cond.get("selectedValue").and_then(|v| v.as_str()) {
-                if let Some(values) = cond.get("values").and_then(|v| v.as_object()) {
-                    if let Some(val_obj) = values.get(selected).and_then(|v| v.as_object()) {
-                        // CSS from this value
-                        if let Some(target_css) = val_obj.get("targetCss").and_then(|v| v.as_object()) {
-                            if let Some(src) = target_css.get("src").and_then(|v| v.as_str()) {
-                                if !src.is_empty() {
-                                    state.condition_css.push(src.to_string());
-                                }
-                            }
-                        }
-                        // JS from this value
-                        if let Some(target_js) = val_obj.get("targetJs").and_then(|v| v.as_object()) {
-                            if let Some(src) = target_js.get("src").and_then(|v| v.as_str()) {
-                                if !src.is_empty() {
-                                    state.condition_js.push(src.to_string());
+            // Get selected value from active.json saved conditions
+            let selected = saved_conditions
+                .and_then(|sc| sc.get(cond_name))
+                .and_then(|v| v.as_str())
+                .or(cond.default.as_deref())
+                .unwrap_or("");
+
+            // Slider condition
+            if let Some(ref slider) = cond.slider {
+                if let (Some(ref var_name), Some(val)) = (&slider.css_variable, saved_conditions
+                    .and_then(|sc| sc.get(cond_name))
+                    .and_then(|v| v.as_f64()))
+                {
+                    let unit = slider.unit.as_deref().unwrap_or("");
+                    slider_vars.push((var_name.clone(), format!("{}{}", val, unit)));
+                } else if let (Some(ref var_name), Some(default_val)) = (&slider.css_variable, slider.default_value) {
+                    let unit = slider.unit.as_deref().unwrap_or("");
+                    slider_vars.push((var_name.clone(), format!("{}{}", default_val, unit)));
+                }
+                continue;
+            }
+
+            // Dropdown condition — resolve selected value → TargetCss with affects
+            if !selected.is_empty() {
+                if let Some(values) = cond.values.as_ref().and_then(|v| v.as_object()) {
+                    if let Some(val_obj) = values.get(selected) {
+                        let entry: ConditionValue = match serde_json::from_value(val_obj.clone()) {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+
+                        if let Some(ref target_css) = entry.target_css {
+                            let affects = target_css.affects.clone().unwrap_or_default();
+                            if let Some(ref src) = target_css.src {
+                                if !src.is_empty() && !affects.is_empty() {
+                                    let abs_path = theme_dir.join(src).to_string_lossy().into_owned();
+                                    state.condition_css.push(ConditionEntry { affects, src: abs_path });
                                 }
                             }
                         }
                     }
-                }
-            }
-
-            // Slider condition
-            if let Some(slider) = cond.get("slider").and_then(|s| s.as_object()) {
-                let var_name = slider.get("cssVariable").and_then(|v| v.as_str()).unwrap_or("");
-                let current = slider.get("currentValue").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let unit = slider.get("unit").and_then(|v| v.as_str()).unwrap_or("");
-                if !var_name.is_empty() {
-                    slider_vars.push((var_name.to_string(), format!("{}{}", current, unit), unit.to_string()));
                 }
             }
         }
@@ -252,7 +488,7 @@ fn load_theme_manifest(state: &mut ThemeState) {
     // Build slider CSS
     if !slider_vars.is_empty() {
         let mut css = String::from(":root {\n");
-        for (var, val, _unit) in &slider_vars {
+        for (var, val) in &slider_vars {
             css.push_str(&format!("    {}: {};\n", var, val));
         }
         css.push_str("}\n");
@@ -260,9 +496,9 @@ fn load_theme_manifest(state: &mut ThemeState) {
     }
 
     log_to_temp(&format!(
-        "[cef_hook] Loaded theme manifest: name={:?}, dir={:?}, patches={}, webkit_css={:?}, webkit_js={:?}, root_colors={:?}, condition_css={}, condition_js={}, slider_vars={}",
-        state.theme_name, state.theme_dir, state.patches.len(),
-        state.webkit_css_path.is_some(), state.webkit_js_path.is_some(),
+        "[cef_hook] Loaded skin.json: name={}, patches={}, webkit_css={}, root_colors_bytes={}, condition_css={}, condition_js={}, slider_vars={}",
+        theme_name, state.patches.len(),
+        state.webkit_css_path.is_some(),
         state.root_colors_content.as_ref().map(|s| s.len()).unwrap_or(0),
         state.condition_css.len(), state.condition_js.len(), slider_vars.len(),
     ));
@@ -284,9 +520,7 @@ fn load_legacy_theme(state: &mut ThemeState) {
 
     // For legacy mode, create a single patch that matches everything
     if css.is_some() || js.is_some() {
-        // Store legacy content as root_colors for CSS (inline) and use root_colors_path for JS
         state.root_colors_content = css;
-        state.root_colors_path = None;
         state.webkit_css_path = None;
         state.webkit_js_path = None;
         state.patches.clear();
@@ -437,7 +671,8 @@ fn handle_vfs_request(url: &str, theme_state: &ThemeState) -> Result<Vec<u8>, ()
         Ok(bytes) => Ok(bytes),
         Err(e) => {
             log_to_temp(&format!("[cef_hook] VFS read error: {} -> {}", file_path.display(), e));
-            Err(())
+            // Return empty 200 instead of failing — missing CSS/JS files degrade gracefully
+            Ok(Vec::new())
         }
     }
 }
@@ -549,8 +784,7 @@ fn inject_theme_html(
     //    inject inline (backward compat)
     if theme_state.patches.is_empty() && theme_state.webkit_css_path.is_none() {
         if let Some(ref legacy_css) = theme_state.root_colors_content {
-            // Check if this was loaded via legacy mode (no root_colors_path)
-            if theme_state.root_colors_path.is_none() && theme_state.theme_name.as_deref() == Some("legacy") {
+            if theme_state.theme_name.as_deref() == Some("legacy") {
                 head_inject.clear();
                 body_inject.clear();
                 head_inject.push_str(&format!(
@@ -561,13 +795,16 @@ fn inject_theme_html(
         }
     }
 
-    // 5. Condition CSS (dropdown selections)
-    for css_path in &theme_state.condition_css {
-        let vfs_url = build_vfs_css_url(&theme_dir, css_path);
-        head_inject.push_str(&format!(
-            "<link rel=\"stylesheet\" data-lumaforge=\"condition-css\" href=\"{}\">\n",
-            vfs_url
-        ));
+    // 5. Condition CSS (dropdown selections) — match affects against window title
+    for cond in &theme_state.condition_css {
+        let matches = cond.affects.iter().any(|affect| regex_matches(affect, window_title));
+        if matches {
+            let vfs_url = build_vfs_css_url(&theme_dir, &cond.src);
+            head_inject.push_str(&format!(
+                "<link rel=\"stylesheet\" data-lumaforge=\"condition-css\" href=\"{}\">\n",
+                vfs_url
+            ));
+        }
     }
 
     // 6. Slider CSS variables
@@ -987,12 +1224,25 @@ fn register_theme_injection_script(
         .unwrap_or_default();
     js = js.replace("WEBKITCSS_PLACEHOLDER", &webkit_url);
 
-    // 3. Condition CSS
-    let mut cond_css_js = String::new();
-    for css_path in &theme_state.condition_css {
-        let vfs_url = build_vfs_css_url(&theme_dir, css_path);
-        cond_css_js.push_str(&format!("addCSS('{}');\n", vfs_url));
+    // 3. Condition CSS — build JSON array with affects for runtime title matching
+    let mut cond_css_entries: Vec<Value> = Vec::new();
+    for cond in &theme_state.condition_css {
+        let vfs_url = build_vfs_css_url(&theme_dir, &cond.src);
+        let affects: Vec<Value> = cond.affects.iter().map(|a| Value::String(a.clone())).collect();
+        cond_css_entries.push(json!({"url": vfs_url, "affects": affects}));
     }
+    let cond_css_json = serde_json::to_string(&cond_css_entries).unwrap_or_else(|_| "[]".to_string());
+    let mut cond_css_js = String::new();
+    cond_css_js.push_str(&format!("var _condCss={};\n", cond_css_json));
+    cond_css_js.push_str("_condCss.forEach(function(c){\n");
+    cond_css_js.push_str("  var t=document.title||'';\n");
+    cond_css_js.push_str("  var cls=(document.documentElement&&document.documentElement.className)||'';\n");
+    cond_css_js.push_str("  var match=c.affects.some(function(a){\n");
+    cond_css_js.push_str("    try{return new RegExp(a).test(t)||new RegExp(a).test(cls);}\n");
+    cond_css_js.push_str("    catch(e){return t.indexOf(a)>-1||cls.indexOf(a)>-1;}\n");
+    cond_css_js.push_str("  });\n");
+    cond_css_js.push_str("  if(match)addCSS(c.url);\n");
+    cond_css_js.push_str("});\n");
     js = js.replace("CONDITION_CSS_PLACEHOLDER", &cond_css_js);
 
     // 4. Slider CSS
@@ -1049,7 +1299,7 @@ fn register_theme_injection_script(
 fn inject_into_existing_targets(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
-    js: &str,
+    _js: &str,
 ) {
     let get_targets = json!({
         "id": *msg_id,
@@ -1324,6 +1574,37 @@ fn handle_fetch_paused(
         return;
     }
 
+    // ── Skip sensitive URLs where HTML injection can break page functionality ──
+    let skip_injection = lower_url.contains("/agecheck/")
+        || lower_url.contains("/login")
+        || lower_url.contains("login.steampowered")
+        || lower_url.contains("help.steampowered.com")
+        || lower_url.contains("/checkout/")
+        || lower_url.contains("/mobileauth/")
+        || lower_url.contains("/two_factor/")
+        || lower_url.contains("/steamguard/")
+        || lower_url.contains("/imagematch/")
+        || lower_url.contains("/forgot")
+        // CDN/video/audio domains — not Steam pages, no need to inject
+        || lower_url.contains("akamaized.net")
+        || lower_url.contains("fastly.")
+        || lower_url.contains("cloudflare")
+        || lower_url.contains("video.")
+        || lower_url.contains(".mpd")
+        || lower_url.contains(".m3u8")
+        || lower_url.contains("segment/")
+        || lower_url.contains("/broadcast/");
+    if skip_injection {
+        let continue_msg = json!({
+            "id": *msg_id,
+            "method": "Fetch.continueResponse",
+            "params": {"requestId": request_id_str}
+        });
+        *msg_id += 1;
+        send_cdp(socket, &continue_msg);
+        return;
+    }
+
     // ── HTML interception: inject theme ──
     log_to_temp(&format!("[cef_hook] Intercepting HTML: {}", &url[..url.len().min(120)]));
 
@@ -1408,12 +1689,15 @@ fn extract_title_from_html(html: &str) -> String {
 // ─── CDP main loop ──────────────────────────────────────────────────────────
 
 fn handle_cdp_connection(port: u16) {
+    let mut retry_count = 0u32;
     loop {
         let browser_ws_url = match get_browser_ws_url(port) {
             Some(url) => url,
             None => {
-                log_to_temp("[cef_hook] Could not get browser WebSocket URL, retrying in 3s");
-                std::thread::sleep(Duration::from_secs(3));
+                retry_count += 1;
+                let delay = if retry_count < 20 { 100 } else { 3000 };
+                log_to_temp(&format!("[cef_hook] Could not get browser WebSocket URL, retrying in {}ms (attempt {})", delay, retry_count));
+                std::thread::sleep(Duration::from_millis(delay));
                 continue;
             }
         };
@@ -1577,8 +1861,6 @@ fn handle_cdp_connection(port: u16) {
 
 unsafe extern "system" fn dll_main_thread(_param: *mut c_void) -> u32 {
     log_to_temp("[cef_hook] DLL loaded into webhelper process");
-
-    std::thread::sleep(Duration::from_millis(500));
 
     let port = match resolve_debug_port() {
         Some(p) => p,

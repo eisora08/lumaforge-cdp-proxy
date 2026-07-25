@@ -4,6 +4,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Write file contents, handling Windows file sharing.
+/// On Windows, fs::write may briefly truncate then write. Readers should handle this.
+fn safe_write(path: &std::path::Path, content: &str) -> Result<(), String> {
+    fs::write(path, content).map_err(|e| format!("write {}: {}", path.display(), e))
+}
+
 fn log_to_temp(msg: &str) {
     let Ok(local_appdata) = std::env::var("LOCALAPPDATA") else {
         return;
@@ -254,7 +260,7 @@ pub fn write_active_theme_name(name: &str) -> Result<(), String> {
             if let Some(obj) = themes.as_object_mut() {
                 obj.insert("activeTheme".into(), Value::String(name.to_string()));
                 let json = serde_json::to_string_pretty(&parsed).map_err(|e| format!("serialize: {}", e))?;
-                fs::write(&active_path, json).map_err(|e| format!("write active.json: {}", e))?;
+                safe_write(&active_path, &json)?;
                 crate::log_to_temp(&format!("[theme] Active theme set to: {} (Millennium format)", name));
                 return Ok(());
             }
@@ -263,8 +269,7 @@ pub fn write_active_theme_name(name: &str) -> Result<(), String> {
 
     // Fallback: legacy format
     let json = serde_json::json!({ "theme": name });
-    fs::write(&active_path, serde_json::to_string_pretty(&json).unwrap_or_default())
-        .map_err(|e| format!("write active.json: {}", e))?;
+    safe_write(&active_path, &serde_json::to_string_pretty(&json).unwrap_or_default())?;
     crate::log_to_temp(&format!("[theme] Active theme set to: {} (legacy format)", name));
     Ok(())
 }
@@ -619,7 +624,7 @@ impl ThemeConditionConfig {
         }
 
         let json = serde_json::to_string_pretty(&parsed).map_err(|e| format!("serialize: {}", e))?;
-        fs::write(&active_path, json).map_err(|e| format!("write active.json: {}", e))
+        safe_write(&active_path, &json)
     }
 
     /// Get the selected value for a condition, falling back to default
