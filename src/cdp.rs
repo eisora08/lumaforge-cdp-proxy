@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::TcpStream;
-use tungstenite::{connect, Message, WebSocket};
 use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message, WebSocket};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Target {
@@ -23,9 +23,10 @@ pub struct CdpClient {
 impl CdpClient {
     pub fn connect(port: u16) -> Result<Self, String> {
         let url = format!("http://127.0.0.1:{}/json", port);
-        let response = reqwest::blocking::get(&url)
-            .map_err(|e| format!("Failed to get targets: {}", e))?;
-        let targets: Vec<Target> = response.json()
+        let response =
+            reqwest::blocking::get(&url).map_err(|e| format!("Failed to get targets: {}", e))?;
+        let targets: Vec<Target> = response
+            .json()
             .map_err(|e| format!("Failed to parse targets: {}", e))?;
 
         if targets.is_empty() {
@@ -35,8 +36,8 @@ impl CdpClient {
         let target = targets.first().unwrap();
         let ws_url = format!("ws://127.0.0.1:{}/devtools/page/{}", port, target.id);
 
-        let (ws, _) = connect(&ws_url)
-            .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        let (ws, _) =
+            connect(&ws_url).map_err(|e| format!("WebSocket connection failed: {}", e))?;
 
         Ok(CdpClient {
             ws,
@@ -50,8 +51,8 @@ impl CdpClient {
             return Ok(());
         }
         let ws_url = format!("ws://127.0.0.1:{}/devtools/page/{}", self.port, target_id);
-        let (ws, _) = connect(&ws_url)
-            .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        let (ws, _) =
+            connect(&ws_url).map_err(|e| format!("WebSocket connection failed: {}", e))?;
         self.ws = ws;
         self.target_id = Some(target_id.to_string());
         Ok(())
@@ -59,9 +60,10 @@ impl CdpClient {
 
     pub fn get_targets(&self) -> Result<Vec<Target>, String> {
         let url = format!("http://127.0.0.1:{}/json", self.port);
-        let response = reqwest::blocking::get(&url)
-            .map_err(|e| format!("Failed to get targets: {}", e))?;
-        let targets: Vec<Target> = response.json()
+        let response =
+            reqwest::blocking::get(&url).map_err(|e| format!("Failed to get targets: {}", e))?;
+        let targets: Vec<Target> = response
+            .json()
             .map_err(|e| format!("Failed to parse targets: {}", e))?;
         Ok(targets)
     }

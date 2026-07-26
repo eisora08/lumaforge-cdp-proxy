@@ -2,13 +2,19 @@ use minhook::MinHook;
 use std::ffi::c_void;
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Once;
 use std::sync::OnceLock;
-use windows_sys::Win32::System::Threading::{PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, CreateRemoteThread, WaitForSingleObject, PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_QUERY_INFORMATION};
-use windows_sys::Win32::System::Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, GetLastError};
-use std::sync::Once;
+use windows_sys::Win32::System::Memory::{
+    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateRemoteThread, OpenProcess, WaitForSingleObject, PROCESS_CREATE_THREAD,
+    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+    PROCESS_VM_WRITE, STARTUPINFOW,
+};
 // --- Contadores para logs ---
 static CREATE_PROCESS_W_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
 static CREATE_PROCESS_AS_USER_W_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -87,29 +93,33 @@ type FnCreateProcessWithLogonW = unsafe extern "system" fn(
 
 // Firma para CreateProcessInternalW (kernelbase.dll)
 type FnCreateProcessInternalW = unsafe extern "system" fn(
-    *mut c_void, // HANDLE hToken (opcional)
-    *const u16,  // LPCWSTR lpApplicationName
-    *mut u16,    // LPWSTR lpCommandLine
+    *mut c_void,   // HANDLE hToken (opcional)
+    *const u16,    // LPCWSTR lpApplicationName
+    *mut u16,      // LPWSTR lpCommandLine
     *const c_void, // LPSECURITY_ATTRIBUTES lpProcessAttributes
     *const c_void, // LPSECURITY_ATTRIBUTES lpThreadAttributes
-    i32,         // BOOL bInheritHandles
-    u32,         // DWORD dwCreationFlags
+    i32,           // BOOL bInheritHandles
+    u32,           // DWORD dwCreationFlags
     *const c_void, // LPVOID lpEnvironment
-    *const u16,  // LPCWSTR lpCurrentDirectory
+    *const u16,    // LPCWSTR lpCurrentDirectory
     *const STARTUPINFOW,
     *mut PROCESS_INFORMATION,
-    *mut u32,    // LPDWORD lpProcessInformation (extra)
+    *mut u32, // LPDWORD lpProcessInformation (extra)
 ) -> i32;
 
 type FnOutputDebugStringW = unsafe extern "system" fn(*const u16);
 
 // --- Almacenamiento de originales ---
 pub(crate) static ORIGINAL_CREATE_PROCESS_W: OnceLock<FnCreateProcessW> = OnceLock::new();
-pub(crate) static ORIGINAL_CREATE_PROCESS_AS_USER_W: OnceLock<FnCreateProcessAsUserW> = OnceLock::new();
+pub(crate) static ORIGINAL_CREATE_PROCESS_AS_USER_W: OnceLock<FnCreateProcessAsUserW> =
+    OnceLock::new();
 pub(crate) static ORIGINAL_CREATE_PROCESS_A: OnceLock<FnCreateProcessA> = OnceLock::new();
-pub(crate) static ORIGINAL_CREATE_PROCESS_WITH_TOKEN_W: OnceLock<FnCreateProcessWithTokenW> = OnceLock::new();
-pub(crate) static ORIGINAL_CREATE_PROCESS_WITH_LOGON_W: OnceLock<FnCreateProcessWithLogonW> = OnceLock::new();
-pub(crate) static ORIGINAL_CREATE_PROCESS_INTERNAL_W: OnceLock<FnCreateProcessInternalW> = OnceLock::new();
+pub(crate) static ORIGINAL_CREATE_PROCESS_WITH_TOKEN_W: OnceLock<FnCreateProcessWithTokenW> =
+    OnceLock::new();
+pub(crate) static ORIGINAL_CREATE_PROCESS_WITH_LOGON_W: OnceLock<FnCreateProcessWithLogonW> =
+    OnceLock::new();
+pub(crate) static ORIGINAL_CREATE_PROCESS_INTERNAL_W: OnceLock<FnCreateProcessInternalW> =
+    OnceLock::new();
 pub(crate) static ORIGINAL_OUTPUT_DEBUG_STRING_W: OnceLock<FnOutputDebugStringW> = OnceLock::new();
 
 pub(crate) static DEBUG_PORT: OnceLock<u16> = OnceLock::new();
@@ -223,7 +233,10 @@ unsafe extern "system" fn hook_create_process_w(
 
     if new_cmd.is_some() {
         if let Err(e) = crate::discovery::publish_if_needed(port) {
-            crate::log_to_temp(&format!("[steamcdp] Failed to publish CDP discovery: {}", e));
+            crate::log_to_temp(&format!(
+                "[steamcdp] Failed to publish CDP discovery: {}",
+                e
+            ));
         }
         crate::log_to_temp(&format!(
             "[steamcdp] Injected debug port {} into steamwebhelper.exe (CPW)",
@@ -345,9 +358,13 @@ unsafe extern "system" fn hook_create_process_w(
     };
 
     if result != 0 && is_webhelper {
-        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let desired_access = PROCESS_CREATE_THREAD
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_QUERY_INFORMATION;
         let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
-        
+
         if !inject_handle.is_null() {
             if let Some(dll_path) = get_cef_hook_dll_path() {
                 inject_dll_into_process(inject_handle, &dll_path);
@@ -355,7 +372,7 @@ unsafe extern "system" fn hook_create_process_w(
             CloseHandle(inject_handle);
         }
     }
-    
+
     result
 }
 
@@ -400,7 +417,10 @@ unsafe extern "system" fn hook_create_process_as_user_w(
 
     if new_cmd.is_some() {
         if let Err(e) = crate::discovery::publish_if_needed(port) {
-            crate::log_to_temp(&format!("[steamcdp] Failed to publish CDP discovery: {}", e));
+            crate::log_to_temp(&format!(
+                "[steamcdp] Failed to publish CDP discovery: {}",
+                e
+            ));
         }
         crate::log_to_temp(&format!(
             "[steamcdp] Injected debug port {} into steamwebhelper.exe (CPAU)",
@@ -443,9 +463,13 @@ unsafe extern "system" fn hook_create_process_as_user_w(
     };
 
     if result != 0 && is_webhelper {
-        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let desired_access = PROCESS_CREATE_THREAD
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_QUERY_INFORMATION;
         let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
-        
+
         if !inject_handle.is_null() {
             if let Some(dll_path) = get_cef_hook_dll_path() {
                 inject_dll_into_process(inject_handle, &dll_path);
@@ -453,7 +477,7 @@ unsafe extern "system" fn hook_create_process_as_user_w(
             CloseHandle(inject_handle);
         }
     }
-    
+
     result
 }
 
@@ -498,7 +522,10 @@ unsafe extern "system" fn hook_create_process_a(
 
     if new_cmd.is_some() {
         if let Err(e) = crate::discovery::publish_if_needed(port) {
-            crate::log_to_temp(&format!("[steamcdp] Failed to publish CDP discovery: {}", e));
+            crate::log_to_temp(&format!(
+                "[steamcdp] Failed to publish CDP discovery: {}",
+                e
+            ));
         }
         crate::log_to_temp(&format!(
             "[steamcdp] Injected debug port {} into steamwebhelper.exe (CPA)",
@@ -540,9 +567,13 @@ unsafe extern "system" fn hook_create_process_a(
     };
 
     if result != 0 && is_webhelper {
-        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let desired_access = PROCESS_CREATE_THREAD
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_QUERY_INFORMATION;
         let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
-        
+
         if !inject_handle.is_null() {
             if let Some(dll_path) = get_cef_hook_dll_path() {
                 inject_dll_into_process(inject_handle, &dll_path);
@@ -550,7 +581,7 @@ unsafe extern "system" fn hook_create_process_a(
             CloseHandle(inject_handle);
         }
     }
-    
+
     result
 }
 
@@ -593,7 +624,10 @@ unsafe extern "system" fn hook_create_process_with_token_w(
 
     if new_cmd.is_some() {
         if let Err(e) = crate::discovery::publish_if_needed(port) {
-            crate::log_to_temp(&format!("[steamcdp] Failed to publish CDP discovery: {}", e));
+            crate::log_to_temp(&format!(
+                "[steamcdp] Failed to publish CDP discovery: {}",
+                e
+            ));
         }
         crate::log_to_temp(&format!(
             "[steamcdp] Injected debug port {} into steamwebhelper.exe (CPTW)",
@@ -632,9 +666,13 @@ unsafe extern "system" fn hook_create_process_with_token_w(
     };
 
     if result != 0 && is_webhelper {
-        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let desired_access = PROCESS_CREATE_THREAD
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_QUERY_INFORMATION;
         let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
-        
+
         if !inject_handle.is_null() {
             if let Some(dll_path) = get_cef_hook_dll_path() {
                 inject_dll_into_process(inject_handle, &dll_path);
@@ -642,7 +680,7 @@ unsafe extern "system" fn hook_create_process_with_token_w(
             CloseHandle(inject_handle);
         }
     }
-    
+
     result
 }
 
@@ -687,7 +725,10 @@ unsafe extern "system" fn hook_create_process_with_logon_w(
 
     if new_cmd.is_some() {
         if let Err(e) = crate::discovery::publish_if_needed(port) {
-            crate::log_to_temp(&format!("[steamcdp] Failed to publish CDP discovery: {}", e));
+            crate::log_to_temp(&format!(
+                "[steamcdp] Failed to publish CDP discovery: {}",
+                e
+            ));
         }
         crate::log_to_temp(&format!(
             "[steamcdp] Injected debug port {} into steamwebhelper.exe (CPLW)",
@@ -730,9 +771,13 @@ unsafe extern "system" fn hook_create_process_with_logon_w(
     };
 
     if result != 0 && is_webhelper {
-        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let desired_access = PROCESS_CREATE_THREAD
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_QUERY_INFORMATION;
         let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
-        
+
         if !inject_handle.is_null() {
             if let Some(dll_path) = get_cef_hook_dll_path() {
                 inject_dll_into_process(inject_handle, &dll_path);
@@ -740,7 +785,7 @@ unsafe extern "system" fn hook_create_process_with_logon_w(
             CloseHandle(inject_handle);
         }
     }
-    
+
     result
 }
 
@@ -797,7 +842,10 @@ unsafe extern "system" fn hook_create_process_internal_w(
 
     if new_cmd.is_some() {
         if let Err(e) = crate::discovery::publish_if_needed(port) {
-            crate::log_to_temp(&format!("[steamcdp] Failed to publish CDP discovery: {}", e));
+            crate::log_to_temp(&format!(
+                "[steamcdp] Failed to publish CDP discovery: {}",
+                e
+            ));
         }
         crate::log_to_temp(&format!(
             "[steamcdp] Injected debug port {} into steamwebhelper.exe (CPIW)",
@@ -842,9 +890,13 @@ unsafe extern "system" fn hook_create_process_internal_w(
     };
 
     if result != 0 && is_webhelper {
-        let desired_access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let desired_access = PROCESS_CREATE_THREAD
+            | PROCESS_VM_OPERATION
+            | PROCESS_VM_READ
+            | PROCESS_VM_WRITE
+            | PROCESS_QUERY_INFORMATION;
         let inject_handle = OpenProcess(desired_access, 0, (*lp_process_information).dwProcessId);
-        
+
         if !inject_handle.is_null() {
             if let Some(dll_path) = get_cef_hook_dll_path() {
                 inject_dll_into_process(inject_handle, &dll_path);
@@ -852,7 +904,7 @@ unsafe extern "system" fn hook_create_process_internal_w(
             CloseHandle(inject_handle);
         }
     }
-    
+
     result
 }
 
@@ -963,8 +1015,7 @@ pub fn install_hook() -> Result<(), String> {
             .map_err(|_| "OriginalOutputDebugStringW already initialized".to_string())?;
 
         // Habilitar todos los hooks
-        MinHook::enable_all_hooks()
-            .map_err(|e| format!("enable_all_hooks failed: {:?}", e))?;
+        MinHook::enable_all_hooks().map_err(|e| format!("enable_all_hooks failed: {:?}", e))?;
     }
 
     Ok(())
@@ -974,7 +1025,7 @@ pub fn install_hook() -> Result<(), String> {
 unsafe fn inject_dll_into_process(process_handle: HANDLE, dll_path: &str) -> bool {
     let dll_path_wide: Vec<u16> = dll_path.encode_utf16().chain(Some(0)).collect();
     let size = dll_path_wide.len() * 2;
-    
+
     let remote_mem = VirtualAllocEx(
         process_handle,
         std::ptr::null_mut(),
@@ -982,12 +1033,15 @@ unsafe fn inject_dll_into_process(process_handle: HANDLE, dll_path: &str) -> boo
         MEM_COMMIT,
         PAGE_READWRITE,
     );
-    
+
     if remote_mem.is_null() {
-        crate::log_to_temp(&format!("[steamcdp] Failed to allocate memory in webhelper process: {}", GetLastError()));
+        crate::log_to_temp(&format!(
+            "[steamcdp] Failed to allocate memory in webhelper process: {}",
+            GetLastError()
+        ));
         return false;
     }
-    
+
     if WriteProcessMemory(
         process_handle,
         remote_mem,
@@ -996,18 +1050,21 @@ unsafe fn inject_dll_into_process(process_handle: HANDLE, dll_path: &str) -> boo
         std::ptr::null_mut(),
     ) == 0
     {
-        crate::log_to_temp(&format!("[steamcdp] Failed to write DLL path to webhelper process: {}", GetLastError()));
+        crate::log_to_temp(&format!(
+            "[steamcdp] Failed to write DLL path to webhelper process: {}",
+            GetLastError()
+        ));
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
         return false;
     }
-    
+
     let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
     if kernel32.is_null() {
         crate::log_to_temp("[steamcdp] Failed to get kernel32.dll handle");
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
         return false;
     }
-    
+
     let load_library_w = GetProcAddress(kernel32, b"LoadLibraryW\0".as_ptr());
     let load_library_w_fn = match load_library_w {
         Some(f) => f,
@@ -1017,7 +1074,7 @@ unsafe fn inject_dll_into_process(process_handle: HANDLE, dll_path: &str) -> boo
             return false;
         }
     };
-    
+
     let mut thread_id = 0u32;
     let thread_handle = CreateRemoteThread(
         process_handle,
@@ -1028,18 +1085,24 @@ unsafe fn inject_dll_into_process(process_handle: HANDLE, dll_path: &str) -> boo
         0,
         &mut thread_id,
     );
-    
+
     if thread_handle.is_null() {
-        crate::log_to_temp(&format!("[steamcdp] Failed to create remote thread in webhelper: {}", GetLastError()));
+        crate::log_to_temp(&format!(
+            "[steamcdp] Failed to create remote thread in webhelper: {}",
+            GetLastError()
+        ));
         VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
         return false;
     }
-    
+
     WaitForSingleObject(thread_handle, 5000);
     CloseHandle(thread_handle);
     VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
-    
-    crate::log_to_temp(&format!("[steamcdp] Successfully injected DLL into webhelper: {}", dll_path));
+
+    crate::log_to_temp(&format!(
+        "[steamcdp] Successfully injected DLL into webhelper: {}",
+        dll_path
+    ));
     true
 }
 
@@ -1047,7 +1110,7 @@ fn get_cef_hook_dll_path() -> Option<String> {
     let exe_path = std::env::current_exe().ok()?;
     let exe_dir = exe_path.parent()?;
     let dll_path = exe_dir.join("lumaforge_cef_hook.dll");
-    
+
     if dll_path.exists() {
         Some(dll_path.to_string_lossy().to_string())
     } else {
@@ -1084,11 +1147,8 @@ mod tests {
 
     #[test]
     fn reject_type_flag() {
-        let r = build_webhelper_command_line(
-            "",
-            "steamwebhelper.exe --type=renderer --some-arg",
-            9222,
-        );
+        let r =
+            build_webhelper_command_line("", "steamwebhelper.exe --type=renderer --some-arg", 9222);
         assert_eq!(r, None);
     }
 

@@ -12,14 +12,13 @@ pub mod theme;
 
 use std::ffi::c_void;
 use std::mem;
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
-    TH32CS_SNAPPROCESS, PROCESSENTRY32W,
-};
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
@@ -133,10 +132,16 @@ unsafe extern "system" fn DllMain(
                         if let Some(ref bc) = p.backend_config {
                             match lua_backend::load_lua_backend(&p._id, &p._dir, bc) {
                                 Ok(()) => {
-                                    log_to_temp(&format!("[steamcdp] Lua backend loaded for {}", p._id));
+                                    log_to_temp(&format!(
+                                        "[steamcdp] Lua backend loaded for {}",
+                                        p._id
+                                    ));
                                 }
                                 Err(e) => {
-                                    log_to_temp(&format!("[steamcdp] Lua backend error for {}: {}", p._id, e));
+                                    log_to_temp(&format!(
+                                        "[steamcdp] Lua backend error for {}: {}",
+                                        p._id, e
+                                    ));
                                 }
                             }
                         }

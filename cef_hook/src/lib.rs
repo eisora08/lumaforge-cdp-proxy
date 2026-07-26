@@ -743,6 +743,20 @@ fn inject_theme_html(
         ));
     }
 
+    // 1b. Bridge: map theme-specific CSS vars to --luma-ssh-* plugin vars
+    //     Uses var() with fallbacks so themes that don't define these still work.
+    head_inject.push_str(
+        "<style data-lumaforge=\"ssh-bridge\">\n\
+         :root {\n\
+           --luma-ssh-accent: var(--fill-color-accent-secondary, var(--st-accent-1, #66c0ff));\n\
+           --luma-ssh-bg-panel: var(--background-fill-color-mica-background-base, #1b2838);\n\
+           --luma-ssh-text-primary: var(--fill-color-text-primary, #fff);\n\
+           --luma-ssh-text: var(--fill-color-text-secondary, #c7d5e0);\n\
+           --luma-ssh-text-muted: var(--fill-color-subtle-secondary, #8f98a0);\n\
+         }\n\
+         </style>\n"
+    );
+
     // 2. Webkit CSS (global - injected into ALL documents)
     if let Some(ref webkit_css) = theme_state.webkit_css_path {
         let vfs_url = build_vfs_css_url(&theme_dir, webkit_css);

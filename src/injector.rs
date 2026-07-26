@@ -33,7 +33,10 @@ pub fn load_theme_patches() -> (String, Vec<ThemePatchEntry>) {
     let manifest: Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            crate::log_to_temp(&format!("[steamcdp] Failed to parse theme-manifest.json: {}", e));
+            crate::log_to_temp(&format!(
+                "[steamcdp] Failed to parse theme-manifest.json: {}",
+                e
+            ));
             return (String::new(), Vec::new());
         }
     };
@@ -83,7 +86,9 @@ pub fn load_theme_patches() -> (String, Vec<ThemePatchEntry>) {
 fn path_to_vfs_url(theme_dir: &str, absolute_path: &str) -> String {
     // Try stripping the theme dir prefix (with or without trailing separator)
     let relative = if let Some(rest) = absolute_path.strip_prefix(theme_dir) {
-        rest.strip_prefix('\\').or_else(|| rest.strip_prefix('/')).unwrap_or(rest)
+        rest.strip_prefix('\\')
+            .or_else(|| rest.strip_prefix('/'))
+            .unwrap_or(rest)
     } else {
         absolute_path
     };
@@ -118,10 +123,7 @@ pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     }
 
     let targets = client.get_targets()?;
-    let pages: Vec<&Target> = targets
-        .iter()
-        .filter(|t| t.target_type == "page")
-        .collect();
+    let pages: Vec<&Target> = targets.iter().filter(|t| t.target_type == "page").collect();
 
     if pages.is_empty() {
         crate::log_to_temp("[steamcdp] No page targets found");

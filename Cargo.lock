@@ -763,6 +763,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tungstenite",
  "url",
  "windows-sys 0.59.0",

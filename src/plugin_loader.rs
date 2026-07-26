@@ -1,15 +1,17 @@
+use crate::plugin::{ExtensionConfig, LoadedPlugin, PluginManifest};
 use std::fs;
 use std::path::PathBuf;
-use crate::plugin::{PluginManifest, ExtensionConfig, LoadedPlugin};
 
 pub fn get_plugins_dir() -> Result<PathBuf, String> {
     if let Ok(override_dir) = std::env::var("LUMA_FORGE_PLUGINS_DIR") {
         return Ok(PathBuf::from(override_dir));
     }
 
-    let local_app_data = std::env::var("LOCALAPPDATA")
-        .map_err(|_| "LOCALAPPDATA not set".to_string())?;
-    Ok(PathBuf::from(local_app_data).join("LumaForge").join("plugins"))
+    let local_app_data =
+        std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA not set".to_string())?;
+    Ok(PathBuf::from(local_app_data)
+        .join("LumaForge")
+        .join("plugins"))
 }
 
 pub fn load_all_plugins() -> Result<Vec<LoadedPlugin>, String> {
@@ -21,8 +23,8 @@ pub fn load_all_plugins() -> Result<Vec<LoadedPlugin>, String> {
     }
 
     let mut loaded = Vec::new();
-    for entry in fs::read_dir(&plugins_dir)
-        .map_err(|e| format!("Failed to read plugins dir: {}", e))?
+    for entry in
+        fs::read_dir(&plugins_dir).map_err(|e| format!("Failed to read plugins dir: {}", e))?
     {
         let entry = match entry {
             Ok(e) => e,
@@ -47,7 +49,8 @@ pub fn load_all_plugins() -> Result<Vec<LoadedPlugin>, String> {
             Err(e) => {
                 crate::log_to_temp(&format!(
                     "[steamcdp] Failed to parse manifest {}: {}",
-                    manifest_path.display(), e
+                    manifest_path.display(),
+                    e
                 ));
                 continue;
             }
@@ -98,7 +101,8 @@ pub fn load_all_plugins() -> Result<Vec<LoadedPlugin>, String> {
             Err(e) => {
                 crate::log_to_temp(&format!(
                     "[steamcdp] Failed to read {}: {}",
-                    code_path.display(), e
+                    code_path.display(),
+                    e
                 ));
                 continue;
             }

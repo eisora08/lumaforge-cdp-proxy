@@ -31,12 +31,20 @@ fn log_to_temp(msg: &str) {
 
 fn themes_base_dir() -> Option<PathBuf> {
     let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
-    Some(PathBuf::from(local_appdata).join("LumaForge").join("themes"))
+    Some(
+        PathBuf::from(local_appdata)
+            .join("LumaForge")
+            .join("themes"),
+    )
 }
 
 fn runtime_dir() -> Option<PathBuf> {
     let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
-    Some(PathBuf::from(local_appdata).join("LumaForge").join("runtime"))
+    Some(
+        PathBuf::from(local_appdata)
+            .join("LumaForge")
+            .join("runtime"),
+    )
 }
 
 // ─── Export theme data for cef_hook ─────────────────────────────────────────
@@ -52,23 +60,34 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
     // Build the manifest JSON for cef_hook
     let mut manifest = serde_json::Map::new();
     manifest.insert("name".into(), serde_json::Value::String(theme.name.clone()));
-    manifest.insert("dir".into(), serde_json::Value::String(theme.dir.to_string_lossy().into_owned()));
+    manifest.insert(
+        "dir".into(),
+        serde_json::Value::String(theme.dir.to_string_lossy().into_owned()),
+    );
 
     // Patches — explicit + auto-generated defaults when UseDefaultPatches is true
     let use_defaults = theme.manifest.use_default_patches.unwrap_or(true);
-    let mut patches: Vec<Value> = theme.manifest.patches.iter().map(|p| {
-        let mut obj = serde_json::Map::new();
-        obj.insert("matchRegex".into(), Value::String(p.match_regex_string.clone()));
-        if let Some(ref css) = p.target_css {
-            let resolved = theme.resolve_path(css).to_string_lossy().into_owned();
-            obj.insert("targetCss".into(), Value::String(resolved));
-        }
-        if let Some(ref js) = p.target_js {
-            let resolved = theme.resolve_path(js).to_string_lossy().into_owned();
-            obj.insert("targetJs".into(), Value::String(resolved));
-        }
-        Value::Object(obj)
-    }).collect();
+    let mut patches: Vec<Value> = theme
+        .manifest
+        .patches
+        .iter()
+        .map(|p| {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "matchRegex".into(),
+                Value::String(p.match_regex_string.clone()),
+            );
+            if let Some(ref css) = p.target_css {
+                let resolved = theme.resolve_path(css).to_string_lossy().into_owned();
+                obj.insert("targetCss".into(), Value::String(resolved));
+            }
+            if let Some(ref js) = p.target_js {
+                let resolved = theme.resolve_path(js).to_string_lossy().into_owned();
+                obj.insert("targetJs".into(), Value::String(resolved));
+            }
+            Value::Object(obj)
+        })
+        .collect();
 
     // Auto-generate default patches for Millennium-compatible themes
     if use_defaults && patches.is_empty() {
@@ -80,7 +99,11 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
             ("^Steam$", Some("elements/gamepage.css"), None),
             ("^Steam$", Some("elements/downloads.css"), None),
             (".friendsui-container", Some("friends.custom.css"), None),
-            ("^notificationtoasts_", Some("elements/notifications.css"), None),
+            (
+                "^notificationtoasts_",
+                Some("elements/notifications.css"),
+                None,
+            ),
             (".*", Some("elements/scrollbar.css"), None),
             (".*", Some("elements/overlay.css"), None),
             (".*", Some("elements/miniprofile.css"), None),
@@ -92,13 +115,19 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
             if let Some(css_rel) = css_opt {
                 let full = theme.resolve_path(css_rel);
                 if full.exists() {
-                    obj.insert("targetCss".into(), Value::String(full.to_string_lossy().into_owned()));
+                    obj.insert(
+                        "targetCss".into(),
+                        Value::String(full.to_string_lossy().into_owned()),
+                    );
                 }
             }
             if let Some(js_rel) = js_opt {
                 let full = theme.resolve_path(js_rel);
                 if full.exists() {
-                    obj.insert("targetJs".into(), Value::String(full.to_string_lossy().into_owned()));
+                    obj.insert(
+                        "targetJs".into(),
+                        Value::String(full.to_string_lossy().into_owned()),
+                    );
                 }
             }
             if obj.contains_key("targetCss") || obj.contains_key("targetJs") {
@@ -129,7 +158,10 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
     let mut conditions_out = serde_json::Map::new();
     for (name, cond) in &theme.manifest.conditions {
         let mut cond_obj = serde_json::Map::new();
-        cond_obj.insert("description".into(), Value::String(cond.description.clone()));
+        cond_obj.insert(
+            "description".into(),
+            Value::String(cond.description.clone()),
+        );
         cond_obj.insert("tab".into(), Value::String(cond.tab.clone()));
         cond_obj.insert("section".into(), Value::String(cond.section.clone()));
         cond_obj.insert("default".into(), cond.default.clone());
@@ -147,9 +179,16 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
                         let resolved = theme.resolve_path(src).to_string_lossy().into_owned();
                         css_obj.insert("src".into(), Value::String(resolved));
                     }
-                    css_obj.insert("affects".into(), Value::Array(
-                        target_css.affects.iter().map(|a| Value::String(a.clone())).collect()
-                    ));
+                    css_obj.insert(
+                        "affects".into(),
+                        Value::Array(
+                            target_css
+                                .affects
+                                .iter()
+                                .map(|a| Value::String(a.clone()))
+                                .collect(),
+                        ),
+                    );
                     val_obj.insert("targetCss".into(), Value::Object(css_obj));
                 }
                 if let Some(ref target_js) = val.target_js {
@@ -158,9 +197,16 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
                         let resolved = theme.resolve_path(src).to_string_lossy().into_owned();
                         js_obj.insert("src".into(), Value::String(resolved));
                     }
-                    js_obj.insert("affects".into(), Value::Array(
-                        target_js.affects.iter().map(|a| Value::String(a.clone())).collect()
-                    ));
+                    js_obj.insert(
+                        "affects".into(),
+                        Value::Array(
+                            target_js
+                                .affects
+                                .iter()
+                                .map(|a| Value::String(a.clone()))
+                                .collect(),
+                        ),
+                    );
                     val_obj.insert("targetJs".into(), Value::Object(js_obj));
                 }
                 values_out.insert(val_name.clone(), Value::Object(val_obj));
@@ -170,7 +216,10 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
 
         if let Some(ref slider) = cond.slider {
             let mut slider_obj = serde_json::Map::new();
-            slider_obj.insert("cssVariable".into(), Value::String(slider.css_variable.clone()));
+            slider_obj.insert(
+                "cssVariable".into(),
+                Value::String(slider.css_variable.clone()),
+            );
             slider_obj.insert("min".into(), Value::from(slider.min));
             slider_obj.insert("max".into(), Value::from(slider.max));
             slider_obj.insert("step".into(), Value::from(slider.step));
@@ -178,11 +227,9 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
 
             // Compute current value from selection or default
             let current_str = condition_config.get_selection(&theme.name, name, &cond.default);
-            let current_val: f64 = current_str.parse().unwrap_or_else(|_| {
-                match &cond.default {
-                    Value::Number(n) => n.as_f64().unwrap_or(slider.min),
-                    _ => slider.min,
-                }
+            let current_val: f64 = current_str.parse().unwrap_or_else(|_| match &cond.default {
+                Value::Number(n) => n.as_f64().unwrap_or(slider.min),
+                _ => slider.min,
             });
             slider_obj.insert("currentValue".into(), Value::from(current_val));
             cond_obj.insert("slider".into(), Value::Object(slider_obj));
@@ -193,8 +240,10 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
     manifest.insert("conditions".into(), Value::Object(conditions_out));
 
     // UseDefaultPatches
-    manifest.insert("useDefaultPatches".into(),
-        Value::Bool(theme.manifest.use_default_patches.unwrap_or(true)));
+    manifest.insert(
+        "useDefaultPatches".into(),
+        Value::Bool(theme.manifest.use_default_patches.unwrap_or(true)),
+    );
 
     let manifest_path = runtime.join("theme-manifest.json");
     let json_str = serde_json::to_string_pretty(&Value::Object(manifest))
@@ -232,7 +281,8 @@ pub fn read_active_theme_name() -> Option<String> {
 
     // Try Millennium format first: {"themes": {"activeTheme": "name", ...}}
     if let Ok(parsed) = serde_json::from_str::<Value>(content) {
-        if let Some(theme_name) = parsed.get("themes")
+        if let Some(theme_name) = parsed
+            .get("themes")
             .and_then(|t| t.get("activeTheme"))
             .and_then(|v| v.as_str())
         {
@@ -259,9 +309,13 @@ pub fn write_active_theme_name(name: &str) -> Result<(), String> {
         if let Some(themes) = parsed.get_mut("themes") {
             if let Some(obj) = themes.as_object_mut() {
                 obj.insert("activeTheme".into(), Value::String(name.to_string()));
-                let json = serde_json::to_string_pretty(&parsed).map_err(|e| format!("serialize: {}", e))?;
+                let json = serde_json::to_string_pretty(&parsed)
+                    .map_err(|e| format!("serialize: {}", e))?;
                 safe_write(&active_path, &json)?;
-                crate::log_to_temp(&format!("[theme] Active theme set to: {} (Millennium format)", name));
+                crate::log_to_temp(&format!(
+                    "[theme] Active theme set to: {} (Millennium format)",
+                    name
+                ));
                 return Ok(());
             }
         }
@@ -269,8 +323,14 @@ pub fn write_active_theme_name(name: &str) -> Result<(), String> {
 
     // Fallback: legacy format
     let json = serde_json::json!({ "theme": name });
-    safe_write(&active_path, &serde_json::to_string_pretty(&json).unwrap_or_default())?;
-    crate::log_to_temp(&format!("[theme] Active theme set to: {} (legacy format)", name));
+    safe_write(
+        &active_path,
+        &serde_json::to_string_pretty(&json).unwrap_or_default(),
+    )?;
+    crate::log_to_temp(&format!(
+        "[theme] Active theme set to: {} (legacy format)",
+        name
+    ));
     Ok(())
 }
 
@@ -459,21 +519,33 @@ impl LoadedTheme {
     pub fn webkit_css_path(&self) -> Option<PathBuf> {
         let rel = self.manifest.webkit_css.as_ref()?;
         let path = self.resolve_path(rel);
-        if path.exists() { Some(path) } else { None }
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     /// Get the webkit JS path (global injection)
     pub fn webkit_js_path(&self) -> Option<PathBuf> {
         let rel = self.manifest.webkit_js.as_ref()?;
         let path = self.resolve_path(rel);
-        if path.exists() { Some(path) } else { None }
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     /// Get the root colors CSS path
     pub fn root_colors_path(&self) -> Option<PathBuf> {
         let rel = self.manifest.root_colors.as_ref()?;
         let path = self.resolve_path(rel);
-        if path.exists() { Some(path) } else { None }
+        if path.exists() {
+            Some(path)
+        } else {
+            None
+        }
     }
 }
 
@@ -524,7 +596,9 @@ pub fn load_theme(name: &str) -> Option<LoadedTheme> {
         Ok(manifest) => {
             log_to_temp(&format!(
                 "[theme] Loaded theme '{}': {} patches, {} conditions",
-                name, manifest.patches.len(), manifest.conditions.len(),
+                name,
+                manifest.patches.len(),
+                manifest.conditions.len(),
             ));
             Some(LoadedTheme {
                 name: name.to_string(),
@@ -562,7 +636,8 @@ impl ThemeConditionConfig {
         if let Ok(raw) = fs::read_to_string(&active_path) {
             let content = raw.trim_start_matches('\u{FEFF}');
             if let Ok(parsed) = serde_json::from_str::<Value>(content) {
-                if let Some(conditions) = parsed.get("themes")
+                if let Some(conditions) = parsed
+                    .get("themes")
                     .and_then(|t| t.get("conditions"))
                     .and_then(|c| c.as_object())
                 {
@@ -571,9 +646,13 @@ impl ThemeConditionConfig {
                         .map(|(theme, theme_conds)| {
                             let conds: HashMap<String, String> = theme_conds
                                 .as_object()
-                                .map(|m| m.iter()
-                                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                                    .collect())
+                                .map(|m| {
+                                    m.iter()
+                                        .filter_map(|(k, v)| {
+                                            v.as_str().map(|s| (k.clone(), s.to_string()))
+                                        })
+                                        .collect()
+                                })
                                 .unwrap_or_default();
                             (theme.clone(), conds)
                         })
@@ -603,10 +682,11 @@ impl ThemeConditionConfig {
         let base = themes_base_dir().ok_or("No themes base dir")?;
         let active_path = base.join("active.json");
 
-        let raw = fs::read_to_string(&active_path).map_err(|e| format!("read active.json: {}", e))?;
+        let raw =
+            fs::read_to_string(&active_path).map_err(|e| format!("read active.json: {}", e))?;
         let content = raw.trim_start_matches('\u{FEFF}');
-        let mut parsed: Value = serde_json::from_str(&content)
-            .map_err(|e| format!("parse active.json: {}", e))?;
+        let mut parsed: Value =
+            serde_json::from_str(&content).map_err(|e| format!("parse active.json: {}", e))?;
 
         // Build the conditions object from our selections
         let mut conditions_obj = serde_json::Map::new();
@@ -623,7 +703,8 @@ impl ThemeConditionConfig {
             themes["conditions"] = Value::Object(conditions_obj);
         }
 
-        let json = serde_json::to_string_pretty(&parsed).map_err(|e| format!("serialize: {}", e))?;
+        let json =
+            serde_json::to_string_pretty(&parsed).map_err(|e| format!("serialize: {}", e))?;
         safe_write(&active_path, &json)
     }
 
@@ -681,7 +762,10 @@ mod tests {
     fn test_regex_wildcard() {
         assert!(regex_matches(".*", "anything"));
         assert!(regex_matches("^Steam.*", "Steam Overlay"));
-        assert!(regex_matches("^notificationtoasts_", "notificationtoasts_123"));
+        assert!(regex_matches(
+            "^notificationtoasts_",
+            "notificationtoasts_123"
+        ));
     }
 
     #[test]
@@ -694,14 +778,20 @@ mod tests {
 
     #[test]
     fn test_regex_css_class() {
-        assert!(regex_matches(".*friendsui-container.*", ".friendsui-container"));
-        assert!(regex_matches(".*ModalDialogPopup.*", "SomeModalDialogPopup"));
+        assert!(regex_matches(
+            ".*friendsui-container.*",
+            ".friendsui-container"
+        ));
+        assert!(regex_matches(
+            ".*ModalDialogPopup.*",
+            "SomeModalDialogPopup"
+        ));
     }
 
     #[test]
     fn test_parse_skin_json_real() {
         let skin_json_path = std::path::PathBuf::from(
-            r"C:\Users\einey.J4F\AppData\Local\LumaForge\themes\Steam\skin.json"
+            r"C:\Users\einey.J4F\AppData\Local\LumaForge\themes\Steam\skin.json",
         );
         if !skin_json_path.exists() {
             eprintln!("Skipping test: skin.json not found");
@@ -734,7 +824,10 @@ mod tests {
             }
         }
 
-        println!("Parsed skin.json: {} patches, {} conditions",
-            manifest.patches.len(), manifest.conditions.len());
+        println!(
+            "Parsed skin.json: {} patches, {} conditions",
+            manifest.patches.len(),
+            manifest.conditions.len()
+        );
     }
 }

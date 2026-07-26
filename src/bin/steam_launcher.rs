@@ -3,12 +3,14 @@ use std::ffi::c_void;
 use std::mem;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows_sys::Win32::System::Memory::{
+    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, CreateRemoteThread, GetExitCodeThread, ResumeThread,
-    WaitForSingleObject, PROCESS_INFORMATION, STARTUPINFOW, CREATE_SUSPENDED,
+    CreateProcessW, CreateRemoteThread, GetExitCodeThread, ResumeThread, WaitForSingleObject,
+    CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 const INFINITE: u32 = 0xFFFFFFFF;
@@ -53,8 +55,7 @@ fn find_steam_exe() -> Option<PathBuf> {
 
 fn find_steam_via_registry() -> Option<PathBuf> {
     use windows_sys::Win32::System::Registry::{
-        RegOpenKeyExW, RegQueryValueExW, RegCloseKey,
-        HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
     };
 
     let key_path = to_wide(r"SOFTWARE\Valve\Steam");
@@ -185,20 +186,27 @@ fn main() {
         Some(p) => p,
         None => {
             eprintln!("[LumaForge Launcher] ERROR: Could not find steam.exe");
-            eprintln!("[LumaForge Launcher] Usage: {} [path\\to\\steam.exe]", exe_name_str);
+            eprintln!(
+                "[LumaForge Launcher] Usage: {} [path\\to\\steam.exe]",
+                exe_name_str
+            );
             std::process::exit(1);
         }
     };
     eprintln!("[LumaForge Launcher] Found Steam: {}", steam_exe.display());
 
-    let steam_dir = steam_exe.parent().expect("steam.exe has no parent directory");
+    let steam_dir = steam_exe
+        .parent()
+        .expect("steam.exe has no parent directory");
     let user32_proxy = steam_dir.join("user32.dll");
     if !user32_proxy.exists() {
         eprintln!(
             "[LumaForge Launcher] ERROR: user32.dll proxy not found at {}",
             user32_proxy.display()
         );
-        eprintln!("[LumaForge Launcher] Place user32.dll in the Steam directory alongside steam.exe.");
+        eprintln!(
+            "[LumaForge Launcher] Place user32.dll in the Steam directory alongside steam.exe."
+        );
         std::process::exit(1);
     }
 

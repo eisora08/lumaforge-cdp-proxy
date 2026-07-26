@@ -1,6 +1,6 @@
+use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use serde_json::json;
 
 const BRIDGE_PORT: u16 = 21775;
 const CORS_HEADERS: &str = "\
@@ -14,11 +14,17 @@ pub fn start_bridge_server() {
         let listener = match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT)) {
             Ok(l) => l,
             Err(e) => {
-                crate::log_to_temp(&format!("[bridge] Failed to bind port {}: {}", BRIDGE_PORT, e));
+                crate::log_to_temp(&format!(
+                    "[bridge] Failed to bind port {}: {}",
+                    BRIDGE_PORT, e
+                ));
                 return;
             }
         };
-        crate::log_to_temp(&format!("[bridge] Mini-bridge listening on port {}", BRIDGE_PORT));
+        crate::log_to_temp(&format!(
+            "[bridge] Mini-bridge listening on port {}",
+            BRIDGE_PORT
+        ));
 
         for stream in listener.incoming() {
             match stream {
@@ -36,8 +42,12 @@ pub fn start_bridge_server() {
 }
 
 fn handle_connection(mut stream: std::net::TcpStream) {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
 
     let cloned = match stream.try_clone() {
         Ok(s) => s,
@@ -95,7 +105,11 @@ fn handle_connection(mut stream: std::net::TcpStream) {
         return;
     }
 
-    crate::log_to_temp(&format!("[bridge] {} {}", method, &path[..path.len().min(120)]));
+    crate::log_to_temp(&format!(
+        "[bridge] {} {}",
+        method,
+        &path[..path.len().min(120)]
+    ));
 
     let (status, response_body) = route_request(method, path, &body);
 
@@ -188,7 +202,11 @@ fn send_response(stream: &mut std::net::TcpStream, status: u16, body: &str, cont
         status,
         status_text,
         CORS_HEADERS,
-        if content_type.is_empty() { "text/plain" } else { content_type },
+        if content_type.is_empty() {
+            "text/plain"
+        } else {
+            content_type
+        },
         body.len(),
         body
     );

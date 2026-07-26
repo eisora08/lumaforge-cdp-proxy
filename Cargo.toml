@@ -38,6 +38,7 @@ mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"]
 base64 = "0.22"
 regex = "1"
 zip = "0.6"
+sha2 = "0.10"
 
 [build-dependencies]
 cc = "1"
