@@ -355,9 +355,7 @@ fn register_host_functions(lua: &Lua, plugin_dir: &PathBuf) -> LuaResult<()> {
         "steam_open_library",
         lua.create_function(move |_, app_id: String| -> LuaResult<bool> {
             let uri = format!("steam://nav/games/details/{}", app_id);
-            let _ = std::process::Command::new("cmd")
-                .args(["/c", "start", &uri])
-                .spawn();
+            let _ = open::that(&uri);
             Ok(true)
         })?,
     )?;

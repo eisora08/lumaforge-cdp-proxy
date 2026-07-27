@@ -39,6 +39,7 @@ base64 = "0.22"
 regex = "1"
 zip = "0.6"
 sha2 = "0.10"
+open = "5"
 
 [build-dependencies]
 cc = "1"
