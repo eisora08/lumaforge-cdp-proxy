@@ -1,6 +1,7 @@
 use minhook::MinHook;
 use std::ffi::c_void;
 use std::mem;
+use std::sync::Once;
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
@@ -128,6 +129,87 @@ unsafe extern "system" fn hook_create_process_w(
     }
 
     let is_webhelper = new_cmd.is_some();
+
+    // Iniciar el thread de CDP solo una vez
+    static INJECTION_STARTED: Once = Once::new();
+    if is_webhelper {
+        INJECTION_STARTED.call_once(|| {
+            let port = port;
+            std::thread::spawn(move || {
+                let max_attempts = 10;
+                let mut attempt = 0;
+
+                loop {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    match crate::cdp::CdpClient::connect(port) {
+                        Ok(mut client) => {
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] Connected to CDP (attempt {})",
+                                attempt
+                            ));
+                            match crate::injector::inject_all(&mut client) {
+                                Ok(()) => {
+                                    crate::log_to_temp("[steamcdp] Injection complete");
+                                }
+                                Err(e) => {
+                                    crate::log_to_temp(&format!("[steamcdp] Injection error: {}", e));
+                                }
+                            }
+
+                            let mut injected_targets: std::collections::HashSet<String> =
+                                std::collections::HashSet::new();
+                            if let Ok(targets) = client.get_targets() {
+                                for t in &targets {
+                                    if t.target_type == "page" {
+                                        injected_targets.insert(t.id.clone());
+                                    }
+                                }
+                            }
+
+                            crate::log_to_temp("[steamcdp] Watching for new targets...");
+                            let (theme_dir, theme_patches) = crate::injector::load_theme_patches();
+                            while client.is_alive() {
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+
+                                if let Ok(new_targets) = client.get_targets() {
+                                    for t in &new_targets {
+                                        if t.target_type == "page" && !injected_targets.contains(&t.id) {
+                                            crate::log_to_temp(&format!(
+                                                "[steamcdp] New target: id={}, title=\"{}\", url={}",
+                                                t.id, t.title, &t.url[..t.url.len().min(100)]
+                                            ));
+                                            let plugins = crate::plugin_loader::load_enabled_plugins().unwrap_or_default();
+                                            if let Err(e) = crate::injector::inject_into_target(&mut client, t, &plugins, &theme_dir, &theme_patches, injected_targets.len() + 1) {
+                                                crate::log_to_temp(&format!("[steamcdp] New target injection failed: {}", e));
+                                            } else {
+                                                injected_targets.insert(t.id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            crate::log_to_temp("[steamcdp] CDP connection lost, reconnecting...");
+                            attempt = 0;
+                        }
+                        Err(e) => {
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] CDP connect attempt {} failed: {}",
+                                attempt, e
+                            ));
+                            if attempt >= max_attempts {
+                                crate::log_to_temp("[steamcdp] Max attempts reached, giving up");
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(3000));
+                            continue;
+                        }
+                    }
+                }
+            });
+        });
+    }
 
     let result = match new_cmd {
         Some(modified) => {

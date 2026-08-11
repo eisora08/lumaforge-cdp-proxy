@@ -1,6 +1,8 @@
 mod bridge;
+mod cdp;
 mod discovery;
 mod hook;
+mod injector;
 mod ipc;
 mod lua_backend;
 mod package_installer;
