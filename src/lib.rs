@@ -212,8 +212,10 @@ unsafe extern "system" fn DllMain(
                 }
             });
 
-            // 5. Bridge server
-            crate::bridge::start_bridge_server();
+            // 5. Bridge server — must not block DllMain
+            std::thread::spawn(|| {
+                crate::bridge::start_bridge_server();
+            });
         }
         DLL_PROCESS_DETACH => {
             flush_log_buffer();

@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
-name = "user32"
+name = "lumaforge"
 
 [[bin]]
 name = "steam_launcher"
@@ -26,7 +26,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_Memory",
     "Win32_System_Registry",
-
 ] }
 minhook = "0.8"
 rand = "0.8"
@@ -43,7 +42,6 @@ sha2 = "0.10"
 open = "5"
 
 [build-dependencies]
-cc = "1"
 
 [profile.release]
 opt-level = "s"
