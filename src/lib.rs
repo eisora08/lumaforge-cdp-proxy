@@ -12,58 +12,134 @@ pub mod theme;
 
 use std::ffi::c_void;
 use std::mem;
+use std::sync::Mutex;
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
-use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
 
-// Función para terminar procesos steamwebhelper.exe existentes
-unsafe fn kill_existing_webhelpers() {
-    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if snapshot == INVALID_HANDLE_VALUE {
-        log_to_temp("[steamcdp] Failed to create process snapshot");
+// ---------------------------------------------------------------------------
+// Buffered logging
+// ---------------------------------------------------------------------------
+
+static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn flush_log_buffer() {
+    let Ok(mut buf) = LOG_BUFFER.lock() else {
+        return;
+    };
+    if buf.is_empty() {
         return;
     }
 
-    let mut entry: PROCESSENTRY32W = mem::zeroed();
-    entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
 
-    if Process32FirstW(snapshot, &mut entry) == 0 {
-        CloseHandle(snapshot);
-        return;
-    }
-
-    let mut killed_count = 0;
-    loop {
-        let name = String::from_utf16_lossy(&entry.szExeFile);
-        if name.to_lowercase().contains("steamwebhelper.exe") {
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, entry.th32ProcessID);
-            if !handle.is_null() {
-                if TerminateProcess(handle, 0) != 0 {
-                    killed_count += 1;
-                }
-                CloseHandle(handle);
+    unsafe {
+        let mut env_buf = [0u16; 260];
+        let temp_key: Vec<u16> = "TEMP".encode_utf16().chain(std::iter::once(0)).collect();
+        let len = GetEnvironmentVariableW(
+            temp_key.as_ptr(),
+            env_buf.as_mut_ptr(),
+            env_buf.len() as u32,
+        );
+        let temp_dir = if len > 0 && (len as usize) < env_buf.len() {
+            String::from_utf16_lossy(&env_buf[..len as usize])
+        } else {
+            "C:\\Windows\\Temp".to_string()
+        };
+        let path = format!("{}\\steamcdp_proxy.log", temp_dir);
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            for line in buf.drain(..) {
+                let _ = file.write_all(line.as_bytes());
             }
         }
-        if Process32NextW(snapshot, &mut entry) == 0 {
-            break;
-        }
-    }
-    CloseHandle(snapshot);
-
-    if killed_count > 0 {
-        log_to_temp(&format!(
-            "[steamcdp] Terminated {} existing steamwebhelper processes",
-            killed_count
-        ));
     }
 }
+
+pub(crate) fn log_to_temp(msg: &str) {
+    let line = format!("{}\r\n", msg);
+    let should_flush = {
+        let Ok(mut buf) = LOG_BUFFER.lock() else {
+            return;
+        };
+        buf.push(line);
+        buf.len() >= 10
+    };
+    if should_flush {
+        flush_log_buffer();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stealth kill — polls for webhelpers, then TerminateProcess all at once
+// ---------------------------------------------------------------------------
+
+unsafe fn stealth_kill_all_webhelpers() {
+    for _ in 0..120 {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+
+        let mut entry: PROCESSENTRY32W = mem::zeroed();
+        entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut entry) == 0 {
+            CloseHandle(snapshot);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+
+        let mut pids: Vec<u32> = Vec::new();
+        loop {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            if name.eq_ignore_ascii_case("steamwebhelper.exe") {
+                pids.push(entry.th32ProcessID);
+            }
+            if Process32NextW(snapshot, &mut entry) == 0 {
+                break;
+            }
+        }
+        CloseHandle(snapshot);
+
+        if pids.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+
+        for pid in &pids {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, *pid);
+            if !handle.is_null() {
+                TerminateProcess(handle, 0);
+                CloseHandle(handle);
+            } else {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .output();
+            }
+        }
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DllMain
+// ---------------------------------------------------------------------------
 
 #[no_mangle]
 #[allow(non_snake_case)]
@@ -92,57 +168,41 @@ unsafe extern "system" fn DllMain(
                 pid, exe_path
             ));
 
-            // Matar webhelpers existentes para forzar reinicio
-            kill_existing_webhelpers();
-
-            // Instalar hooks
+            // 1. Hooks — synchronous
             match hook::install_hook() {
                 Ok(()) => {
-                    log_to_temp(&format!(
-                        "[steamcdp] Hooks installed synchronously in PID {}",
-                        pid
-                    ));
+                    log_to_temp(&format!("[steamcdp] Hooks installed in PID {}", pid));
                 }
                 Err(e) => {
                     log_to_temp(&format!("[steamcdp] Failed to install hooks: {}", e));
                 }
             }
 
-            // Initialize theme system and export for cef_hook
-            match theme::export_theme_for_cef_hook() {
-                Ok(()) => {
-                    log_to_temp("[steamcdp] Theme exported for cef_hook");
-                }
-                Err(e) => {
+            // 2. Kill webhelpers — background thread, polls until found
+            std::thread::spawn(|| {
+                stealth_kill_all_webhelpers();
+            });
+
+            // 3. Theme + IPC — background thread
+            std::thread::spawn(|| {
+                if let Err(e) = theme::export_theme_for_cef_hook() {
                     log_to_temp(&format!("[steamcdp] Theme export failed: {}", e));
                 }
-            }
-
-            // 🔥 Iniciar el servidor IPC y bridge en threads separados
-            std::thread::spawn(|| {
                 if let Err(e) = crate::ipc::start_ipc_server() {
                     log_to_temp(&format!("[steamcdp] IPC server error: {}", e));
                 }
             });
 
-            // Initialize Lua backends for plugins that have them
-            match plugin_loader::load_all_plugins() {
+            // 4. Lua backends — separate thread
+            std::thread::spawn(|| match plugin_loader::load_all_plugins() {
                 Ok(plugins) => {
                     for p in &plugins {
                         if let Some(ref bc) = p.backend_config {
-                            match lua_backend::load_lua_backend(&p._id, &p._dir, bc) {
-                                Ok(()) => {
-                                    log_to_temp(&format!(
-                                        "[steamcdp] Lua backend loaded for {}",
-                                        p._id
-                                    ));
-                                }
-                                Err(e) => {
-                                    log_to_temp(&format!(
-                                        "[steamcdp] Lua backend error for {}: {}",
-                                        p._id, e
-                                    ));
-                                }
+                            if let Err(e) = lua_backend::load_lua_backend(&p._id, &p._dir, bc) {
+                                log_to_temp(&format!(
+                                    "[steamcdp] Lua backend error for {}: {}",
+                                    p._id, e
+                                ));
                             }
                         }
                     }
@@ -150,39 +210,15 @@ unsafe extern "system" fn DllMain(
                 Err(e) => {
                     log_to_temp(&format!("[steamcdp] Plugin load error: {}", e));
                 }
-            }
+            });
 
+            // 5. Bridge server
             crate::bridge::start_bridge_server();
         }
-        DLL_PROCESS_DETACH => {}
+        DLL_PROCESS_DETACH => {
+            flush_log_buffer();
+        }
         _ => {}
     }
     1
-}
-
-pub(crate) fn log_to_temp(msg: &str) {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
-
-    unsafe {
-        let mut buf = [0u16; 260];
-        let temp_key: Vec<u16> = "TEMP".encode_utf16().chain(std::iter::once(0)).collect();
-        let len = GetEnvironmentVariableW(temp_key.as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
-
-        let temp_dir = if len > 0 && (len as usize) < buf.len() {
-            String::from_utf16_lossy(&buf[..len as usize])
-        } else {
-            "C:\\Windows\\Temp".to_string()
-        };
-
-        let path = format!("{}\\steamcdp_proxy.log", temp_dir);
-        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-
-        let line = format!("{}\r\n", msg);
-        let _ = file.write_all(line.as_bytes());
-    }
 }

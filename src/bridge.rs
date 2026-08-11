@@ -105,12 +105,6 @@ fn handle_connection(mut stream: std::net::TcpStream) {
         return;
     }
 
-    crate::log_to_temp(&format!(
-        "[bridge] {} {}",
-        method,
-        &path[..path.len().min(120)]
-    ));
-
     let (status, response_body) = route_request(method, path, &body);
 
     send_response(&mut stream, status, &response_body, "application/json");
