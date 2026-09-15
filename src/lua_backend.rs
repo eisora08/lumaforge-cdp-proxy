@@ -44,22 +44,19 @@ pub fn get_router() -> &'static LuaBackendRouter {
 }
 
 fn detect_steam_root() -> String {
-    let candidates = [
-        "C:\\Program Files (x86)\\Steam",
-        "C:\\Program Files (x86)\\Steam Luma",
-    ];
-    for c in &candidates {
-        if std::path::Path::new(c).join("steam.exe").exists() {
-            return c.to_string();
-        }
-    }
-    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-        let p = std::path::PathBuf::from(&local_appdata).join("Steam");
-        if p.join("steam.exe").exists() {
-            return p.to_string_lossy().to_string();
-        }
-    }
-    "C:\\Program Files (x86)\\Steam".to_string()
+    crate::platform::find_steam_install()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            #[cfg(target_os = "windows")]
+            {
+                "C:\\Program Files (x86)\\Steam".to_string()
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                format!("{}/.steam/steam", home)
+            }
+        })
 }
 
 fn register_host_functions(lua: &Lua, plugin_dir: &PathBuf) -> LuaResult<()> {
@@ -81,7 +78,7 @@ fn register_host_functions(lua: &Lua, plugin_dir: &PathBuf) -> LuaResult<()> {
     globals.set(
         "local_appdata",
         lua.create_function(move |_, ()| -> LuaResult<String> {
-            Ok(std::env::var("LOCALAPPDATA").unwrap_or_default())
+            Ok(crate::platform::local_data_dir().to_string_lossy().to_string())
         })?,
     )?;
 
@@ -372,7 +369,11 @@ fn register_host_functions(lua: &Lua, plugin_dir: &PathBuf) -> LuaResult<()> {
         "lua_dir_path",
         lua.create_function(move |_, app_id: String| -> LuaResult<String> {
             let steam = detect_steam_root();
-            Ok(format!("{}\\config\\lua\\{}.lua", steam, app_id))
+            let sep = crate::platform::SEP;
+            Ok(format!(
+                "{}{}config{}lua{}{}.lua",
+                steam, sep, sep, sep, app_id
+            ))
         })?,
     )?;
 
@@ -380,7 +381,11 @@ fn register_host_functions(lua: &Lua, plugin_dir: &PathBuf) -> LuaResult<()> {
         "manifest_dir_path",
         lua.create_function(move |_, app_id: String| -> LuaResult<String> {
             let steam = detect_steam_root();
-            Ok(format!("{}\\depotcache\\{}.manifest", steam, app_id))
+            let sep = crate::platform::SEP;
+            Ok(format!(
+                "{}{}depotcache{}{}.manifest",
+                steam, sep, sep, app_id
+            ))
         })?,
     )?;
 

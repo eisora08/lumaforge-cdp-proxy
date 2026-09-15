@@ -1,29 +1,26 @@
 mod bridge;
 mod cdp;
 mod discovery;
-mod hook;
 mod injector;
 mod ipc;
 mod lua_backend;
-mod package_installer;
+pub mod platform;
 mod plugin;
-mod plugin_loader;
 pub mod theme;
 
-use std::ffi::c_void;
-use std::mem;
-use std::sync::Mutex;
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
-use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-};
+#[cfg(target_os = "windows")]
+mod hook;
+#[cfg(target_os = "windows")]
+mod package_installer;
+#[cfg(target_os = "windows")]
+mod plugin_loader;
 
-const DLL_PROCESS_ATTACH: u32 = 1;
-const DLL_PROCESS_DETACH: u32 = 0;
+#[cfg(target_os = "linux")]
+mod hook_linux;
+#[cfg(target_os = "linux")]
+mod plugin_loader_linux;
+
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Buffered logging
@@ -41,26 +38,14 @@ fn flush_log_buffer() {
 
     use std::fs::OpenOptions;
     use std::io::Write;
-    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
 
-    unsafe {
-        let mut env_buf = [0u16; 260];
-        let temp_key: Vec<u16> = "TEMP".encode_utf16().chain(std::iter::once(0)).collect();
-        let len = GetEnvironmentVariableW(
-            temp_key.as_ptr(),
-            env_buf.as_mut_ptr(),
-            env_buf.len() as u32,
-        );
-        let temp_dir = if len > 0 && (len as usize) < env_buf.len() {
-            String::from_utf16_lossy(&env_buf[..len as usize])
-        } else {
-            "C:\\Windows\\Temp".to_string()
-        };
-        let path = format!("{}\\steamcdp_proxy.log", temp_dir);
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            for line in buf.drain(..) {
-                let _ = file.write_all(line.as_bytes());
-            }
+    let path = platform::log_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        for line in buf.drain(..) {
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }
@@ -80,10 +65,19 @@ pub(crate) fn log_to_temp(msg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Stealth kill — polls for webhelpers, then TerminateProcess all at once
+// Stealth kill — polls for webhelpers, then kills all at once
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "windows")]
 unsafe fn stealth_kill_all_webhelpers() {
+    use std::mem;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
     for _ in 0..120 {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
@@ -137,17 +131,63 @@ unsafe fn stealth_kill_all_webhelpers() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn stealth_kill_all_webhelpers() {
+    use std::io::Read;
+
+    for _ in 0..120 {
+        let mut pids: Vec<u32> = Vec::new();
+
+        // Scan /proc for steamwebhelper processes
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if let Ok(pid) = name_str.parse::<u32>() {
+                    let cmdline_path = entry.path().join("cmdline");
+                    if let Ok(mut f) = std::fs::File::open(&cmdline_path) {
+                        let mut buf = String::new();
+                        let _ = f.read_to_string(&mut buf);
+                        if buf.contains("steamwebhelper") {
+                            pids.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+
+        if pids.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            continue;
+        }
+
+        for pid in &pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .output();
+        }
+        return;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// DllMain
+// DllMain (Windows) / #[ctor] (Linux)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "windows")]
 #[no_mangle]
 #[allow(non_snake_case)]
 unsafe extern "system" fn DllMain(
-    _hinst: *const c_void,
+    _hinst: *const std::ffi::c_void,
     fdw_reason: u32,
-    _lpv_reserved: *const c_void,
+    _lpv_reserved: *const std::ffi::c_void,
 ) -> i32 {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    const DLL_PROCESS_DETACH: u32 = 0;
+
     match fdw_reason {
         DLL_PROCESS_ATTACH => {
             let pid = GetCurrentProcessId();
@@ -223,4 +263,57 @@ unsafe extern "system" fn DllMain(
         _ => {}
     }
     1
+}
+
+#[cfg(target_os = "linux")]
+#[ctor::ctor]
+fn init() {
+    use std::io::Read;
+
+    // Identify which process loaded us
+    let mut cmdline = String::new();
+    if let Ok(mut f) = std::fs::File::open("/proc/self/cmdline") {
+        let _ = f.read_to_string(&mut cmdline);
+    }
+    let exe_name = cmdline.split('\0').next().unwrap_or("unknown");
+
+    log_to_temp(&format!(
+        "[steamcdp] .so loaded in PID {} exe=\"{}\"",
+        std::process::id(),
+        exe_name
+    ));
+
+    // 1. Kill existing webhelpers
+    std::thread::spawn(|| {
+        stealth_kill_all_webhelpers();
+    });
+
+    // 2. Theme export + IPC server
+    std::thread::spawn(|| {
+        if let Err(e) = theme::export_theme_for_cef_hook() {
+            log_to_temp(&format!("[steamcdp] Theme export failed: {}", e));
+        }
+        if let Err(e) = crate::ipc::start_ipc_server() {
+            log_to_temp(&format!("[steamcdp] IPC server error: {}", e));
+        }
+    });
+
+    // 3. Lua backends
+    std::thread::spawn(|| {
+        // TODO: Load plugins from platform::plugins_dir()
+        // For now, try the existing plugin_loader if available
+        log_to_temp("[steamcdp] Linux: plugin loading not yet implemented");
+    });
+
+    // 4. Bridge server
+    std::thread::spawn(|| {
+        crate::bridge::start_bridge_server();
+    });
+
+    // 5. Start CDP injection loop
+    std::thread::spawn(|| {
+        crate::hook_linux::start_cdp_injection_loop();
+    });
+
+    log_to_temp("[steamcdp] Linux initialization complete");
 }

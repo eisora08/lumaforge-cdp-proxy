@@ -1,18 +1,18 @@
 // src/ipc.rs
 use std::sync::Once;
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeA};
 
-// Constantes de pipes (definidas localmente)
-const PIPE_ACCESS_DUPLEX: u32 = 0x00000003;
-const PIPE_TYPE_MESSAGE: u32 = 0x00000004;
-const PIPE_READMODE_MESSAGE: u32 = 0x00000002;
-const PIPE_WAIT: u32 = 0x00000000;
-
-const PIPE_NAME: &str = r"\\.\pipe\lumalite_core\0";
-
+#[cfg(target_os = "windows")]
 pub fn start_ipc_server() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeA};
+
+    const PIPE_ACCESS_DUPLEX: u32 = 0x00000003;
+    const PIPE_TYPE_MESSAGE: u32 = 0x00000004;
+    const PIPE_READMODE_MESSAGE: u32 = 0x00000002;
+    const PIPE_WAIT: u32 = 0x00000000;
+    const PIPE_NAME: &str = r"\\.\pipe\lumalite_core\0";
+
     static STARTED: Once = Once::new();
     let result = Ok(());
     STARTED.call_once(|| {
@@ -71,12 +71,56 @@ pub fn start_ipc_server() -> Result<(), String> {
     result
 }
 
+#[cfg(target_os = "linux")]
+pub fn start_ipc_server() -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    static STARTED: Once = Once::new();
+    let result = Ok(());
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            let sock_path = std::path::PathBuf::from("/tmp").join("lumalite_core.sock");
+            let _ = std::fs::remove_file(&sock_path);
+
+            let listener = match UnixListener::bind(&sock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    crate::log_to_temp(&format!("[steamcdp] Failed to bind Unix socket: {}", e));
+                    return;
+                }
+            };
+
+            crate::log_to_temp(&format!(
+                "[steamcdp] IPC Unix socket listening on {}",
+                sock_path.display()
+            ));
+
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        let mut buffer = [0u8; 1024];
+                        match stream.read(&mut buffer) {
+                            Ok(n) if n > 0 => {
+                                let command = String::from_utf8_lossy(&buffer[..n]);
+                                let response = handle_command(&command);
+                                let _ = stream.write_all(response.as_bytes());
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        crate::log_to_temp(&format!("[steamcdp] IPC accept error: {}", e));
+                    }
+                }
+            }
+        });
+    });
+    result
+}
+
 fn write_theme_reload_signal() -> Result<(), String> {
-    let local_appdata =
-        std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA not set".to_string())?;
-    let runtime_dir = std::path::PathBuf::from(&local_appdata)
-        .join("LumaForge")
-        .join("runtime");
+    let runtime_dir = crate::platform::runtime_dir();
     std::fs::create_dir_all(&runtime_dir)
         .map_err(|e| format!("Failed to create runtime dir: {}", e))?;
     let signal_path = runtime_dir.join("theme-reload");

@@ -368,13 +368,20 @@ unsafe fn inject_dll_into_process(process_handle: HANDLE, dll_path: &str) -> boo
 fn get_cef_hook_dll_path() -> Option<String> {
     let exe_path = std::env::current_exe().ok()?;
     let exe_dir = exe_path.parent()?;
-    let dll_path = exe_dir.join("lumaforge_cef_hook.dll");
 
+    // Primero buscar en subfolder lumaforge/ (DLL organizada)
+    let dll_path = exe_dir.join("lumaforge").join("lumaforge_cef_hook.dll");
     if dll_path.exists() {
-        Some(dll_path.to_string_lossy().to_string())
-    } else {
-        None
+        return Some(dll_path.to_string_lossy().to_string());
     }
+
+    // Fallback: root de Steam (legacy)
+    let dll_path = exe_dir.join("lumaforge_cef_hook.dll");
+    if dll_path.exists() {
+        return Some(dll_path.to_string_lossy().to_string());
+    }
+
+    None
 }
 
 // --- Pruebas unitarias ---

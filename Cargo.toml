@@ -11,7 +11,7 @@ name = "lumaforge"
 name = "steam_launcher"
 path = "src/bin/steam_launcher.rs"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -28,6 +28,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Registry",
 ] }
 minhook = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+ctor = "0.2"
+libloading = "0.8"
+
+[dependencies]
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -40,6 +47,7 @@ regex = "1"
 zip = "0.6"
 sha2 = "0.10"
 open = "5"
+dirs = "5"
 
 [build-dependencies]
 

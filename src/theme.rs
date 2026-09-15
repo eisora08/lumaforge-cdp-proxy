@@ -11,13 +11,7 @@ fn safe_write(path: &std::path::Path, content: &str) -> Result<(), String> {
 }
 
 fn log_to_temp(msg: &str) {
-    let Ok(local_appdata) = std::env::var("LOCALAPPDATA") else {
-        return;
-    };
-    let log_path = PathBuf::from(local_appdata)
-        .join("LumaForge")
-        .join("runtime")
-        .join("theme.log");
+    let log_path = crate::platform::runtime_dir().join("theme.log");
     let _ = std::fs::create_dir_all(log_path.parent().unwrap());
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -30,21 +24,11 @@ fn log_to_temp(msg: &str) {
 }
 
 fn themes_base_dir() -> Option<PathBuf> {
-    let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
-    Some(
-        PathBuf::from(local_appdata)
-            .join("LumaForge")
-            .join("themes"),
-    )
+    Some(crate::platform::themes_dir())
 }
 
 fn runtime_dir() -> Option<PathBuf> {
-    let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
-    Some(
-        PathBuf::from(local_appdata)
-            .join("LumaForge")
-            .join("runtime"),
-    )
+    Some(crate::platform::runtime_dir())
 }
 
 // ─── Export theme data for cef_hook ─────────────────────────────────────────

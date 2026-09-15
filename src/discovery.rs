@@ -1,14 +1,10 @@
 use std::fs;
 use std::net::TcpListener;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, MoveFileExW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-};
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
 
 const DEFAULT_DEBUG_PORT: u16 = 9222;
 const PORT_MIN: u16 = 1024;
@@ -61,40 +57,29 @@ pub fn resolve_debug_port() -> u16 {
 }
 
 fn discovery_runtime_dir() -> Result<PathBuf, String> {
-    let local_app_data =
-        std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA not set".to_string())?;
-    Ok(PathBuf::from(local_app_data)
-        .join("LumaForge")
-        .join("runtime"))
+    Ok(crate::platform::runtime_dir())
 }
 
-unsafe fn raw_move_file_exw(tmp: &Path, dest: &Path) -> Result<(), String> {
-    let tmp_wide: Vec<u16> = tmp
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let dest_wide: Vec<u16> = dest
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-    let ok = MoveFileExW(tmp_wide.as_ptr(), dest_wide.as_ptr(), flags);
-    if ok == 0 {
-        let err = std::io::Error::last_os_error();
-        let _ = fs::remove_file(tmp);
-        return Err(format!("MoveFileExW failed: {}", err));
-    }
-    Ok(())
-}
+// ── Atomic file write ────────────────────────────────────────────────────────
 
+#[cfg(target_os = "windows")]
 fn write_json_and_atomic_replace(dest: &Path, json: &str) -> Result<PathBuf, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, MoveFileExW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
     let tmp = dest.with_extension("json.tmp");
     let json_bytes = json.as_bytes();
 
     unsafe {
         let tmp_wide: Vec<u16> = tmp
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let dest_wide: Vec<u16> = dest
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
@@ -132,15 +117,31 @@ fn write_json_and_atomic_replace(dest: &Path, json: &str) -> Result<PathBuf, Str
         windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(handle);
         CloseHandle(handle);
 
-        raw_move_file_exw(&tmp, dest)?;
+        let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+        let ok = MoveFileExW(tmp_wide.as_ptr(), dest_wide.as_ptr(), flags);
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("MoveFileExW failed: {}", err));
+        }
     }
-
-    let _ = fs::remove_file(tmp.with_extension("json.tmp"));
 
     if dest.exists() {
         Ok(dest.to_path_buf())
     } else {
         Err("Destination not found after MoveFileExW".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_json_and_atomic_replace(dest: &Path, json: &str) -> Result<PathBuf, String> {
+    let tmp = dest.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| format!("write tmp: {}", e))?;
+    fs::rename(&tmp, dest).map_err(|e| format!("rename: {}", e))?;
+    if dest.exists() {
+        Ok(dest.to_path_buf())
+    } else {
+        Err("Destination not found after rename".to_string())
     }
 }
 
