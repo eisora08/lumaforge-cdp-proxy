@@ -1,8 +1,8 @@
 # AGENTS.md — Linux Port: LumaForge Ecosystem
 
-> **Fecha:** 2026-09-15
+> **Fecha:** 2026-09-17 (última actualización)
 > **Branch:** `feat/linux-port` (los 3 repos)
-> **Objetivo:** Portar LumaForge a Linux (Ubuntu/SteamOS)
+> **Objetivo:** Portar LumaForge a Linux (Nobara 44 / Fedora-based)
 
 ---
 
@@ -10,11 +10,22 @@
 
 Tres repositorios fueron modificados para soporte Linux:
 
-| Repo | Branch | Commit | Cambios |
+| Repo | Branch | Último Commit | Cambios |
 |---|---|---|---|
-| `lumaforge-cdp-proxy` | `feat/linux-port` | `1b75bfc` | 12 files, +876/-164 |
+| `lumaforge-cdp-proxy` | `feat/linux-port` | `05856e6` | 12+ files, CDP injection completa |
 | `luma-lite` | `feat/linux-port` | `1b0f1cf` | 29 files, +3474/-33 |
 | `lumaforge-extensions` | `feat/linux-port` | `1230528` | 1 file, +11/-11 |
+
+### Commits del CDP Proxy (orden cronológico)
+```
+05856e6 feat: URL change detection + exponential CDP backoff + optimized bridge drain
+bf7195a feat: Millennium-style libXtst.so.6 proxy + pvs_shim + CDP pipe client
+a016f74 fix: reduce CDP load to match vanilla Steam lifetime + filter Shutdown targets
+3b0cb6f feat: bridge proxy for mixed-content fix + hook subcrate + diagnostics
+ecf9064 feat: working Linux CDP injection with re-injection, diagnostic eval, panic hook
+de01033 docs: add agents.md for Linux port context
+1b75bfc feat: Linux port — cross-platform CDP proxy
+```
 
 ---
 
@@ -23,29 +34,61 @@ Tres repositorios fueron modificados para soporte Linux:
 ```
 LumaForge en Linux:
 ┌─────────────────────────────────────────────────────────┐
-│  lumaforge-cdp-proxy.so (LD_PRELOAD)                   │
-│  ├── hook_linux.rs     → execve hook (inyecta CDP port)│
+│  libXtst.so.6 proxy (hook/src/lib.rs)                  │
+│  ├── Steam carga automáticamente (reemplaza libXtst)   │
+│  ├── Forward XTest functions via dlsym                  │
+│  └── dlopen liblumaforge.so en ctor                    │
+├─────────────────────────────────────────────────────────┤
+│  liblumaforge.so (#[ctor] init)                        │
+│  ├── hook_linux.rs     → CDP injection loop (5s cycle) │
+│  │   ├── Exponential backoff: 200ms → 1s               │
+│  │   ├── URL change detection (known_urls HashMap)     │
+│  │   ├── Bridge drain every 5s                         │
+│  │   └── Recheck all targets every 30s (store first)  │
+│  ├── injector.rs       → JS injection via CDP          │
+│  │   ├── BRIDGE_PROXY_JS (mixed-content fix)           │
+│  │   ├── addScriptToEvaluateOnNewDocument              │
+│  │   └── Runtime.evaluate for immediate inject         │
 │  ├── platform.rs       → paths de Steam, config, etc.  │
 │  ├── plugin_loader_linux.rs → carga plugins desde disco │
-│  ├── ipc.rs            → Unix socket (/tmp/lumaforge)  │
+│  ├── ipc.rs            → Unix socket (/tmp/lumalite_core.sock)│
 │  ├── discovery.rs      → steam-cdp.json (port discovery)│
-│  ├── cdp.rs            → CDP client (100% portable)    │
-│  ├── bridge.rs         → HTTP bridge server (portable)  │
-│  └── injector.rs       → JS injection via CDP (portable)│
+│  ├── cdp.rs            → CDP client (TCP, reqwest)     │
+│  ├── bridge.rs         → HTTP bridge server (port 21775)│
+│  ├── lua_backend.rs    → Lua 5.4 sandboxed engine      │
+│  └── theme.rs          → Theme export for CEF          │
 ├─────────────────────────────────────────────────────────┤
-│  luma-lite (Tauri 2 app)                               │
-│  ├── commands/slssteam.rs       → SLS Steam integration│
-│  ├── commands/depot_downloader.rs → DepotDownloaderMod  │
-│  ├── commands/steam_acf.rs      → ACF generation       │
-│  ├── commands/steam_library.rs  → Library management   │
-│  ├── commands/manifest_watcher.rs → Manifest backup    │
-│  ├── utils/slssteam_config.rs   → YAML config editor  │
-│  ├── utils/path_utils.rs        → Steam path detection │
-│  └── components/DownloadsView.tsx → Download UI        │
+│  luma-lite (Tauri 2 app) — PUERTO 21775                │
+│  ├── commands/steam_bridge.rs → HTTP bridge (real data) │
+│  ├── commands/slssteam.rs     → SLS Steam integration  │
+│  └── ... (ver sección luma-lite)                        │
 ├─────────────────────────────────────────────────────────┤
 │  lumaforge-extensions/steam-store-helper               │
-│  └── backend.lua → Cross-platform paths (forward slash) │
+│  └── inject.js → Bridge fetch via proxy (HTTPS→HTTP)   │
 └─────────────────────────────────────────────────────────┘
+```
+
+### Flujo de datos (bridge proxy)
+
+```
+1. Steam CEF loads store.steampowered.com (HTTPS)
+2. inject.js intercepts fetch() to 127.0.0.1:21775
+3. Request queued in __lumaBridgeQueue (can't fetch HTTP from HTTPS)
+4. CDP proxy drains queue every 5s via Runtime.evaluate
+5. Rust makes HTTP request to 127.0.0.1:21775 (no mixed-content issue)
+6. Response injected back via Runtime.evaluate
+7. JS Promise resolves with the response
+```
+
+### Desktop launch (sin LD_PRELOAD)
+
+```
+~/.local/share/Steam/ubuntu12_32/libXtst.so.6  ← proxy (32-bit)
+~/.local/share/Steam/ubuntu12_32/liblumaforge.so ← main library (32-bit)
+
+Steam carga libXtst.so.6 automáticamente (necesita XTest).
+El proxy hace dlopen de liblumaforge.so en el ctor.
+No se necesita LD_PRELOAD.
 ```
 
 ---
@@ -59,68 +102,136 @@ LumaForge en Linux:
 
 ### Qué hace
 DLL/.so que se inyecta en Steam para:
-1. Hook de `steamwebhelper` → añadir `--remote-debugging-port`
-2. Servidor bridge HTTP (TCP 21775) para APIs de LumaLite
-3. Exportar tema de Steam para CEF injection
-4. Cargar y ejecutar backends Lua de extensiones
+1. **libXtst.so.6 proxy** — Steam carga automáticamente; forward XTest + dlopen liblumaforge.so
+2. **CDP injection loop** — conecta a Steam CEF debug port, inyecta JS
+3. **Bridge proxy** — resuelve mixed-content (HTTPS→HTTP) via queue drain
+4. **Servidor bridge HTTP** (TCP 21775) — stubs cuando luma-lite no está corriendo
+5. **IPC server** — Unix socket para control remoto (themes, plugins)
+6. **Exportar tema de Steam** para CEF injection
+7. **Cargar y ejecutar backends Lua** de extensiones
+
+### Descubrimientos Importantes
+
+#### 1. Steam binary path
+```
+~/.local/share/Steam/ubuntu12_32/steam  (32-bit)
+steamwebhelper es 64-bit, lanzado via srt-bwrap → pv-adverb → steamwebhelper_sniper_wrap.sh
+```
+
+#### 2. pv-adverb no honors PRESSURE_VESSEL_PREFIX
+pv-adverb tiene `--prefix=/usr/lib/pressure-vessel/from-host` hardcoded. El approach de pasar FDs via FIFOs no funciona porque el container no tiene acceso a los FDs del host.
+
+#### 3. CreateSimpleProcess inline hook NO funciona
+El hook intentaba saltar 5 bytes (E9 jump) sobre `push rbp; push rbx; sub rsp,0x18; call CreateSimpleProcess`. Pero el call tiene 5 bytes (E8 XX XX XX XX), y saltar a fn+5 cae mid-instruction (0x4C = `dec rsp`). El 4to push sobreescribe el callee del call. **Eliminado** — no se necesita con script patching + proxy.
+
+#### 4. Bridge proxy resuelve mixed-content
+HTTPS store pages no pueden hacer fetch() a HTTP. Solución:
+- `BRIDGE_PROXY_JS` intercepta fetch, encola en `__lumaBridgeQueue`
+- CDP proxy drainea la cola cada 5s via `Runtime.evaluate`
+- Rust hace el request HTTP (sin mixed-content)
+- Resultado se inyecta de vuelta via `Runtime.evaluate`
+
+#### 5. addScriptToEvaluateOnNewDocument NO re-fire en SPA
+En Steam CEF, `Page.addScriptToEvaluateOnNewDocument` no se re-ejecuta en navigaciones SPA. Solución: recheck cada 30s re-evalúa `hasLuma` y re-inyecta si es false.
+
+#### 6. URL change detection
+`known_urls` HashMap trackea la URL de cada target. Cuando cambia (store page navigation), se re-inyecta inmediatamente sin esperar al recheck de 30s.
+
+#### 7. --disable-web-security causa crash
+El flag `--remote-debugging-port` funciona. `--disable-web-security` causa crash del webhelper. No usar.
+
+#### 8. Steam lifetime
+Steam en este sistema vive ~60-90s. Matches vanilla lifetime. No es causado por nuestro código.
 
 ### Archivos modificados/creados para Linux
 
 | Archivo | Estado | Qué hace |
 |---|---|---|
-| `src/platform.rs` | **NUEVO** | Abstracción de paths: `find_steam_install()`, `local_data_dir()`, `config_dir()`, `runtime_dir()`, `plugins_dir()`, `themes_dir()` |
-| `src/hook_linux.rs` | **NUEVO** | Loop de inyección CDP: detecta steamwebhelper, publica discovery, conecta CDP, inyecta JS, watchea nuevos targets |
-| `src/plugin_loader_linux.rs` | **NUEVO** | Carga plugins desde `~/.local/share/LumaForge/plugins/` (lee manifest.json, extension-config.json, inject.js) |
-| `src/lib.rs` | **MODIFICADO** | `#[ctor]` en lugar de `DllMain`, cfg gates para Windows/Linux, `stealth_kill_all_webhelpers()` lee `/proc` |
-| `src/ipc.rs` | **MODIFICADO** | Unix domain socket (`/tmp/lumalite_core.sock`) en Linux, named pipes en Windows |
-| `src/discovery.rs` | **MODIFICADO** | `atomic_write` con `fs::rename` en Linux (en vez de `MoveFileExW`) |
-| `src/theme.rs` | **MODIFICADO** | Usa `platform::themes_dir()` y `platform::runtime_dir()` |
-| `src/lua_backend.rs` | **MODIFICADO** | `detect_steam_root()` usa `platform::find_steam_install()`, separadores cross-platform |
+| `hook/src/lib.rs` | **MODIFICADO** | libXtst.so.6 proxy: XTest pass-through + dlopen liblumaforge.so. INIT_DONE guard. Macro-based XTest functions. |
+| `src/hook_linux.rs` | **NUEVO** | CDP injection loop: exponential backoff (200ms→1s), URL change detection, bridge drain 5s, recheck 30s all targets |
+| `src/injector.rs` | **MODIFICADO** | BRIDGE_PROXY_JS (mixed-content fix), diagnostic eval, theme patches |
+| `src/platform.rs` | **NUEVO** | Abstracción de paths: `find_steam_install()`, `local_data_dir()`, `config_dir()`, `runtime_dir()` |
+| `src/plugin_loader_linux.rs` | **NUEVO** | Carga plugins desde `~/.local/share/LumaForge/plugins/` |
+| `src/lib.rs` | **MODIFICADO** | `#[ctor]` init, panic hook, 6 threads (kill, theme+ipc, plugins, bridge, patch script, CDP loop) |
+| `src/ipc.rs` | **MODIFICADO** | Unix domain socket (`/tmp/lumalite_core.sock`) en Linux |
+| `src/discovery.rs` | **MODIFICADO** | `OnceLock` cache, `atomic_write` con `fs::rename` |
+| `src/cdp_pipe.rs` | **NUEVO** | Pipe CDP client (null-byte delimited JSON over FIFOs). **No integrado aún.** |
+| `pvs_shim/pvs_shim.c` | **NUEVO** | 64-bit C binary for pressure-vessel shim. **No funcional** (pv-adverb hardcoded prefix). |
 | `Cargo.toml` | **MODIFICADO** | Deps condicionales: `libc`/`ctor`/`libloading` en Linux, `windows-sys`/`minhook` en Windows |
-| `build.rs` | **MODIFICADO** | Solo compila `cef_hook` en Windows |
 
 ### Archivos 100% portables (sin cambios)
-- `src/cdp.rs` — Cliente CDP
-- `src/bridge.rs` — Servidor HTTP bridge
-- `src/injector.rs` — Inyección JS via CDP
+- `src/cdp.rs` — Cliente CDP (TCP, reqwest)
+- `src/bridge.rs` — Servidor HTTP bridge (stubs)
 - `src/plugin.rs` — Tipos de plugin
+- `src/lua_backend.rs` — Lua sandbox
+- `src/theme.rs` — Theme management
 
-### Cómo compilar en Linux
+### Cómo compilar en Linux (32-bit)
 
 ```bash
-# Instalar dependencias del sistema (Ubuntu/Debian)
-sudo apt-get install -y pkg-config libssl-dev build-essential
+# Instalar dependencias del sistema
+sudo dnf install -y openssl-devel.i686  # Fedora/Nobara
+# or: sudo apt-get install -y pkg-config libssl-dev build-essential gcc-multilib
 
-# Compilar
+# Compilar hook subcrate (32-bit)
+cd ~/Codigo/lumaforge-cdp-proxy/hook
+CC="gcc -m32" cargo build --release --target i686-unknown-linux-gnu
+
+# Compilar proxy principal (32-bit)
 cd ~/Codigo/lumaforge-cdp-proxy
-cargo build --release
+CC="gcc -m32" OPENSSL_LIB_DIR=/usr/lib OPENSSL_INCLUDE_DIR=/usr/include \
+  cargo build --release --target i686-unknown-linux-gnu
 
 # El .so se genera en:
-# target/release/liblumaforge.so
+# target/i686-unknown-linux-gnu/release/liblumaforge.so
+# hook/target/i686-unknown-linux-gnu/release/libXtst.so.6
 ```
 
-### Cómo probar
+### Cómo deployear
 
 ```bash
-# Copiar .so a Steam
-cp target/release/liblumaforge.so ~/.steam/steam/
+# Copiar .so files a Steam directory
+cp target/i686-unknown-linux-gnu/release/liblumaforge.so \
+   ~/.local/share/Steam/ubuntu12_32/
 
-# Lanzar Steam con LD_PRELOAD
-LD_PRELOAD=~/.steam/steam/liblumaforge.so steam
+cp hook/target/i686-unknown-linux-gnu/release/libXtst.so.6 \
+   ~/.local/share/Steam/ubuntu12_32/
 
-# Verificar logs
-cat /tmp/steamcdp_proxy.log
+# Steam carga libXtst.so.6 automáticamente (no necesita LD_PRELOAD)
+# Solo lanzar Steam normalmente:
+steam
 ```
 
-### Dependencias Linux
-- `pkg-config` — para compilar native crates
-- `libssl-dev` — para `reqwest` con TLS
-- `build-essential` — gcc, etc.
+### Verificar logs
 
-### Issues conocidos
-- `hook_linux.rs:95`: `let plugins = Vec::new()` — los plugins no se cargan aún en el loop CDP. Falta integrar `plugin_loader_linux::load_all_plugins()` en el loop.
-- `lib.rs:303`: `log_to_temp("[steamcdp] Linux: plugin loading not yet implemented")` — el init constructor no carga plugins aún. Solo logea.
-- `build.rs`: No compila `cef_hook` en Linux (correcto, no se necesita).
+```bash
+# Ver CDP proxy log
+tail -f /tmp/steamcdp_proxy.log
+
+# Buscar errores
+grep -i error /tmp/steamcdp_proxy.log
+
+# Verificar connection
+grep "Connected to CDP" /tmp/steamcdp_proxy.log
+
+# Verificar inyección
+grep "Injected" /tmp/steamcdp_proxy.log
+
+# Verificar bridge
+grep "BRIDGE" /tmp/steamcdp_proxy.log
+```
+
+### Issues conocidos / Resueltos
+
+| Issue | Estado | Notas |
+|---|---|---|
+| `hook_linux.rs:95` plugins no se cargan | **RESUELTO** | `load_all_plugins()` integrado en init + recheck |
+| `lib.rs:303` carga de plugins no implementada | **RESUELTO** | Thread 3 en init carga plugins + lua backends |
+| CreateSimpleProcess inline hook SEGV | **RESUELTO** | Eliminado — E9 jump sobreescribe mid-instruction |
+| pv-adverb hardcoded prefix | **PENDIENTE** | No se puede pasar FDs al container |
+| CDP pipe client no integrado | **PENDIENTE** | `cdp_pipe.rs` existe pero no se usa |
+| `window_fx.rs` stub en Linux | **OK** | No hay equivalente Linux para Mica/Acrylic |
+| `system_toggle.rs` DLL injection | **PENDIENTE** | Necesita LD_AUDIT equivalent en luma-lite |
 
 ---
 
@@ -263,27 +374,44 @@ steam .. "/config/lua/" .. app_id .. ".lua"
 ## Flujo de Ejecución en Linux
 
 ```
-1. Usuario ejecuta: LD_PRELOAD=liblumaforge.so steam
+1. Usuario ejecuta: steam (sin LD_PRELOAD)
 
-2. liblumaforge.so se carga (#[ctor] init):
-   ├── Lee /proc/self/cmdline para identificar proceso
-   ├── Mata steamwebhelper existentes (pkill)
-   ├── Exporta tema de Steam
-   ├── Inicia IPC server (Unix socket)
-   ├── Inicia bridge server (TCP 21775)
-   └── Inicia CDP injection loop
+2. Steam carga libXtst.so.6 (proxy en ubuntu12_32/):
+   ├── XTest functions forwarded via dlsym
+   └── ctor: dlopen liblumaforge.so
 
-3. CDP injection loop:
-   ├── Publica discovery (steam-cdp.json o TCP)
-   ├── Espera a que CDP esté disponible
-   ├── Conecta a CDP
-   ├── Inyecta JS en targets existentes
-   └── Watchea nuevos targets y los inyecta
+3. liblumaforge.so init (#[ctor]):
+   ├── Panic hook → /tmp/steamcdp_proxy.log
+   ├── Identifica proceso via /proc/self/cmdline
+   ├── Solo ejecuta init en "steam" principal (no child processes)
+   ├── Thread 1: stealth_kill_all_webhelpers() (lee /proc)
+   ├── Thread 2: theme::export_theme_for_cef_hook() + ipc::start_ipc_server()
+   ├── Thread 3: plugin_loader_linux::load_all_plugins() + lua_backend
+   ├── Thread 4: bridge::start_bridge_server() (port 21775)
+   ├── patch_steamwebhelper_script() — añade --remote-debugging-port
+   └── Thread 6: hook_linux::start_cdp_injection_loop()
 
-4. LumaLite detecta CDP:
-   ├── Lee steam-cdp.json o conecta TCP 21775
-   ├── Muestra UI con plugins/extensiones
-   └── Permite gestionar SLS Steam + DepotDownloader
+4. CDP injection loop (5s cycle):
+   ├── Publica discovery (steam-cdp.json)
+   ├── Exponential backoff: 200ms → 400ms → 800ms → 1s
+   ├── Connects to CDP (attempt ~3)
+   ├── inject_all() — bridge proxy + plugins + theme patches
+   └── Loop infinito:
+       ├── Drain bridge queue every 5s
+       ├── Recheck every 30s (all targets, store first)
+       ├── URL change detection → immediate re-inject
+       └── Detect new targets → inject
+
+5. Steam CEF loads store.steampowered.com:
+   ├── inject.js runs (via addScriptToEvaluateOnNewDocument)
+   ├── bridge proxy intercepts fetch to 127.0.0.1:21775
+   ├── Queue drain by CDP proxy (every 5s)
+   └── Response injected back → Promise resolves
+
+6. luma-lite (si está corriendo):
+   ├── Bind port 21775 (real bridge)
+   ├── Handle API requests from inject.js
+   └── Can connect to /tmp/lumalite_core.sock for IPC
 ```
 
 ---
@@ -391,54 +519,55 @@ sudo apt-get install -y curl git gcc g++ make
 
 ## Pasos para Probar en Linux
 
-### 1. Clonar y compilar CDP Proxy
+### 1. Compilar CDP Proxy (32-bit)
 ```bash
-git clone -b feat/linux-port https://github.com/eisora08/lumaforge-cdp-proxy.git
-cd lumaforge-cdp-proxy
-sudo apt-get install -y pkg-config libssl-dev build-essential
-cargo build --release
-# Verificar: target/release/liblumaforge.so existe
+cd ~/Codigo/lumaforge-cdp-proxy/hook
+CC="gcc -m32" cargo build --release --target i686-unknown-linux-gnu
+
+cd ~/Codigo/lumaforge-cdp-proxy
+CC="gcc -m32" OPENSSL_LIB_DIR=/usr/lib OPENSSL_INCLUDE_DIR=/usr/include \
+  cargo build --release --target i686-unknown-linux-gnu
 ```
 
-### 2. Clonar y compilar LumaLite
+### 2. Deployear
 ```bash
-git clone -b feat/linux-port https://github.com/eisora08/luma-lite.git
-cd luma-lite/src-tauri
-sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
-cargo check
-# Si hay errores, verificar dependencias del sistema
+cp target/i686-unknown-linux-gnu/release/liblumaforge.so \
+   ~/.local/share/Steam/ubuntu12_32/
+
+cp hook/target/i686-unknown-linux-gnu/release/libXtst.so.6 \
+   ~/.local/share/Steam/ubuntu12_32/
 ```
 
-### 3. Clonar extensiones
+### 3. Lanzar Steam
 ```bash
-git clone -b feat/linux-port https://github.com/eisora08/lumaforge-extensions.git
-# Copiar steam-store-helper a ~/.local/share/LumaForge/plugins/
-mkdir -p ~/.local/share/LumaForge/plugins
-cp -r lumaforge-extensions/extensions/steam-store-helper ~/.local/share/LumaForge/plugins/
-```
-
-### 4. Probar CDP Proxy
-```bash
-# Copiar .so a Steam
-cp lumaforge-cdp-proxy/target/release/liblumaforge.so ~/.steam/steam/
-
-# Lanzar Steam con proxy
-LD_PRELOAD=~/.steam/steam/liblumaforge.so steam &
+# Steam carga libXtst.so.6 automáticamente
+steam
 
 # Verificar logs
-sleep 5
-cat /tmp/steamcdp_proxy.log
-
-# Verificar discovery
-cat ~/.local/share/LumaForge/runtime/steam-cdp.json
+tail -f /tmp/steamcdp_proxy.log
 ```
 
-### 5. Probar LumaLite
+### 4. Verificar funcionamiento
 ```bash
-cd luma-lite/src-tauri
-cargo run
-# O desde la raíz de luma-lite:
-# npm run tauri dev
+# Buscar connected
+grep "Connected to CDP" /tmp/steamcdp_proxy.log
+
+# Buscar inyección
+grep "Injected" /tmp/steamcdp_proxy.log
+
+# Buscar bridge
+grep "BRIDGE" /tmp/steamcdp_proxy.log
+
+# Buscar URL change
+grep "Store URL changed" /tmp/steamcdp_proxy.log
+```
+
+### 5. Probar LumaLite (pendiente de fix)
+```bash
+cd ~/Codigo/luma-lite/src-tauri
+cargo check  # Debería compilar después del fix
+cargo build --release
+./target/release/luma-lite
 ```
 
 ---
@@ -480,14 +609,25 @@ sudo apt-get install -y libayatana-appindicator3-dev
 
 ## TODO / Pendiente
 
-- [ ] `hook_linux.rs:95` — Integrar `plugin_loader_linux::load_all_plugins()` en el loop CDP
-- [ ] `lib.rs:303` — Implementar carga de plugins en el init constructor de Linux
-- [ ] `system_toggle.rs` — Implementar toggle para Linux (LD_AUDIT en vez de DLL injection)
-- [ ] `window_fx.rs` — Implementar efectos de ventana en Linux (o confirmar que stub es suficiente)
-- [ ] `steam_library.rs:300` — `get_disk_space()` retornar 0, implementar con `libc::statvfs`
-- [ ] Testing completo: CDP injection, theme export, plugin loading, SLS Steam, DepotDownloader
+### CDP Proxy (completado)
+- [x] `hook/src/lib.rs` — libXtst.so.6 proxy with INIT_DONE guard + macro-based XTest
+- [x] `hook_linux.rs` — CDP injection loop with exponential backoff
+- [x] `hook_linux.rs` — URL change detection for immediate re-injection
+- [x] `hook_linux.rs` — Bridge drain every 5s (was 60s)
+- [x] `hook_linux.rs` — Recheck all targets every 30s (store first)
+- [x] `injector.rs` — BRIDGE_PROXY_JS for mixed-content fix
+- [x] `lib.rs` — Panic hook, stealth kill, plugin loading, bridge server
+- [x] `lib.rs` — Desktop launch via libXtst proxy (no LD_PRELOAD needed)
+
+### Pendiente
+- [ ] **luma-lite: Fix compile** — `game_fix.rs:1043` winreg without cfg guard
+- [ ] **luma-lite: Linux gaps** — `is_steam_running()`, `launch_steam_process()`, `set_start_with_system()`
+- [ ] **luma-lite: IPC client** — Connect to `/tmp/lumalite_core.sock` from luma-lite
+- [ ] **Port conflict** — CDP proxy fallback to 21776 if 21775 is taken by luma-lite
+- [ ] `cdp_pipe.rs` — Integrar pipe CDP client (pv-adverb approach)
+- [ ] `system_toggle.rs` — LD_AUDIT equivalent para Linux en luma-lite
+- [ ] Testing completo: CDP injection, theme export, plugin loading, bridge proxy
 - [ ] Packaging: `.deb` y/o AppImage para LumaLite
-- [ ] Script de instalación para CDP proxy
 
 ---
 
