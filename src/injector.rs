@@ -114,6 +114,59 @@ fn regex_matches(pattern: &str, text: &str) -> bool {
 
 // ─── Main injection entry point ─────────────────────────────────────────────
 
+/// Bridge proxy JS — intercepts fetch() to the CDP proxy bridge and routes
+/// it through a global queue so the Rust watcher loop can fulfill requests
+/// without mixed-content issues (HTTPS page → HTTP bridge).
+pub const BRIDGE_PROXY_JS: &str = r#"
+(function(){
+  if (window.__lumaBridgeProxyInstalled) return;
+  window.__lumaBridgeProxyInstalled = true;
+  window.__lumaBridgeQueue = [];
+  window.__lumaBridgeResults = {};
+  var _origFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    var urlStr = (typeof url === 'string') ? url : (url && url.url) || '';
+    if (urlStr.indexOf('127.0.0.1:21775') !== -1 || urlStr.indexOf('localhost:21775') !== -1) {
+      var id = 'bq' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+      var method = (opts && opts.method) || 'GET';
+      var body = (opts && opts.body) || null;
+      var headers = {};
+      if (opts && opts.headers) {
+        if (opts.headers.forEach) {
+          opts.headers.forEach(function(v,k){ headers[k]=v; });
+        } else {
+          for (var k in opts.headers) headers[k] = opts.headers[k];
+        }
+      }
+      window.__lumaBridgeQueue.push({id:id, url:urlStr, method:method, body:body, headers:headers});
+      return new Promise(function(resolve, reject) {
+        var elapsed = 0;
+        var iv = setInterval(function() {
+          elapsed += 100;
+          if (window.__lumaBridgeResults[id]) {
+            clearInterval(iv);
+            var r = window.__lumaBridgeResults[id];
+            delete window.__lumaBridgeResults[id];
+            var h = new Headers();
+            if (r.headers) { for (var k in r.headers) h.set(k, r.headers[k]); }
+            resolve(new Response(r.body || '', {status: r.status || 200, statusText: r.statusText || 'OK', headers: h}));
+          } else if (elapsed > 15000) {
+            clearInterval(iv);
+            reject(new Error('Bridge proxy timeout'));
+          }
+        }, 100);
+      });
+    }
+    return _origFetch.apply(this, arguments);
+  };
+  window.__lumaBridgeDrain = function() {
+    var q = window.__lumaBridgeQueue;
+    window.__lumaBridgeQueue = [];
+    return JSON.stringify(q);
+  };
+})();
+"#;
+
 pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     let plugins = load_enabled_plugins().unwrap_or_default();
     let (theme_dir, patches) = load_theme_patches();
@@ -284,6 +337,45 @@ pub fn inject_into_target(
             msg_id += 1;
         }
     }
+
+    // ─── Bridge proxy: intercept fetch() for HTTPS→HTTP mixed content ───
+    // Register for future navigations
+    let resp = client.send_cdp_wait(
+        &json!({
+            "id": msg_id,
+            "method": "Page.addScriptToEvaluateOnNewDocument",
+            "params": {
+                "source": BRIDGE_PROXY_JS,
+                "runImmediately": true
+            }
+        }),
+        msg_id,
+    )?;
+    if let Some(err) = resp.get("error") {
+        crate::log_to_temp(&format!("[steamcdp] Bridge proxy addScript error: {}", err));
+    } else {
+        crate::log_to_temp("[steamcdp] Bridge proxy registered for new documents");
+    }
+    msg_id += 1;
+
+    // Also execute immediately on current page
+    let resp = client.send_cdp_wait(
+        &json!({
+            "id": msg_id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": BRIDGE_PROXY_JS,
+                "returnByValue": true
+            }
+        }),
+        msg_id,
+    )?;
+    if let Some(err) = resp.get("error") {
+        crate::log_to_temp(&format!("[steamcdp] Bridge proxy eval error: {}", err));
+    } else {
+        crate::log_to_temp("[steamcdp] Bridge proxy installed on current page");
+    }
+    msg_id += 1;
 
     // ─── Plugins ──────────────────────────────────────────────────────
     for plugin in plugins {

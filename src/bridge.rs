@@ -68,6 +68,13 @@ fn handle_connection(mut stream: std::net::TcpStream) {
     let method = parts[0];
     let path = parts[1];
 
+    crate::log_to_temp(&format!(
+        "[bridge] {} {} from {:?}",
+        method,
+        path,
+        stream.peer_addr().ok()
+    ));
+
     let mut content_length: usize = 0;
     let mut headers: Vec<(String, String)> = Vec::new();
 

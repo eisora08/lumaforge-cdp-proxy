@@ -25,12 +25,117 @@ pub fn build_webhelper_args(argv: &[String], port: u16) -> Option<Vec<String>> {
 
     let mut new_argv = argv.to_vec();
     new_argv.push(format!("--remote-debugging-port={}", port));
+    new_argv.push("--remote-allow-origins=*".to_string());
     Some(new_argv)
 }
 
 /// Main CDP injection loop for Linux.
 /// Called from the init() constructor.
 /// Polls for steamwebhelper processes and injects via CDP.
+
+/// Drain the bridge proxy queue from all injected targets and fulfill
+/// pending HTTP requests from Rust (bypasses mixed-content blocking).
+fn drain_bridge_queue(client: &mut crate::cdp::CdpClient, injected: &std::collections::HashSet<String>) {
+    for target_id in injected {
+        if target_id.is_empty() {
+            continue;
+        }
+        if let Err(_) = client.attach_to_target(target_id) {
+            continue;
+        }
+        let drain_expr = r#"(function(){
+            if (!window.__lumaBridgeDrain) return '[]';
+            return window.__lumaBridgeDrain();
+        })()"#;
+        let resp = match client.send_cdp_wait(
+            &serde_json::json!({
+                "id": 7700,
+                "method": "Runtime.evaluate",
+                "params": { "expression": drain_expr, "returnByValue": true }
+            }),
+            7700,
+        ) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let queue_str = resp.get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("[]");
+        let queue: Vec<serde_json::Value> = serde_json::from_str(queue_str).unwrap_or_default();
+        if queue.is_empty() {
+            continue;
+        }
+
+        for req in &queue {
+            let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let body = req.get("body").and_then(|v| v.as_str());
+
+            let result = make_bridge_request(method, url, body);
+            let inject_expr = format!(
+                "window.__lumaBridgeResults['{}'] = {};",
+                id.replace('\'', "\\'"),
+                serde_json::to_string(&result).unwrap_or_default()
+            );
+            let _ = client.send_cdp_wait(
+                &serde_json::json!({
+                    "id": 7701,
+                    "method": "Runtime.evaluate",
+                    "params": { "expression": &inject_expr, "returnByValue": true }
+                }),
+                7701,
+            );
+        }
+    }
+}
+
+/// Make an HTTP request to the local bridge (called from Rust, not CEF).
+fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_json::Value {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build() {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": format!("Client build error: {}", e)});
+            }
+        };
+
+    let mut req = match method {
+        "POST" => {
+            let mut r = client.post(url);
+            if let Some(b) = body {
+                r = r.body(b.to_string()).header("content-type", "application/json");
+            }
+            r
+        }
+        _ => client.get(url),
+    };
+
+    match req.send() {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let headers: serde_json::Map<String, serde_json::Value> = resp.headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), serde_json::Value::String(v.to_str().unwrap_or("").to_string())))
+                .collect();
+            let body = resp.text().unwrap_or_default();
+            serde_json::json!({
+                "status": status,
+                "body": body,
+                "headers": headers,
+                "statusText": ""
+            })
+        }
+        Err(e) => {
+            crate::log_to_temp(&format!("[bridge-proxy] HTTP error: {} {}", method, e));
+            serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": e.to_string()})
+        }
+    }
+}
+
 pub fn start_cdp_injection_loop() {
     let port = get_debug_port();
 
@@ -84,6 +189,11 @@ pub fn start_cdp_injection_loop() {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     recheck_counter += 1;
+
+                    // Drain bridge proxy queue every other cycle (6s) to reduce CDP load
+                    if recheck_counter % 2 == 0 {
+                        drain_bridge_queue(&mut client, &injected_targets);
+                    }
 
                     // Every 10s, re-evaluate diagnostic on all known targets to catch SPA navigations
                     if recheck_counter % 10 == 0 {
@@ -157,6 +267,11 @@ pub fn start_cdp_injection_loop() {
                         Ok(new_targets) => {
                             for t in &new_targets {
                                 if t.target_type == "page" && !injected_targets.contains(&t.id) {
+                                    // Skip shutdown/close targets — injecting into these can destabilize Steam
+                                    if t.title == "Shutdown" || t.url.contains("createflags=2") {
+                                        injected_targets.insert(t.id.clone());
+                                        continue;
+                                    }
                                     crate::log_to_temp(&format!(
                                         "[steamcdp] New target: id={}, title=\"{}\", url={}",
                                         t.id,

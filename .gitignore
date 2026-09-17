@@ -113,3 +113,5 @@ crash-logs/
 /test-results/
 /tmp/
 /temp/
+hook/target/
+hook/Cargo.lock
