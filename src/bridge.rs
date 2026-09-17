@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 const BRIDGE_PORT: u16 = 21775;
+const BRIDGE_PORT_FALLBACK: u16 = 21776;
 const CORS_HEADERS: &str = "\
 Access-Control-Allow-Origin: *\r\n\
 Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
@@ -11,20 +12,38 @@ Access-Control-Max-Age: 86400\r\n";
 
 pub fn start_bridge_server() {
     std::thread::spawn(|| {
+        // Try primary port first (luma-lite's port), fall back to 21776
         let listener = match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT)) {
-            Ok(l) => l,
+            Ok(l) => {
+                crate::log_to_temp(&format!(
+                    "[bridge] Mini-bridge listening on port {} (luma-lite not detected)",
+                    BRIDGE_PORT
+                ));
+                l
+            }
             Err(e) => {
                 crate::log_to_temp(&format!(
-                    "[bridge] Failed to bind port {}: {}",
-                    BRIDGE_PORT, e
+                    "[bridge] Port {} in use (luma-lite running?), trying fallback port {}: {}",
+                    BRIDGE_PORT, BRIDGE_PORT_FALLBACK, e
                 ));
-                return;
+                match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT_FALLBACK)) {
+                    Ok(l) => {
+                        crate::log_to_temp(&format!(
+                            "[bridge] Mini-bridge listening on fallback port {}",
+                            BRIDGE_PORT_FALLBACK
+                        ));
+                        l
+                    }
+                    Err(e2) => {
+                        crate::log_to_temp(&format!(
+                            "[bridge] Failed to bind both ports {} and {}: {}, {}",
+                            BRIDGE_PORT, BRIDGE_PORT_FALLBACK, e, e2
+                        ));
+                        return;
+                    }
+                }
             }
         };
-        crate::log_to_temp(&format!(
-            "[bridge] Mini-bridge listening on port {}",
-            BRIDGE_PORT
-        ));
 
         for stream in listener.incoming() {
             match stream {
