@@ -19,6 +19,8 @@ mod plugin_loader;
 mod hook_linux;
 #[cfg(target_os = "linux")]
 mod plugin_loader_linux;
+#[cfg(target_os = "linux")]
+mod cdp_pipe;
 
 use std::sync::Mutex;
 

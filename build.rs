@@ -44,13 +44,13 @@ fn main() {
             println!("cargo:rerun-if-changed={}", cef_hook_dll.display());
         }
     } else {
-        // Build execve hook .so on Linux
+        // Build libXtst proxy (.so) on Linux
         let hook_dir = manifest_dir.join("hook");
         if hook_dir.exists() {
-            eprintln!("build.rs: building lumaforge_hook.so...");
+            eprintln!("build.rs: building libXtst proxy...");
 
             let mut cmd = Command::new("cargo");
-            cmd.args(["build", "--release", "--manifest-path"]);
+            cmd.args(["build", "--release", "--target", "i686-unknown-linux-gnu", "--manifest-path"]);
             cmd.arg(hook_dir.join("Cargo.toml"));
 
             let status = cmd
@@ -62,8 +62,9 @@ fn main() {
 
             let hook_so = hook_dir
                 .join("target")
+                .join("i686-unknown-linux-gnu")
                 .join("release")
-                .join("liblumaforge_hook.so");
+                .join("libXtst.so");
 
             if hook_so.exists() {
                 let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -74,12 +75,43 @@ fn main() {
                     .unwrap()
                     .parent()
                     .unwrap();
-                let dest = target_release.join("lumaforge_hook.so");
-                eprintln!("build.rs: copying hook .so to {}", dest.display());
-                std::fs::copy(&hook_so, &dest).expect("Failed to copy hook .so");
+                let dest = target_release.join("libXtst_proxy.so");
+                eprintln!("build.rs: copying libXtst proxy to {}", dest.display());
+                std::fs::copy(&hook_so, &dest).expect("Failed to copy libXtst proxy");
             }
 
             println!("cargo:rerun-if-changed={}", hook_so.display());
+        }
+
+        // Build pvs_shim (64-bit C binary)
+        let shim_dir = manifest_dir.join("pvs_shim");
+        if shim_dir.exists() {
+            eprintln!("build.rs: building pvs_shim...");
+
+            let status = Command::new("make")
+                .current_dir(&shim_dir)
+                .status()
+                .expect("Failed to run make for pvs_shim");
+            if !status.success() {
+                panic!("make for pvs_shim failed with status: {}", status);
+            }
+
+            let shim_bin = shim_dir.join("pvs_shim");
+            if shim_bin.exists() {
+                let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+                let target_release = out_dir
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap();
+                let dest = target_release.join("pvs_shim");
+                eprintln!("build.rs: copying pvs_shim to {}", dest.display());
+                std::fs::copy(&shim_bin, &dest).expect("Failed to copy pvs_shim");
+            }
+
+            println!("cargo:rerun-if-changed={}", shim_dir.join("pvs_shim.c").display());
         }
     }
 }

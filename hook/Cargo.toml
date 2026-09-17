@@ -5,13 +5,14 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
-name = "lumaforge_hook"
+name = "Xtst"
 
 [dependencies]
 libc = "0.2"
-ctor = "0.1"
+ctor = "0.2"
+libloading = "0.8"
 
 [profile.release]
 opt-level = "s"
-lto = false
+lto = true
 strip = "debuginfo"

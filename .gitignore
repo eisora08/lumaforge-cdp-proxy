@@ -115,3 +115,4 @@ crash-logs/
 /temp/
 hook/target/
 hook/Cargo.lock
+pvs_shim/pvs_shim
