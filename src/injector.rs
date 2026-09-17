@@ -1,8 +1,17 @@
 use crate::cdp::{CdpClient, Target};
-use crate::plugin_loader::load_enabled_plugins;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::fs;
+
+#[cfg(target_os = "windows")]
+fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
+    crate::plugin_loader::load_enabled_plugins()
+}
+
+#[cfg(target_os = "linux")]
+fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
+    crate::plugin_loader_linux::load_enabled_plugins()
+}
 
 // ─── Theme patch (parsed from theme-manifest.json) ──────────────────────────
 
@@ -14,12 +23,7 @@ pub struct ThemePatchEntry {
 
 /// Load theme patches from theme-manifest.json written by main crate
 pub fn load_theme_patches() -> (String, Vec<ThemePatchEntry>) {
-    let Ok(local_appdata) = std::env::var("LOCALAPPDATA") else {
-        return (String::new(), Vec::new());
-    };
-    let manifest_path = std::path::PathBuf::from(local_appdata)
-        .join("LumaForge")
-        .join("runtime")
+    let manifest_path = crate::platform::runtime_dir()
         .join("theme-manifest.json");
 
     let content = match fs::read_to_string(&manifest_path) {
@@ -314,29 +318,34 @@ pub fn inject_into_target(
         }
         msg_id += 1;
 
-        let matches_url = match plugin.target_url {
-            Some(ref filter) => target.url.to_lowercase().contains(&filter.to_lowercase()),
-            None => true,
-        };
+        let resp = client.send_cdp_wait(
+            &json!({
+                "id": msg_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": &plugin.code,
+                    "awaitPromise": true,
+                    "returnByValue": true
+                }
+            }),
+            msg_id,
+        )?;
 
-        if matches_url {
-            let resp = client.send_cdp_wait(
-                &json!({
-                    "id": msg_id,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": &plugin.code,
-                        "awaitPromise": true,
-                        "returnByValue": true
-                    }
-                }),
-                msg_id,
-            )?;
-
-            if let Some(err) = resp.get("error") {
+        if let Some(err) = resp.get("error") {
+            crate::log_to_temp(&format!(
+                "[steamcdp] Plugin eval error '{}' target#{}: {}",
+                plugin.name, target_num, err
+            ));
+        } else if let Some(result) = resp.get("result") {
+            if let Some(exc) = result.get("exceptionDetails") {
+                let text = exc.get("text").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let desc = exc.get("exception")
+                    .and_then(|e| e.get("description"))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
                 crate::log_to_temp(&format!(
-                    "[steamcdp] Plugin eval error '{}' target#{}: {}",
-                    plugin.name, target_num, err
+                    "[steamcdp] Plugin '{}' exception in target#{}: {} {}",
+                    plugin.name, target_num, text, desc
                 ));
             } else {
                 crate::log_to_temp(&format!(
@@ -344,14 +353,55 @@ pub fn inject_into_target(
                     plugin.name, target_num
                 ));
             }
-            msg_id += 1;
         }
-
-        crate::log_to_temp(&format!(
-            "[steamcdp] Plugin '{}' -> target#{} url_match={}",
-            plugin.name, target_num, matches_url
-        ));
+        msg_id += 1;
     }
+
+    // Diagnostic: test if Runtime.evaluate actually works and check inject state
+    let test_resp = client.send_cdp_wait(
+        &json!({
+            "id": msg_id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": r#"(function(){
+                    var ns = window.__lumaforge_ssh__;
+                    var APP_URL_RE = /\/app\/(\d+)(?:\/|$)/;
+                    var locMatch = (window.location.href||'').match(APP_URL_RE);
+                    var appLinks = document.querySelectorAll('a[href*="/app/"]');
+                    var appLinkHrefs = [];
+                    for(var i=0;i<appLinks.length;i++) appLinkHrefs.push(appLinks[i].getAttribute('href'));
+                    var subInput = document.querySelector('input[name="subid"]');
+                    var dataAppid = document.querySelectorAll('[data-appid]');
+                    var btnExists = !!document.getElementById('luma-action-btn');
+                    var actionBar = document.querySelector('#game_area_purchase_game') || document.querySelector('.game_area_purchase_game') || document.querySelector('.apphub_OtherSiteInfo') || document.querySelector('.app_title_area');
+                    return JSON.stringify({
+                        url: window.location.href.substring(0,150),
+                        bodyLen: document.body ? document.body.innerHTML.length : -1,
+                        hasLuma: !!ns, lumaActive: ns && ns.active, lumaAppId: ns && ns.currentAppId,
+                        locMatch: locMatch ? locMatch[1] : null,
+                        appLinkCount: appLinks.length, appLinkHrefs: appLinkHrefs.slice(0,5),
+                        hasSubInput: !!subInput, subInputVal: subInput ? subInput.value : null,
+                        dataAppidCount: dataAppid.length,
+                        btnExists: btnExists,
+                        actionBarFound: !!actionBar, actionBarTag: actionBar ? actionBar.tagName : null,
+                        title: document.title.substring(0,80)
+                    });
+                })()"#,
+                "returnByValue": true
+            }
+        }),
+        msg_id,
+    )?;
+    let result_str = test_resp.get("result")
+        .and_then(|r| r.get("result"))
+        .and_then(|r| r.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("<no value>");
+    crate::log_to_temp(&format!(
+        "[steamcdp] Diag target#{}: {}",
+        target_num, result_str
+    ));
+    msg_id += 1;
 
     Ok(())
 }

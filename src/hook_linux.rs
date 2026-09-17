@@ -80,34 +80,126 @@ pub fn start_cdp_injection_loop() {
 
                 crate::log_to_temp("[steamcdp] Watching for new targets...");
                 let (theme_dir, theme_patches) = crate::injector::load_theme_patches();
-                while client.is_alive() {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                let mut recheck_counter = 0u32;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    recheck_counter += 1;
 
-                    if let Ok(new_targets) = client.get_targets() {
-                        for t in &new_targets {
-                            if t.target_type == "page" && !injected_targets.contains(&t.id) {
-                                crate::log_to_temp(&format!(
-                                    "[steamcdp] New target: id={}, title=\"{}\", url={}",
-                                    t.id,
-                                    t.title,
-                                    &t.url[..t.url.len().min(100)]
-                                ));
-                                // TODO: Load plugins from plugin_loader_linux
-                                let plugins = Vec::new();
-                                if let Err(e) = crate::injector::inject_into_target(
-                                    &mut client,
-                                    t,
-                                    &plugins,
-                                    &theme_dir,
-                                    &theme_patches,
-                                    injected_targets.len() + 1,
-                                ) {
+                    // Every 10s, re-evaluate diagnostic on all known targets to catch SPA navigations
+                    if recheck_counter % 10 == 0 {
+                        match client.get_targets() {
+                            Ok(all_targets) => {
+                                let page_count = all_targets.iter().filter(|t| t.target_type == "page").count();
+                                crate::log_to_temp(&format!("[steamcdp] Recheck: {} total targets ({} pages), {} injected", all_targets.len(), page_count, injected_targets.len()));
+                                for (idx, t) in all_targets.iter().enumerate() {
+                                    if t.target_type == "page" {
+                                        // Need to attach to this target first
+                                        if let Err(_) = client.attach_to_target(&t.id) {
+                                            continue;
+                                        }
+                                        let diag_expr = r#"JSON.stringify({url:window.location.href.substring(0,200),title:document.title.substring(0,80),bodyLen:document.body?document.body.innerHTML.length:-1,hasLuma:!!window.__lumaforge_ssh__,lumaActive:window.__lumaforge_ssh__&&window.__lumaforge_ssh__.active,lumaAppId:window.__lumaforge_ssh__&&window.__lumaforge_ssh__.currentAppId,btnExists:!!document.getElementById('luma-action-btn'),appLinks:document.querySelectorAll('a[href*="/app/"]').length})"#;
+                                        let msg_id = 9000 + idx as u64;
+                                        let mut diag_val = String::new();
+                                        if let Ok(resp) = client.send_cdp_wait(
+                                            &serde_json::json!({
+                                                "id": msg_id,
+                                                "method": "Runtime.evaluate",
+                                                "params": { "expression": diag_expr, "returnByValue": true }
+                                            }),
+                                            msg_id,
+                                        ) {
+                                            if let Some(v) = resp.get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")).and_then(|v| v.as_str()) {
+                                                diag_val = v.to_string();
+                                                crate::log_to_temp(&format!(
+                                                    "[steamcdp] Recheck p#{}: {}",
+                                                    idx + 1, v
+                                                ));
+                                            }
+                                        } else {
+                                            crate::log_to_temp(&format!(
+                                                "[steamcdp] Recheck p#{}: CDP eval failed",
+                                                idx + 1
+                                            ));
+                                        }
+
+                                        let has_luma = diag_val.contains("\"hasLuma\":true");
+                                        let needs_reinject = !injected_targets.contains(&t.id) || !has_luma;
+                                        if needs_reinject {
+                                            if !injected_targets.contains(&t.id) {
+                                                crate::log_to_temp(&format!(
+                                                    "[steamcdp] Re-injecting missed target: id={}, title=\"{}\", url={}",
+                                                    t.id, t.title, &t.url[..t.url.len().min(100)]
+                                                ));
+                                            } else {
+                                                crate::log_to_temp(&format!(
+                                                    "[steamcdp] Re-injecting target (hasLuma=false): id={}, title=\"{}\", url={}",
+                                                    t.id, t.title, &t.url[..t.url.len().min(100)]
+                                                ));
+                                            }
+                                            // Re-run addScriptToEvaluateOnNewDocument + Runtime.evaluate
+                                            let plugins = crate::plugin_loader_linux::load_all_plugins().unwrap_or_default();
+                                            if let Err(e) = crate::injector::inject_into_target(
+                                                &mut client, t, &plugins, &theme_dir, &theme_patches, idx + 1,
+                                            ) {
+                                                crate::log_to_temp(&format!("[steamcdp] Re-inject failed: {}", e));
+                                            } else {
+                                                injected_targets.insert(t.id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+
+                    match client.get_targets() {
+                        Ok(new_targets) => {
+                            for t in &new_targets {
+                                if t.target_type == "page" && !injected_targets.contains(&t.id) {
                                     crate::log_to_temp(&format!(
-                                        "[steamcdp] New target injection failed: {}",
-                                        e
+                                        "[steamcdp] New target: id={}, title=\"{}\", url={}",
+                                        t.id,
+                                        t.title,
+                                        &t.url[..t.url.len().min(100)]
                                     ));
-                                } else {
-                                    injected_targets.insert(t.id.clone());
+                                    let plugins = crate::plugin_loader_linux::load_all_plugins()
+                                        .unwrap_or_default();
+                                    if let Err(e) = crate::injector::inject_into_target(
+                                        &mut client,
+                                        t,
+                                        &plugins,
+                                        &theme_dir,
+                                        &theme_patches,
+                                        injected_targets.len() + 1,
+                                    ) {
+                                        crate::log_to_temp(&format!(
+                                            "[steamcdp] New target injection failed: {}",
+                                            e
+                                        ));
+                                    } else {
+                                        injected_targets.insert(t.id.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::log_to_temp(&format!("[steamcdp] get_targets error: {}, trying reconnect...", e));
+                            match crate::cdp::CdpClient::connect(port) {
+                                Ok(mut new_client) => {
+                                    crate::log_to_temp("[steamcdp] Reconnected to CDP");
+                                    client = new_client;
+                                    injected_targets.clear();
+                                    if let Ok(targets) = client.get_targets() {
+                                        for t in &targets {
+                                            if t.target_type == "page" {
+                                                injected_targets.insert(t.id.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e2) => {
+                                    crate::log_to_temp(&format!("[steamcdp] Reconnect failed: {}", e2));
                                 }
                             }
                         }

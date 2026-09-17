@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // Only build cef_hook on Windows (it's a Windows DLL with vtable hooks)
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
     if cfg!(target_os = "windows") {
-        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        // Build cef_hook DLL on Windows
         let cef_hook_dir = manifest_dir.join("cef_hook");
         if cef_hook_dir.exists() {
             eprintln!("build.rs: building cef_hook DLL...");
@@ -43,6 +44,42 @@ fn main() {
             println!("cargo:rerun-if-changed={}", cef_hook_dll.display());
         }
     } else {
-        eprintln!("build.rs: skipping cef_hook build (not Windows)");
+        // Build execve hook .so on Linux
+        let hook_dir = manifest_dir.join("hook");
+        if hook_dir.exists() {
+            eprintln!("build.rs: building lumaforge_hook.so...");
+
+            let mut cmd = Command::new("cargo");
+            cmd.args(["build", "--release", "--manifest-path"]);
+            cmd.arg(hook_dir.join("Cargo.toml"));
+
+            let status = cmd
+                .status()
+                .expect("Failed to run cargo build for hook");
+            if !status.success() {
+                panic!("cargo build for hook failed with status: {}", status);
+            }
+
+            let hook_so = hook_dir
+                .join("target")
+                .join("release")
+                .join("liblumaforge_hook.so");
+
+            if hook_so.exists() {
+                let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+                let target_release = out_dir
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap();
+                let dest = target_release.join("lumaforge_hook.so");
+                eprintln!("build.rs: copying hook .so to {}", dest.display());
+                std::fs::copy(&hook_so, &dest).expect("Failed to copy hook .so");
+            }
+
+            println!("cargo:rerun-if-changed={}", hook_so.display());
+        }
     }
 }

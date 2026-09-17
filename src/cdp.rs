@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::TcpStream;
+use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
@@ -20,14 +21,27 @@ pub struct CdpClient {
     port: u16,
 }
 
+fn reqwest_get(port: u16, path: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let url = format!("http://127.0.0.1:{}{}", port, path);
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("HTTP GET failed: {}", e))?;
+    response
+        .text()
+        .map_err(|e| format!("Failed to read response: {}", e))
+}
+
 impl CdpClient {
     pub fn connect(port: u16) -> Result<Self, String> {
-        let url = format!("http://127.0.0.1:{}/json", port);
-        let response =
-            reqwest::blocking::get(&url).map_err(|e| format!("Failed to get targets: {}", e))?;
-        let targets: Vec<Target> = response
-            .json()
-            .map_err(|e| format!("Failed to parse targets: {}", e))?;
+        let body = reqwest_get(port, "/json")?;
+        let targets: Vec<Target> = serde_json::from_str(&body)
+            .map_err(|e| format!("Failed to parse targets: {} body={}", e, &body[..body.len().min(200)]))?;
 
         if targets.is_empty() {
             return Err("No targets available".to_string());
@@ -59,11 +73,8 @@ impl CdpClient {
     }
 
     pub fn get_targets(&self) -> Result<Vec<Target>, String> {
-        let url = format!("http://127.0.0.1:{}/json", self.port);
-        let response =
-            reqwest::blocking::get(&url).map_err(|e| format!("Failed to get targets: {}", e))?;
-        let targets: Vec<Target> = response
-            .json()
+        let body = reqwest_get(self.port, "/json")?;
+        let targets: Vec<Target> = serde_json::from_str(&body)
             .map_err(|e| format!("Failed to parse targets: {}", e))?;
         Ok(targets)
     }
@@ -109,7 +120,6 @@ impl CdpClient {
     }
 
     pub fn is_alive(&self) -> bool {
-        let url = format!("http://127.0.0.1:{}/json/version", self.port);
-        reqwest::blocking::get(&url).is_ok()
+        reqwest_get(self.port, "/json/version").is_ok()
     }
 }

@@ -51,7 +51,7 @@ fn flush_log_buffer() {
 }
 
 pub(crate) fn log_to_temp(msg: &str) {
-    let line = format!("{}\r\n", msg);
+    let line = format!("{}\n", msg);
     let should_flush = {
         let Ok(mut buf) = LOG_BUFFER.lock() else {
             return;
@@ -171,6 +171,69 @@ fn stealth_kill_all_webhelpers() {
 }
 
 // ---------------------------------------------------------------------------
+// Steamwebhelper script patching (Linux)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn patch_steamwebhelper_script(port: u16) {
+    use std::io::Write;
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            log_to_temp("[steamcdp] patch: HOME not set");
+            return;
+        }
+    };
+
+    let script_path = format!(
+        "{}/.local/share/Steam/ubuntu12_64/steamwebhelper_sniper_wrap.sh",
+        home
+    );
+
+    let content = match std::fs::read_to_string(&script_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log_to_temp(&format!("[steamcdp] patch: failed to read {}: {}", script_path, e));
+            return;
+        }
+    };
+
+    let flag = format!("--remote-debugging-port={} --remote-allow-origins=*", port);
+
+    let clean_line = "exec ./steamwebhelper \"$@\"";
+    let patched_line = format!("{} {}", clean_line, flag);
+
+    let new_content: String = content
+        .lines()
+        .map(|line| {
+            if line.trim() == clean_line
+                || line.starts_with(&format!("{} --remote-debugging-port=", clean_line))
+            {
+                patched_line.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if new_content == content {
+        log_to_temp(&format!(
+            "[steamcdp] patch: already correct with {}",
+            flag
+        ));
+        return;
+    }
+
+    if let Err(e) = std::fs::write(&script_path, new_content) {
+        log_to_temp(&format!("[steamcdp] patch: write failed: {}", e));
+    } else {
+        log_to_temp(&format!("[steamcdp] patch: SUCCESS: {}", flag));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DllMain (Windows) / #[ctor] (Linux)
 // ---------------------------------------------------------------------------
 
@@ -270,6 +333,16 @@ unsafe extern "system" fn DllMain(
 fn init() {
     use std::io::Read;
 
+    // Install panic hook to log panics before they kill the process
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let msg = format!("[steamcdp] PANIC in thread '{}': {}", thread.name().unwrap_or("?"), info);
+        let _ = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/tmp/steamcdp_proxy.log")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+    }));
+
     // Identify which process loaded us
     let mut cmdline = String::new();
     if let Ok(mut f) = std::fs::File::open("/proc/self/cmdline") {
@@ -283,7 +356,22 @@ fn init() {
         exe_name
     ));
 
-    // 1. Kill existing webhelpers
+    // Only run full init in the main steam binary, not in child processes
+    let args: Vec<String> = cmdline.split('\0').map(|s| s.to_string()).collect();
+    let exe_base = exe_name.rsplit('/').next().unwrap_or(exe_name);
+    let is_main_steam = exe_base == "steam"
+        && args.iter().any(|a| a.contains("ubuntu12_32/steam"))
+        && !args.iter().any(|a| a == "-child-update-ui" || a == "-steam-update-ui" || a.starts_with("--type="));
+
+    if !is_main_steam {
+        log_to_temp(&format!(
+            "[steamcdp] Skipping init for non-main process: exe=\"{}\"",
+            exe_name
+        ));
+        return;
+    }
+
+    // 1. Kill existing webhelpers — forces restart with patched script
     std::thread::spawn(|| {
         stealth_kill_all_webhelpers();
     });
@@ -300,9 +388,27 @@ fn init() {
 
     // 3. Lua backends
     std::thread::spawn(|| {
-        // TODO: Load plugins from platform::plugins_dir()
-        // For now, try the existing plugin_loader if available
-        log_to_temp("[steamcdp] Linux: plugin loading not yet implemented");
+        match crate::plugin_loader_linux::load_all_plugins() {
+            Ok(plugins) => {
+                log_to_temp(&format!(
+                    "[steamcdp] Linux: loaded {} plugins",
+                    plugins.len()
+                ));
+                for p in &plugins {
+                    if let Some(ref bc) = p.backend_config {
+                        if let Err(e) = lua_backend::load_lua_backend(&p._id, &p._dir, bc) {
+                            log_to_temp(&format!(
+                                "[steamcdp] Lua backend error for {}: {}",
+                                p._id, e
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log_to_temp(&format!("[steamcdp] Plugin load error: {}", e));
+            }
+        }
     });
 
     // 4. Bridge server
@@ -310,7 +416,13 @@ fn init() {
         crate::bridge::start_bridge_server();
     });
 
-    // 5. Start CDP injection loop
+    // 5. Patch steamwebhelper script to add --remote-debugging-port
+    {
+        let port = crate::discovery::resolve_debug_port();
+        patch_steamwebhelper_script(port);
+    }
+
+    // 6. Start CDP injection loop
     std::thread::spawn(|| {
         crate::hook_linux::start_cdp_injection_loop();
     });

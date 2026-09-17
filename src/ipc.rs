@@ -2,6 +2,16 @@
 use std::sync::Once;
 
 #[cfg(target_os = "windows")]
+fn load_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
+    crate::plugin_loader::load_enabled_plugins()
+}
+
+#[cfg(target_os = "linux")]
+fn load_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
+    crate::plugin_loader_linux::load_enabled_plugins()
+}
+
+#[cfg(target_os = "windows")]
 pub fn start_ipc_server() -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -137,7 +147,7 @@ fn handle_command(command: &str) -> String {
     match cmd {
         "reload" => {
             crate::log_to_temp("[steamcdp] IPC: reload command received");
-            match crate::plugin_loader::load_enabled_plugins() {
+            match load_plugins() {
                 Ok(plugins) => {
                     let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
                     format!(
@@ -156,7 +166,7 @@ fn handle_command(command: &str) -> String {
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
             }
         }
-        "status" => match crate::plugin_loader::load_enabled_plugins() {
+        "status" => match load_plugins() {
             Ok(plugins) => {
                 let names: Vec<String> = plugins.iter().map(|p| p.name.clone()).collect();
                 format!(r#"{{"status":"ok","plugins":{:?}}}"#, names)

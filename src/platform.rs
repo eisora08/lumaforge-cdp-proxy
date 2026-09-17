@@ -123,9 +123,16 @@ pub fn temp_dir() -> PathBuf {
 
 #[cfg(target_os = "windows")]
 pub fn temp_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()),
-    )
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/tmp")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(
+            std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()),
+        )
+    }
 }
 
 /// Log file path for the CDP proxy.

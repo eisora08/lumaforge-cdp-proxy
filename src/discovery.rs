@@ -1,7 +1,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
@@ -11,6 +11,7 @@ const PORT_MIN: u16 = 1024;
 const PORT_MAX: u16 = 65535;
 
 static PUBLISHED: Mutex<Option<(u16, u32)>> = Mutex::new(None);
+static CACHED_PORT: OnceLock<u16> = OnceLock::new();
 
 pub fn parse_configured_port(value: Option<&str>) -> Option<u16> {
     let s = value?;
@@ -38,22 +39,24 @@ pub fn find_available_dynamic_port() -> Option<u16> {
 }
 
 pub fn resolve_debug_port() -> u16 {
-    let env_val = std::env::var("STEAMCDP_PORT").ok();
-    if let Some(port) = parse_configured_port(env_val.as_deref()) {
-        crate::log_to_temp(&format!("[steamcdp] Using STEAMCDP_PORT={}", port));
-        return port;
-    }
-    if env_val.is_some() {
-        crate::log_to_temp("[steamcdp] Invalid STEAMCDP_PORT; selecting dynamic port");
-    }
+    *CACHED_PORT.get_or_init(|| {
+        let env_val = std::env::var("STEAMCDP_PORT").ok();
+        if let Some(port) = parse_configured_port(env_val.as_deref()) {
+            crate::log_to_temp(&format!("[steamcdp] Using STEAMCDP_PORT={}", port));
+            return port;
+        }
+        if env_val.is_some() {
+            crate::log_to_temp("[steamcdp] Invalid STEAMCDP_PORT; selecting dynamic port");
+        }
 
-    if let Some(port) = find_available_dynamic_port() {
-        crate::log_to_temp(&format!("[steamcdp] Selected dynamic debug port {}", port));
-        return port;
-    }
+        if let Some(port) = find_available_dynamic_port() {
+            crate::log_to_temp(&format!("[steamcdp] Selected dynamic debug port {}", port));
+            return port;
+        }
 
-    crate::log_to_temp("[steamcdp] Dynamic port selection failed; falling back to 9222");
-    DEFAULT_DEBUG_PORT
+        crate::log_to_temp("[steamcdp] Dynamic port selection failed; falling back to 9222");
+        DEFAULT_DEBUG_PORT
+    })
 }
 
 fn discovery_runtime_dir() -> Result<PathBuf, String> {
@@ -330,6 +333,7 @@ mod tests {
         assert!(json.contains(r#""updatedAt":1784730000"#));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn discovery_path_ends_with_lumaforge_runtime_file() {
         let dir = PathBuf::from("C:\\Users\\test\\AppData\\Local")
@@ -339,6 +343,18 @@ mod tests {
         assert!(file
             .to_string_lossy()
             .contains("LumaForge\\runtime\\steam-cdp.json"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_path_ends_with_lumaforge_runtime_file() {
+        let dir = PathBuf::from("/home/test/.local/share")
+            .join("LumaForge")
+            .join("runtime");
+        let file = dir.join("steam-cdp.json");
+        assert!(file
+            .to_string_lossy()
+            .contains("LumaForge/runtime/steam-cdp.json"));
     }
 
     #[test]
