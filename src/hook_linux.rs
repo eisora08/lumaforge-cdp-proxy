@@ -152,10 +152,11 @@ pub fn start_cdp_injection_loop() {
         port
     ));
 
-    // Wait for CDP to become available
+    // Wait for CDP to become available — exponential backoff: 200ms → 400ms → 800ms → 1s
     let max_attempts = 30;
     for attempt in 1..=max_attempts {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        let delay_ms = std::cmp::min(200 * (1u64 << ((attempt - 1).min(3))), 1000);
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 
         match crate::cdp::CdpClient::connect(port) {
             Ok(mut client) => {
@@ -190,24 +191,43 @@ pub fn start_cdp_injection_loop() {
                 crate::log_to_temp("[steamcdp] Watching for new targets...");
                 let (theme_dir, theme_patches) = crate::injector::load_theme_patches();
                 let mut recheck_counter = 0u32;
+                // Track last-known URLs to detect store page navigations immediately
+                let mut known_urls: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                if let Ok(targets) = client.get_targets() {
+                    for t in &targets {
+                        if t.target_type == "page" && injected_targets.contains(&t.id) {
+                            known_urls.insert(t.id.clone(), t.url.clone());
+                        }
+                    }
+                }
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     recheck_counter += 1;
 
-                    // Drain bridge proxy queue every 12th cycle (~60s) to minimize CDP load
-                    if recheck_counter % 12 == 0 {
-                        drain_bridge_queue(&mut client, &injected_targets);
-                    }
+                    // Drain bridge proxy queue every cycle (~5s) so extension fetch
+                    // requests are fulfilled within the 15s JS timeout
+                    drain_bridge_queue(&mut client, &injected_targets);
 
-                    // Every 60s, re-evaluate diagnostic on known targets to catch SPA navigations
-                    if recheck_counter % 12 == 0 {
+                    // Every 30s, re-evaluate diagnostic on ALL injected targets to catch SPA navigations.
+                    // Store pages are checked first since they're where the button appears.
+                    if recheck_counter % 6 == 0 {
                         match client.get_targets() {
                             Ok(all_targets) => {
                                 let page_count = all_targets.iter().filter(|t| t.target_type == "page").count();
                                 crate::log_to_temp(&format!("[steamcdp] Recheck: {} total targets ({} pages), {} injected", all_targets.len(), page_count, injected_targets.len()));
+
+                                // Collect injected page targets, sort store pages first
+                                let mut pages: Vec<_> = all_targets.iter()
+                                    .filter(|t| t.target_type == "page" && injected_targets.contains(&t.id))
+                                    .collect();
+                                pages.sort_by(|a, b| {
+                                    let a_store = a.url.contains("store.steampowered.com");
+                                    let b_store = b.url.contains("store.steampowered.com");
+                                    b_store.cmp(&a_store) // store pages first
+                                });
+
                                 let mut checked = 0u32;
-                                for t in all_targets.iter().filter(|t| t.target_type == "page" && injected_targets.contains(&t.id)) {
-                                    if checked >= 3 { break; }
+                                for t in pages {
                                     checked += 1;
                                     if let Err(_) = client.attach_to_target(&t.id) {
                                         continue;
@@ -287,6 +307,34 @@ pub fn start_cdp_injection_loop() {
                                         ));
                                     } else {
                                         injected_targets.insert(t.id.clone());
+                                        known_urls.insert(t.id.clone(), t.url.clone());
+                                    }
+                                } else if t.target_type == "page" && injected_targets.contains(&t.id) {
+                                    // Detect URL change on existing store target → re-inject immediately
+                                    if t.url.contains("store.steampowered.com") {
+                                        if let Some(prev_url) = known_urls.get(&t.id) {
+                                            if prev_url != &t.url {
+                                                crate::log_to_temp(&format!(
+                                                    "[steamcdp] Store URL changed: id={}, prev={}, new={}",
+                                                    t.id,
+                                                    &prev_url[..prev_url.len().min(80)],
+                                                    &t.url[..t.url.len().min(80)]
+                                                ));
+                                                let plugins = crate::plugin_loader_linux::load_all_plugins()
+                                                    .unwrap_or_default();
+                                                if let Err(e) = crate::injector::inject_into_target(
+                                                    &mut client,
+                                                    t,
+                                                    &plugins,
+                                                    &theme_dir,
+                                                    &theme_patches,
+                                                    1,
+                                                ) {
+                                                    crate::log_to_temp(&format!("[steamcdp] URL-change re-inject failed: {}", e));
+                                                }
+                                            }
+                                        }
+                                        known_urls.insert(t.id.clone(), t.url.clone());
                                     }
                                 }
                             }
@@ -298,10 +346,12 @@ pub fn start_cdp_injection_loop() {
                                     crate::log_to_temp("[steamcdp] Reconnected to CDP");
                                     client = new_client;
                                     injected_targets.clear();
+                                    known_urls.clear();
                                     if let Ok(targets) = client.get_targets() {
                                         for t in &targets {
                                             if t.target_type == "page" {
                                                 injected_targets.insert(t.id.clone());
+                                                known_urls.insert(t.id.clone(), t.url.clone());
                                             }
                                         }
                                     }
