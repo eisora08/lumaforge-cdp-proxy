@@ -93,6 +93,7 @@ fn drain_bridge_queue(client: &mut crate::cdp::CdpClient, injected: &std::collec
 }
 
 /// Make an HTTP request to the local bridge (called from Rust, not CEF).
+/// Tries port 21775 first (luma-lite primary), then 21777 (fallback).
 fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_json::Value {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -103,37 +104,59 @@ fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_jso
             }
         };
 
-    let mut req = match method {
-        "POST" => {
-            let mut r = client.post(url);
-            if let Some(b) = body {
-                r = r.body(b.to_string()).header("content-type", "application/json");
+    // Try primary port first, then fallback
+    let ports = [21775u16, 21777];
+    for port in &ports {
+        // Replace port in URL
+        let target_url = if url.contains("127.0.0.1:") {
+            let prefix = url.split("127.0.0.1:").next().unwrap_or("");
+            let suffix = url.splitn(2, "127.0.0.1:").nth(1).unwrap_or("");
+            let path = suffix.splitn(2, '/').nth(1).unwrap_or("");
+            if path.is_empty() {
+                format!("http://127.0.0.1:{}/", port)
+            } else {
+                format!("http://127.0.0.1:{}/{}", port, path)
             }
-            r
-        }
-        _ => client.get(url),
-    };
+        } else {
+            url.to_string()
+        };
 
-    match req.send() {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let headers: serde_json::Map<String, serde_json::Value> = resp.headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_string(), serde_json::Value::String(v.to_str().unwrap_or("").to_string())))
-                .collect();
-            let body = resp.text().unwrap_or_default();
-            serde_json::json!({
-                "status": status,
-                "body": body,
-                "headers": headers,
-                "statusText": ""
-            })
-        }
-        Err(e) => {
-            crate::log_to_temp(&format!("[bridge-proxy] HTTP error: {} {}", method, e));
-            serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": e.to_string()})
+        let mut req = match method {
+            "POST" => {
+                let mut r = client.post(&target_url);
+                if let Some(b) = body {
+                    r = r.body(b.to_string()).header("content-type", "application/json");
+                }
+                r
+            }
+            _ => client.get(&target_url),
+        };
+
+        match req.send() {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                // If we got a response, use this port for future requests
+                let headers: serde_json::Map<String, serde_json::Value> = resp.headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), serde_json::Value::String(v.to_str().unwrap_or("").to_string())))
+                    .collect();
+                let body = resp.text().unwrap_or_default();
+                return serde_json::json!({
+                    "status": status,
+                    "body": body,
+                    "headers": headers,
+                    "statusText": ""
+                });
+            }
+            Err(_) => {
+                // Try next port
+                continue;
+            }
         }
     }
+
+    // All ports failed
+    serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": "Bridge not available on any port"})
 }
 
 pub fn start_cdp_injection_loop() {
