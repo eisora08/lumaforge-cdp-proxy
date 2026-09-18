@@ -104,8 +104,8 @@ fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_jso
             }
         };
 
-    // Try primary port first, then fallback
-    let ports = [21775u16, 21777];
+    // Try luma-lite port first (21777), then CDP proxy stub (21775)
+    let ports = [21777u16, 21775];
     for port in &ports {
         // Replace port in URL
         let target_url = if url.contains("127.0.0.1:") {
@@ -175,10 +175,10 @@ pub fn start_cdp_injection_loop() {
         port
     ));
 
-    // Wait for CDP to become available — exponential backoff: 200ms → 400ms → 800ms → 1s
+    // Wait for CDP to become available — exponential backoff: 100ms → 200ms → 400ms → 500ms
     let max_attempts = 30;
     for attempt in 1..=max_attempts {
-        let delay_ms = std::cmp::min(200 * (1u64 << ((attempt - 1).min(3))), 1000);
+        let delay_ms = std::cmp::min(100 * (1u64 << ((attempt - 1).min(2))), 500);
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 
         match crate::cdp::CdpClient::connect(port) {
@@ -224,16 +224,16 @@ pub fn start_cdp_injection_loop() {
                     }
                 }
                 loop {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                     recheck_counter += 1;
 
-                    // Drain bridge proxy queue every cycle (~5s) so extension fetch
+                    // Drain bridge proxy queue every cycle (~1s) so extension fetch
                     // requests are fulfilled within the 15s JS timeout
                     drain_bridge_queue(&mut client, &injected_targets);
 
                     // Every 30s, re-evaluate diagnostic on ALL injected targets to catch SPA navigations.
                     // Store pages are checked first since they're where the button appears.
-                    if recheck_counter % 6 == 0 {
+                    if recheck_counter % 30 == 0 {
                         match client.get_targets() {
                             Ok(all_targets) => {
                                 let page_count = all_targets.iter().filter(|t| t.target_type == "page").count();

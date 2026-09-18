@@ -1,6 +1,6 @@
 # AGENTS.md — Linux Port: LumaForge Ecosystem
 
-> **Fecha:** 2026-09-17 (última actualización)
+> **Fecha:** 2026-09-18 (última actualización)
 > **Branch:** `feat/linux-port` (los 3 repos)
 > **Objetivo:** Portar LumaForge a Linux (Nobara 44 / Fedora-based)
 
@@ -40,10 +40,11 @@ LumaForge en Linux:
 │  └── dlopen liblumaforge.so en ctor                    │
 ├─────────────────────────────────────────────────────────┤
 │  liblumaforge.so (#[ctor] init)                        │
-│  ├── hook_linux.rs     → CDP injection loop (5s cycle) │
-│  │   ├── Exponential backoff: 200ms → 1s               │
+│  ├── hook_linux.rs     → CDP injection loop (1s cycle) │
+│  │   ├── Exponential backoff: 100ms → 500ms            │
 │  │   ├── URL change detection (known_urls HashMap)     │
-│  │   ├── Bridge drain every 5s                         │
+│  │   ├── Bridge drain every 1s                         │
+│  │   ├── make_bridge_request: tries 21777 then 21775   │
 │  │   └── Recheck all targets every 30s (store first)  │
 │  ├── injector.rs       → JS injection via CDP          │
 │  │   ├── BRIDGE_PROXY_JS (mixed-content fix)           │
@@ -74,8 +75,8 @@ LumaForge en Linux:
 1. Steam CEF loads store.steampowered.com (HTTPS)
 2. inject.js intercepts fetch() to 127.0.0.1:21775
 3. Request queued in __lumaBridgeQueue (can't fetch HTTP from HTTPS)
-4. CDP proxy drains queue every 5s via Runtime.evaluate
-5. Rust makes HTTP request to 127.0.0.1:21775 (no mixed-content issue)
+4. CDP proxy drains queue every 1s via Runtime.evaluate
+5. Rust makes HTTP request — tries 21777 (luma-lite) first, then 21775 (stub)
 6. Response injected back via Runtime.evaluate
 7. JS Promise resolves with the response
 ```
@@ -127,8 +128,8 @@ El hook intentaba saltar 5 bytes (E9 jump) sobre `push rbp; push rbx; sub rsp,0x
 #### 4. Bridge proxy resuelve mixed-content
 HTTPS store pages no pueden hacer fetch() a HTTP. Solución:
 - `BRIDGE_PROXY_JS` intercepta fetch, encola en `__lumaBridgeQueue`
-- CDP proxy drainea la cola cada 5s via `Runtime.evaluate`
-- Rust hace el request HTTP (sin mixed-content)
+- CDP proxy drainea la cola cada 1s via `Runtime.evaluate`
+- Rust hace el request HTTP a 21777 (luma-lite) primero, 21775 (stub) como fallback
 - Resultado se inyecta de vuelta via `Runtime.evaluate`
 
 #### 5. addScriptToEvaluateOnNewDocument NO re-fire en SPA
@@ -148,7 +149,7 @@ Steam en este sistema vive ~60-90s. Matches vanilla lifetime. No es causado por 
 | Archivo | Estado | Qué hace |
 |---|---|---|
 | `hook/src/lib.rs` | **MODIFICADO** | libXtst.so.6 proxy: XTest pass-through + dlopen liblumaforge.so. INIT_DONE guard. Macro-based XTest functions. |
-| `src/hook_linux.rs` | **NUEVO** | CDP injection loop: exponential backoff (200ms→1s), URL change detection, bridge drain 5s, recheck 30s all targets |
+| `src/hook_linux.rs` | **NUEVO** | CDP injection loop: exponential backoff (100ms→500ms), URL change detection, bridge drain 1s, make_bridge_request priority [21777, 21775], recheck 30s all targets |
 | `src/injector.rs` | **MODIFICADO** | BRIDGE_PROXY_JS (mixed-content fix), diagnostic eval, theme patches |
 | `src/platform.rs` | **NUEVO** | Abstracción de paths: `find_steam_install()`, `local_data_dir()`, `config_dir()`, `runtime_dir()` |
 | `src/plugin_loader_linux.rs` | **NUEVO** | Carga plugins desde `~/.local/share/LumaForge/plugins/` |
@@ -173,28 +174,20 @@ Steam en este sistema vive ~60-90s. Matches vanilla lifetime. No es causado por 
 sudo dnf install -y openssl-devel.i686  # Fedora/Nobara
 # or: sudo apt-get install -y pkg-config libssl-dev build-essential gcc-multilib
 
-# Compilar hook subcrate (32-bit)
-cd ~/Codigo/lumaforge-cdp-proxy/hook
-CC="gcc -m32" cargo build --release --target i686-unknown-linux-gnu
-
-# Compilar proxy principal (32-bit)
+# Compilar proxy principal (32-bit) — el build.rs compila el hook subcrate automáticamente
 cd ~/Codigo/lumaforge-cdp-proxy
-CC="gcc -m32" OPENSSL_LIB_DIR=/usr/lib OPENSSL_INCLUDE_DIR=/usr/include \
+CC_i686_unknown_linux_gnu="gcc -m32" OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib OPENSSL_INCLUDE_DIR=/usr/include \
   cargo build --release --target i686-unknown-linux-gnu
 
 # El .so se genera en:
 # target/i686-unknown-linux-gnu/release/liblumaforge.so
-# hook/target/i686-unknown-linux-gnu/release/libXtst.so.6
 ```
 
 ### Cómo deployear
 
 ```bash
-# Copiar .so files a Steam directory
+# Copiar solo liblumaforge.so (libXtst.so.6 no se cambia)
 cp target/i686-unknown-linux-gnu/release/liblumaforge.so \
-   ~/.local/share/Steam/ubuntu12_32/
-
-cp hook/target/i686-unknown-linux-gnu/release/libXtst.so.6 \
    ~/.local/share/Steam/ubuntu12_32/
 
 # Steam carga libXtst.so.6 automáticamente (no necesita LD_PRELOAD)
@@ -391,13 +384,13 @@ steam .. "/config/lua/" .. app_id .. ".lua"
    ├── patch_steamwebhelper_script() — añade --remote-debugging-port
    └── Thread 6: hook_linux::start_cdp_injection_loop()
 
-4. CDP injection loop (5s cycle):
+4. CDP injection loop (1s cycle):
    ├── Publica discovery (steam-cdp.json)
-   ├── Exponential backoff: 200ms → 400ms → 800ms → 1s
+   ├── Exponential backoff: 100ms → 200ms → 400ms → 500ms
    ├── Connects to CDP (attempt ~3)
    ├── inject_all() — bridge proxy + plugins + theme patches
    └── Loop infinito:
-       ├── Drain bridge queue every 5s
+       ├── Drain bridge queue every 1s
        ├── Recheck every 30s (all targets, store first)
        ├── URL change detection → immediate re-inject
        └── Detect new targets → inject
@@ -405,13 +398,14 @@ steam .. "/config/lua/" .. app_id .. ".lua"
 5. Steam CEF loads store.steampowered.com:
    ├── inject.js runs (via addScriptToEvaluateOnNewDocument)
    ├── bridge proxy intercepts fetch to 127.0.0.1:21775
-   ├── Queue drain by CDP proxy (every 5s)
+   ├── Queue drain by CDP proxy (every 1s)
+   ├── make_bridge_request: tries 21777 (luma-lite) first, 21775 (stub) fallback
    └── Response injected back → Promise resolves
 
-6. luma-lite (si está corriendo):
-   ├── Bind port 21775 (real bridge)
-   ├── Handle API requests from inject.js
-   └── Can connect to /tmp/lumalite_core.sock for IPC
+6. luma-lite (si está corriendo en port 21777):
+   ├── Bind port 21777 (21775 taken by CDP proxy stub)
+   ├── Handle API requests from inject.js (via bridge proxy)
+   └── Full functionality: depots, sources, downloads
 ```
 
 ---
@@ -521,20 +515,14 @@ sudo apt-get install -y curl git gcc g++ make
 
 ### 1. Compilar CDP Proxy (32-bit)
 ```bash
-cd ~/Codigo/lumaforge-cdp-proxy/hook
-CC="gcc -m32" cargo build --release --target i686-unknown-linux-gnu
-
 cd ~/Codigo/lumaforge-cdp-proxy
-CC="gcc -m32" OPENSSL_LIB_DIR=/usr/lib OPENSSL_INCLUDE_DIR=/usr/include \
+CC_i686_unknown_linux_gnu="gcc -m32" OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib OPENSSL_INCLUDE_DIR=/usr/include \
   cargo build --release --target i686-unknown-linux-gnu
 ```
 
 ### 2. Deployear
 ```bash
 cp target/i686-unknown-linux-gnu/release/liblumaforge.so \
-   ~/.local/share/Steam/ubuntu12_32/
-
-cp hook/target/i686-unknown-linux-gnu/release/libXtst.so.6 \
    ~/.local/share/Steam/ubuntu12_32/
 ```
 
@@ -613,7 +601,8 @@ sudo apt-get install -y libayatana-appindicator3-dev
 - [x] `hook/src/lib.rs` — libXtst.so.6 proxy with INIT_DONE guard + macro-based XTest
 - [x] `hook_linux.rs` — CDP injection loop with exponential backoff
 - [x] `hook_linux.rs` — URL change detection for immediate re-injection
-- [x] `hook_linux.rs` — Bridge drain every 5s (was 60s)
+- [x] `hook_linux.rs` — Bridge drain every 1s (was 5s)
+- [x] `hook_linux.rs` — Bridge request priority: 21777 (luma-lite) first, 21775 (stub) fallback
 - [x] `hook_linux.rs` — Recheck all targets every 30s (store first)
 - [x] `injector.rs` — BRIDGE_PROXY_JS for mixed-content fix
 - [x] `lib.rs` — Panic hook, stealth kill, plugin loading, bridge server
@@ -623,7 +612,10 @@ sudo apt-get install -y libayatana-appindicator3-dev
 - [ ] **luma-lite: Fix compile** — `game_fix.rs:1043` winreg without cfg guard
 - [ ] **luma-lite: Linux gaps** — `is_steam_running()`, `launch_steam_process()`, `set_start_with_system()`
 - [ ] **luma-lite: IPC client** — Connect to `/tmp/lumalite_core.sock` from luma-lite
-- [ ] **Port conflict** — CDP proxy fallback to 21776 if 21775 is taken by luma-lite
+- [x] **Port conflict** — CDP proxy fallback to 21776 if 21775 is taken by luma-lite
+- [x] **Bridge priority** — make_bridge_request tries 21777 first, then 21775
+- [x] **Bridge drain** — Reduced from 5s to 1s for faster request processing
+- [x] **CDP backoff** — Reduced from 200ms→1s to 100ms→500ms for faster connection
 - [ ] `cdp_pipe.rs` — Integrar pipe CDP client (pv-adverb approach)
 - [ ] `system_toggle.rs` — LD_AUDIT equivalent para Linux en luma-lite
 - [ ] Testing completo: CDP injection, theme export, plugin loading, bridge proxy
