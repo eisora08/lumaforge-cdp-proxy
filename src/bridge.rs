@@ -155,6 +155,17 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return rust_resp;
     }
 
+    // Depot download routes (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(resp) = handle_depot_route(method, &clean_path, body) {
+            return resp;
+        }
+        if let Some(resp) = handle_slssteam_route(method, &clean_path, body) {
+            return resp;
+        }
+    }
+
     if let Some(lua_resp) = crate::lua_backend::handle_lua_request(&lua_req) {
         return (lua_resp.status, lua_resp.body);
     }
@@ -189,7 +200,7 @@ fn handle_sources(_app_id: &str) -> (u16, String) {
         "ok": true,
         "sources": [],
         "unavailableSources": [],
-        "message": "Connect LumaLite for download sources"
+        "message": "No download sources available. Configure providers in Settings."
     });
     (200, response.to_string())
 }
@@ -198,9 +209,162 @@ fn handle_providers() -> (u16, String) {
     let response = json!({
         "ok": true,
         "providers": [],
-        "message": "No providers connected. Start LumaLite to enable download sources."
+        "message": "No providers configured. Open Settings (gear icon) to configure providers."
     });
     (200, response.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Depot download routes (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn handle_depot_route(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
+    use crate::depot_downloader;
+
+    if path == "/api/depots" && method == "GET" {
+        // This route is handled by the query param version below
+        return None;
+    }
+
+    if path.starts_with("/api/depots/") && method == "GET" {
+        let app_id_str = path.trim_start_matches("/api/depots/");
+        if let Ok(app_id) = app_id_str.parse::<u64>() {
+            match depot_downloader::resolve_depots(app_id) {
+                Ok(depots) => Some((200, json!({"ok": true, "depots": depots}).to_string())),
+                Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+            }
+        } else {
+            Some((400, json!({"ok": false, "message": "Invalid appId"}).to_string()))
+        }
+    } else if path == "/api/depot-download" && method == "POST" {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
+        match parsed {
+            Ok(val) => {
+                let job: Result<crate::depot_downloader::DepotDownloadJob, _> =
+                    serde_json::from_value(val);
+                match job {
+                    Ok(j) => match depot_downloader::start_download(j) {
+                        Ok(job_id) => Some((200, json!({"ok": true, "jobId": job_id}).to_string())),
+                        Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+                    },
+                    Err(e) => Some((400, json!({"ok": false, "message": format!("Invalid job: {e}")}).to_string())),
+                }
+            }
+            Err(e) => Some((400, json!({"ok": false, "message": format!("Invalid JSON: {e}")}).to_string())),
+        }
+    } else if path.starts_with("/api/depot-download-status/") && method == "GET" {
+        let job_id = path.trim_start_matches("/api/depot-download-status/");
+        Some((200, depot_downloader::get_status(job_id).to_string()))
+    } else if path.starts_with("/api/depot-download-pause/") && method == "POST" {
+        let job_id = path.trim_start_matches("/api/depot-download-pause/");
+        match depot_downloader::pause_download(job_id) {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path.starts_with("/api/depot-download-resume/") && method == "POST" {
+        let job_id = path.trim_start_matches("/api/depot-download-resume/");
+        match depot_downloader::resume_download(job_id) {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path.starts_with("/api/depot-download-cancel/") && method == "POST" {
+        let job_id = path.trim_start_matches("/api/depot-download-cancel/");
+        match depot_downloader::cancel_download(job_id) {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path.starts_with("/api/depot-post-download/") && method == "POST" {
+        let app_id_str = path.trim_start_matches("/api/depot-post-download/");
+        if let Ok(app_id) = app_id_str.parse::<u64>() {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
+            match parsed {
+                Ok(val) => {
+                    let job_id = val.get("jobId").and_then(|v| v.as_str()).unwrap_or("");
+                    let game_name = val.get("gameName").and_then(|v| v.as_str()).unwrap_or("Unknown Game");
+                    match depot_downloader::post_download(job_id, app_id, game_name) {
+                        Ok(result) => Some((200, result.to_string())),
+                        Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+                    }
+                }
+                Err(e) => Some((400, json!({"ok": false, "message": format!("Invalid JSON: {e}")}).to_string())),
+            }
+        } else {
+            Some((400, json!({"ok": false, "message": "Invalid appId"}).to_string()))
+        }
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SLS Steam routes (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn handle_slssteam_route(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
+    use crate::slssteam;
+
+    if path == "/api/slssteam/status" && method == "GET" {
+        Some((200, slssteam::get_status().to_string()))
+    } else if path == "/api/slssteam/kill-steam" && method == "POST" {
+        match slssteam::kill_steam() {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path == "/api/slssteam/start-steam" && method == "POST" {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
+        let with_ld_audit = parsed.as_ref().ok()
+            .and_then(|v| v.get("withLdAudit"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        match slssteam::start_steam(with_ld_audit) {
+            Ok(result) => Some((200, result.to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path == "/api/slssteam/setup" && method == "POST" {
+        match slssteam::full_setup() {
+            Ok(result) => Some((200, result.to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path == "/api/slssteam/patch-steam-sh" && method == "POST" {
+        match slssteam::patch_steam_sh() {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path == "/api/slssteam/config/add-app" && method == "POST" {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
+        match parsed {
+            Ok(val) => {
+                let app_id = val.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                let comment = val.get("comment").and_then(|v| v.as_str()).unwrap_or("");
+                match slssteam::config_add_app(app_id, comment) {
+                    Ok(existed) => Some((200, json!({"ok": true, "added": !existed}).to_string())),
+                    Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+                }
+            }
+            Err(e) => Some((400, json!({"ok": false, "message": format!("Invalid JSON: {e}")}).to_string())),
+        }
+    } else if path == "/api/slssteam/config/remove-app" && method == "POST" {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
+        match parsed {
+            Ok(val) => {
+                let app_id = val.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+                match slssteam::config_remove_app(app_id) {
+                    Ok(removed) => Some((200, json!({"ok": true, "removed": removed}).to_string())),
+                    Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+                }
+            }
+            Err(e) => Some((400, json!({"ok": false, "message": format!("Invalid JSON: {e}")}).to_string())),
+        }
+    } else if path == "/api/slssteam/config/apps" && method == "GET" {
+        match slssteam::config_get_apps() {
+            Ok(apps) => Some((200, json!({"ok": true, "apps": apps}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else {
+        None
+    }
 }
 
 fn send_response(stream: &mut std::net::TcpStream, status: u16, body: &str, content_type: &str) {

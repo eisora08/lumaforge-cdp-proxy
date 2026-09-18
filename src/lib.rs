@@ -1,11 +1,15 @@
 mod bridge;
 mod cdp;
+mod depot_downloader;
 mod discovery;
 mod injector;
 mod ipc;
 mod lua_backend;
+mod manifest_parser;
 pub mod platform;
 mod plugin;
+#[cfg(target_os = "linux")]
+mod slssteam;
 pub mod theme;
 
 #[cfg(target_os = "windows")]
