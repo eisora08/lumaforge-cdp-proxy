@@ -302,7 +302,9 @@ pub fn start_cdp_injection_loop() {
                     match client.get_targets() {
                         Ok(new_targets) => {
                             for t in &new_targets {
-                                if t.target_type == "page" && !injected_targets.contains(&t.id) {
+                                if t.target_type == "page" && !injected_targets.contains(&t.id)
+                                    && crate::injector::is_real_steam_page(&t.url)
+                                {
                                     // Skip shutdown/close targets — injecting into these can destabilize Steam
                                     if t.title == "Shutdown" || t.url.contains("createflags=2") {
                                         injected_targets.insert(t.id.clone());

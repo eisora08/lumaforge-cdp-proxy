@@ -366,7 +366,7 @@ fn init() {
     let args: Vec<String> = cmdline.split('\0').map(|s| s.to_string()).collect();
     let exe_base = exe_name.rsplit('/').next().unwrap_or(exe_name);
     let is_main_steam = exe_base == "steam"
-        && args.iter().any(|a| a.contains("ubuntu12_32/steam"))
+        && args.iter().any(|a| a.contains("ubuntu12_32") || a.contains("ubuntu12_64") || a.contains("/steam"))
         && !args.iter().any(|a| a == "-child-update-ui" || a == "-steam-update-ui" || a.starts_with("--type="));
 
     if !is_main_steam {
@@ -380,6 +380,11 @@ fn init() {
     // 1. Kill existing webhelpers — forces restart with patched script
     std::thread::spawn(|| {
         stealth_kill_all_webhelpers();
+    });
+
+    // 1b. Kill orphaned DepotDownloader processes from previous sessions
+    std::thread::spawn(|| {
+        crate::depot_downloader::kill_orphaned_depots();
     });
 
     // 2. Theme export + IPC server

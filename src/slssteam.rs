@@ -89,6 +89,7 @@ fn find_slssteam_so(steam_path: Option<&str>) -> Option<String> {
         PathBuf::from("/usr/lib32/libSLSsteam.so"),
         home_dir()?.join(".local/share/SLSsteam/SLSsteam.so"),
         home_dir()?.join(".var/app/com.valvesoftware.Steam/.local/share/SLSsteam/SLSsteam.so"),
+        home_dir()?.join(".local/share/LumaForge/thirdparty/slssteam/bin/SLSsteam.so"),
     ];
 
     if let Some(sp) = steam_path {
@@ -117,6 +118,7 @@ fn find_library_inject_so(steam_path: Option<&str>) -> Option<String> {
         PathBuf::from("/usr/lib32/libSLS-library-inject.so"),
         home_dir()?.join(".local/share/SLSsteam/library-inject.so"),
         home_dir()?.join(".var/app/com.valvesoftware.Steam/.local/share/SLSsteam/library-inject.so"),
+        home_dir()?.join(".local/share/LumaForge/thirdparty/slssteam/bin/library-inject.so"),
     ];
 
     if let Some(sp) = steam_path {

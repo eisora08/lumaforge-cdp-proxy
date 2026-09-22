@@ -114,6 +114,15 @@ fn regex_matches(pattern: &str, text: &str) -> bool {
 
 // ─── Main injection entry point ─────────────────────────────────────────────
 
+/// Check if a target URL belongs to a real Steam page (not a context menu, footer, or internal UI).
+pub(crate) fn is_real_steam_page(url: &str) -> bool {
+    url.contains("store.steampowered.com")
+        || url.contains("steamcommunity.com")
+        || url.starts_with("steam://")
+        || url.contains("help.steampowered.com")
+        || url.contains("library.steampowered.com")
+}
+
 /// Bridge proxy JS — intercepts fetch() to the CDP proxy bridge and routes
 /// it through a global queue so the Rust watcher loop can fulfill requests
 /// without mixed-content issues (HTTPS page → HTTP bridge).
@@ -180,7 +189,9 @@ pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     }
 
     let targets = client.get_targets()?;
-    let pages: Vec<&Target> = targets.iter().filter(|t| t.target_type == "page").collect();
+    let pages: Vec<&Target> = targets.iter()
+        .filter(|t| t.target_type == "page" && is_real_steam_page(&t.url))
+        .collect();
 
     if pages.is_empty() {
         crate::log_to_temp("[steamcdp] No page targets found");
@@ -188,8 +199,9 @@ pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     }
 
     crate::log_to_temp(&format!(
-        "[steamcdp] Found {} page targets, {} plugins, {} theme patches",
+        "[steamcdp] Found {} page targets ({} total targets), {} plugins, {} theme patches",
         pages.len(),
+        targets.len(),
         plugins.len(),
         patches.len()
     ));

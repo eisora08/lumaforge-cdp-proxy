@@ -6,7 +6,7 @@ const BRIDGE_PORT: u16 = 21775;
 const BRIDGE_PORT_FALLBACK: u16 = 21776;
 const CORS_HEADERS: &str = "\
 Access-Control-Allow-Origin: *\r\n\
-Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
 Access-Control-Allow-Headers: Content-Type\r\n\
 Access-Control-Max-Age: 86400\r\n";
 
@@ -140,6 +140,11 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
     let query = path.splitn(2, '?').nth(1).unwrap_or("").to_string();
     let clean_path = path.splitn(2, '?').next().unwrap_or(path).to_string();
 
+    // Health check endpoint (for bridge detection)
+    if clean_path == "/health" && method == "GET" {
+        return (200, json!({"status": "ok", "bridge": "lumaforge-cdp-proxy"}).to_string());
+    }
+
     let headers_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let lua_req = crate::lua_backend::LuaRequest {
         method: method.to_string(),
@@ -161,19 +166,33 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         if let Some(resp) = handle_depot_route(method, &clean_path, body) {
             return resp;
         }
+        if let Some(resp) = handle_steam_library_folders(method, &clean_path) {
+            return resp;
+        }
         if let Some(resp) = handle_slssteam_route(method, &clean_path, body) {
             return resp;
         }
+    }
+
+    // Lua file management routes (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(resp) = handle_lua_files_route(method, &clean_path, body) {
+            return resp;
+        }
+    }
+
+    // Rust-native routes — run BEFORE Lua backend so our ACF detection wins
+    if clean_path.starts_with("/api/local-status/") {
+        let app_id = clean_path.trim_start_matches("/api/local-status/");
+        return handle_local_status(app_id);
     }
 
     if let Some(lua_resp) = crate::lua_backend::handle_lua_request(&lua_req) {
         return (lua_resp.status, lua_resp.body);
     }
 
-    if clean_path.starts_with("/api/local-status/") {
-        let app_id = clean_path.trim_start_matches("/api/local-status/");
-        handle_local_status(app_id)
-    } else if clean_path.starts_with("/api/sources/") {
+    if clean_path.starts_with("/api/sources/") {
         let app_id = clean_path.trim_start_matches("/api/sources/");
         handle_sources(app_id)
     } else if clean_path == "/api/providers" {
@@ -181,16 +200,107 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
     } else if clean_path.starts_with("/api/open-library/") && method == "POST" {
         let _app_id = clean_path.trim_start_matches("/api/open-library/");
         (200, json!({"ok": true}).to_string())
+    } else if clean_path == "/api/restart-steam" && method == "POST" {
+        #[cfg(target_os = "linux")]
+        {
+            match crate::slssteam::kill_steam() {
+                Ok(_) => {
+                    std::thread::spawn(|| {
+                        // Poll until Steam is dead (max 10s)
+                        for _ in 0..20 {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            let alive = std::process::Command::new("pgrep")
+                                .args(["-f", "[Ss]team"])
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false);
+                            if !alive { break; }
+                        }
+                        crate::log_to_temp("[restart] Old Steam process terminated, starting new instance");
+                        // Try with SLS first, fall back to plain Steam
+                        match crate::slssteam::start_steam(true) {
+                            Ok(_) => {
+                                crate::log_to_temp("[restart] Steam started with SLS Steam");
+                            }
+                            Err(e) => {
+                                crate::log_to_temp(&format!("[restart] SLS start failed: {}, trying plain start", e));
+                                match crate::slssteam::start_steam(false) {
+                                    Ok(_) => crate::log_to_temp("[restart] Steam started (no SLS)"),
+                                    Err(e2) => crate::log_to_temp(&format!("[restart] Plain start also failed: {}", e2)),
+                                }
+                            }
+                        }
+                    });
+                    (200, json!({"ok": true, "message": "Steam restarting"}).to_string())
+                }
+                Err(e) => (200, json!({"ok": false, "message": e}).to_string()),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (200, json!({"ok": false, "message": "Restart not supported on this platform"}).to_string())
+        }
     } else {
         (404, json!({"error": "not found"}).to_string())
     }
 }
 
 fn handle_local_status(app_id: &str) -> (u16, String) {
+    let mut in_library = false;
+    let mut has_acf = false;
+
+    if let Some(steam_root) = crate::depot_downloader::steam_root() {
+        // Check if lua file exists → in library
+        let lua_path = steam_root.join("config").join("lua").join(format!("{}.lua", app_id));
+        if lua_path.exists() {
+            in_library = true;
+        }
+
+        // Check ACF in default library
+        let acf_name = format!("appmanifest_{}.acf", app_id);
+        let default_acf = steam_root.join("steamapps").join(&acf_name);
+        if default_acf.exists() {
+            has_acf = true;
+        }
+
+        // Also check other library folders from libraryfolders.vdf
+        if !has_acf {
+            let vdf_path = steam_root.join("steamapps").join("libraryfolders.vdf");
+            if let Ok(content) = std::fs::read_to_string(&vdf_path) {
+                let mut current_path: Option<String> = None;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("\"path\"") {
+                        let rest = &trimmed[6..];
+                        if let Some(q1) = rest.find('"') {
+                            let after_q1 = &rest[q1 + 1..];
+                            if let Some(q2) = after_q1.find('"') {
+                                let value = &after_q1[..q2];
+                                current_path = Some(value.replace("\\\\", "/").replace("\\", "/"));
+                            }
+                        }
+                    }
+                    if trimmed == "}" {
+                        if let Some(ref p) = current_path {
+                            let lib_acf = std::path::PathBuf::from(p).join("steamapps").join(&acf_name);
+                            if lib_acf.exists() {
+                                has_acf = true;
+                                break;
+                            }
+                            current_path = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let response = json!({
         "ok": true,
         "appId": app_id,
-        "inLibrary": false
+        "inLibrary": in_library,
+        "has_acf": has_acf,
+        "installed": has_acf
     });
     (200, response.to_string())
 }
@@ -231,7 +341,7 @@ fn handle_depot_route(method: &str, path: &str, body: &str) -> Option<(u16, Stri
         let app_id_str = path.trim_start_matches("/api/depots/");
         if let Ok(app_id) = app_id_str.parse::<u64>() {
             match depot_downloader::resolve_depots(app_id) {
-                Ok(depots) => Some((200, json!({"ok": true, "depots": depots}).to_string())),
+                Ok(result) => Some((200, json!({"ok": true, "depots": result.depots, "gameName": result.game_name, "outputDir": result.output_dir}).to_string())),
                 Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
             }
         } else {
@@ -292,9 +402,102 @@ fn handle_depot_route(method: &str, path: &str, body: &str) -> Option<(u16, Stri
         } else {
             Some((400, json!({"ok": false, "message": "Invalid appId"}).to_string()))
         }
+    } else if path == "/api/downloads-queue" && method == "GET" {
+        let qf = depot_downloader::get_queue();
+        Some((200, json!({"ok": true, "queue": qf.queue, "history": qf.history}).to_string()))
+    } else if path == "/api/downloads-queue/add" && method == "POST" {
+        let parsed: Result<crate::depot_downloader::QueueItem, _> = serde_json::from_str(body);
+        match parsed {
+            Ok(item) => {
+                let id = depot_downloader::add_to_queue(item);
+                Some((200, json!({"ok": true, "id": id}).to_string()))
+            }
+            Err(e) => Some((400, json!({"ok": false, "message": format!("Invalid: {e}")}).to_string()))
+        }
+    } else if path.starts_with("/api/downloads-queue/remove/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/remove/");
+        let ok = depot_downloader::remove_from_queue(id);
+        Some((200, json!({"ok": ok}).to_string()))
+    } else if path.starts_with("/api/downloads-queue/pause/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/pause/");
+        match depot_downloader::pause_queue_item(id) {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path.starts_with("/api/downloads-queue/resume/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/resume/");
+        match depot_downloader::resume_queue_item(id) {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path == "/api/downloads-queue/start-next" && method == "POST" {
+        depot_downloader::start_next();
+        Some((200, json!({"ok": true}).to_string()))
+    } else if path == "/api/downloads-queue/clear-history" && method == "POST" {
+        depot_downloader::clear_history();
+        Some((200, json!({"ok": true}).to_string()))
+    } else if path.starts_with("/api/downloads-queue/remove-history/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/remove-history/");
+        let ok = depot_downloader::remove_history_item(id);
+        Some((200, json!({"ok": ok}).to_string()))
     } else {
         None
     }
+}
+
+#[cfg(target_os = "linux")]
+fn handle_steam_library_folders(method: &str, path: &str) -> Option<(u16, String)> {
+    if path != "/api/steam-library-folders" || method != "GET" {
+        return None;
+    }
+
+    let mut folders: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(steam_root) = crate::depot_downloader::steam_root() {
+        let common = steam_root.join("steamapps").join("common");
+        if common.exists() {
+            folders.push(json!({
+                "path": steam_root.to_string_lossy(),
+                "commonPath": common.to_string_lossy(),
+                "label": "Default"
+            }));
+        }
+
+        let vdf_path = steam_root.join("steamapps").join("libraryfolders.vdf");
+        if let Ok(content) = std::fs::read_to_string(&vdf_path) {
+            let mut current_path: Option<String> = None;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("\"path\"") {
+                    // Parse: "path"		"/path/to/lib"
+                    let rest = &trimmed[6..];
+                    if let Some(q1) = rest.find('"') {
+                        let after_q1 = &rest[q1 + 1..];
+                        if let Some(q2) = after_q1.find('"') {
+                            let value = &after_q1[..q2];
+                            current_path = Some(value.replace("\\\\", "/").replace("\\", "/"));
+                        }
+                    }
+                }
+                if trimmed == "}" {
+                    if let Some(ref p) = current_path {
+                        let path_buf = std::path::PathBuf::from(p);
+                        let common = path_buf.join("steamapps").join("common");
+                        if common.exists() && !folders.iter().any(|f| f["path"].as_str() == Some(p)) {
+                            folders.push(json!({
+                                "path": p,
+                                "commonPath": common.to_string_lossy(),
+                                "label": path_buf.file_name().unwrap_or_default().to_string_lossy()
+                            }));
+                        }
+                        current_path = None;
+                    }
+                }
+            }
+        }
+    }
+
+    Some((200, json!({"ok": true, "folders": folders}).to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +565,116 @@ fn handle_slssteam_route(method: &str, path: &str, body: &str) -> Option<(u16, S
             Ok(apps) => Some((200, json!({"ok": true, "apps": apps}).to_string())),
             Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
         }
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lua file management routes (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16, String)> {
+    if path == "/api/lua-files" && method == "GET" {
+        let steam_root = crate::depot_downloader::steam_root();
+        let lua_dir = steam_root.map(|r| r.join("config").join("lua"));
+
+        let lua_dir = match lua_dir {
+            Some(d) if d.exists() => d,
+            _ => return Some((200, json!({"ok": true, "files": []}).to_string())),
+        };
+
+        let mut files: Vec<serde_json::Value> = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&lua_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.ends_with(".lua") || name_str.contains(".backup") {
+                    continue;
+                }
+                let app_id = name_str.trim_end_matches(".lua").to_string();
+
+                // Extract game name from comment on line 2
+                let mut game_name = String::new();
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    for line in content.lines().take(3) {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("--") && trimmed.len() > 3 {
+                            let candidate = trimmed[2..].trim();
+                            if !candidate.is_empty()
+                                && !candidate.contains("Lua")
+                                && !candidate.contains("Manifest")
+                                && !candidate.contains("Created")
+                                && !candidate.contains("Website")
+                                && !candidate.contains("Total")
+                            {
+                                game_name = candidate.to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let meta = std::fs::metadata(entry.path()).ok();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+                files.push(json!({
+                    "appId": app_id,
+                    "filename": name_str,
+                    "name": game_name,
+                    "size": size
+                }));
+            }
+        }
+
+        // Sort by app id
+        files.sort_by(|a, b| {
+            let a_id = a["appId"].as_str().unwrap_or("");
+            let b_id = b["appId"].as_str().unwrap_or("");
+            a_id.cmp(b_id)
+        });
+
+        Some((200, json!({"ok": true, "files": files}).to_string()))
+    } else if path.starts_with("/api/lua-files/") && method == "DELETE" {
+        let app_id = path.trim_start_matches("/api/lua-files/");
+
+        let steam_root = match crate::depot_downloader::steam_root() {
+            Some(r) => r,
+            None => return Some((200, json!({"ok": false, "message": "Steam root not found"}).to_string())),
+        };
+
+        let lua_path = steam_root.join("config").join("lua").join(format!("{}.lua", app_id));
+
+        let mut removed_file = false;
+        if lua_path.exists() {
+            match std::fs::remove_file(&lua_path) {
+                Ok(_) => {
+                    removed_file = true;
+                    crate::log_to_temp(&format!("[lua-files] Deleted {}", lua_path.display()));
+                }
+                Err(e) => {
+                    return Some((200, json!({"ok": false, "message": format!("Failed to delete: {e}")}).to_string()));
+                }
+            }
+        }
+
+        // Also remove from SLS Steam config
+        let mut removed_config = false;
+        match crate::slssteam::config_remove_app(app_id) {
+            Ok(removed) => {
+                removed_config = removed;
+                if removed {
+                    crate::log_to_temp(&format!("[lua-files] Removed {} from SLS config", app_id));
+                }
+            }
+            Err(e) => {
+                crate::log_to_temp(&format!("[lua-files] Warning: failed to remove from SLS config: {e}"));
+            }
+        }
+
+        Some((200, json!({"ok": true, "removedFile": removed_file, "removedConfig": removed_config}).to_string()))
     } else {
         None
     }
