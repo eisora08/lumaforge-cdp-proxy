@@ -1114,6 +1114,140 @@ fn unfix_steamless(game_path: &Path, app_id: u64) -> Result<GameFixResult, Strin
 // Goldberg (fork)
 // ---------------------------------------------------------------------------
 
+/// Generates achievements.json for GSE in the given steam_settings directory
+/// using the Steam Web API (GetSchemaForGame). Blocking.
+fn generate_goldberg_achievements_json(
+    app_id: u64,
+    output_dir: &Path,
+    api_key: &str,
+) -> Result<usize, String> {
+    if api_key.is_empty() {
+        return Err("No Steam Web API key configured".to_string());
+    }
+    let url = format!(
+        "https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/?key={api_key}&appid={app_id}&l=english"
+    );
+    let client = http_client(Duration::from_secs(15))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Steam API request: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Steam API HTTP {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("Parse Steam API response: {e}"))?;
+
+    let achievements = body["game"]["availableGameStats"]["achievements"]
+        .as_array()
+        .ok_or_else(|| "No achievements in schema".to_string())?;
+    if achievements.is_empty() {
+        return Err("Schema has 0 achievements".to_string());
+    }
+
+    // Build GSE-format achievements.json as an Array (Goldberg expects [...], not {...})
+    let mut gse_achievements: Vec<serde_json::Value> = Vec::new();
+    let img_dir = output_dir.join("img");
+    let _ = std::fs::create_dir_all(&img_dir);
+
+    for ach in achievements {
+        let api_name = ach["name"].as_str().unwrap_or("");
+        if api_name.is_empty() {
+            continue;
+        }
+        let display_name = ach["displayName"].as_str().unwrap_or(api_name);
+        let description = ach["description"].as_str().unwrap_or("");
+        let hidden = ach["hidden"].as_u64().unwrap_or(0);
+
+        // Extract hash from icon field — Steam API may return full CDN URL or just the hash
+        let extract_hash = |raw: &str| -> String {
+            if raw.is_empty() {
+                return String::new();
+            }
+            if raw.starts_with("http") {
+                raw.rsplit('/')
+                    .next()
+                    .unwrap_or(raw)
+                    .trim_end_matches(".jpg")
+                    .trim_end_matches(".png")
+                    .to_string()
+            } else {
+                raw.to_string()
+            }
+        };
+
+        let icon_hash = extract_hash(ach["icon"].as_str().unwrap_or(""));
+        let icon_gray_hash = extract_hash(ach["icongray"].as_str().unwrap_or(""));
+        let icon = if icon_hash.is_empty() {
+            String::new()
+        } else {
+            format!("img/{icon_hash}.jpg")
+        };
+        let icon_gray = if icon_gray_hash.is_empty() {
+            String::new()
+        } else {
+            format!("img/{icon_gray_hash}.jpg")
+        };
+
+        if !icon_hash.is_empty() {
+            let icon_url = format!(
+                "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{app_id}/{icon_hash}.jpg"
+            );
+            let icon_path = img_dir.join(format!("{icon_hash}.jpg"));
+            if !icon_path.exists() {
+                let _ = download_icon_file(&client, &icon_url, &icon_path);
+            }
+        }
+        if !icon_gray_hash.is_empty() {
+            let gray_url = format!(
+                "https://cdn.akamai.steamstatic.com/steamcommunity/public/images/apps/{app_id}/{icon_gray_hash}.jpg"
+            );
+            let gray_path = img_dir.join(format!("{icon_gray_hash}.jpg"));
+            if !gray_path.exists() {
+                let _ = download_icon_file(&client, &gray_url, &gray_path);
+            }
+        }
+
+        gse_achievements.push(json!({
+            "hidden": hidden,
+            "displayName": {"english": display_name},
+            "description": {"english": description},
+            "icon": icon,
+            "icon_gray": icon_gray,
+            "name": api_name
+        }));
+    }
+
+    if gse_achievements.is_empty() {
+        return Err("No valid achievements to write".to_string());
+    }
+
+    let _ = std::fs::create_dir_all(output_dir);
+    let json_out =
+        serde_json::to_string_pretty(&gse_achievements).map_err(|e| format!("Serialize: {e}"))?;
+    std::fs::write(output_dir.join("achievements.json"), json_out)
+        .map_err(|e| format!("Write achievements.json: {e}"))?;
+    Ok(gse_achievements.len())
+}
+
+/// Download a single icon file (best-effort, ignores errors at call site).
+fn download_icon_file(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    let resp = client.get(url).send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(dest, &bytes).map_err(|e| e.to_string())
+}
+
 fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -1226,6 +1360,44 @@ fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> 
             }
         }
 
+        // Step 3.5: generate achievements.json in output/ from Steam Web API
+        // when a key is configured. Non-fatal: applies without achievements if
+        // there is no key or the API call fails.
+        {
+            let achievements_path = output_steam_settings.join("achievements.json");
+            if achievements_path.exists() {
+                crate::log_to_temp(&format!(
+                    "[fixes] goldberg achievements.json already present (app {app_id})"
+                ));
+            } else {
+                let api_key = crate::steam_account::load_steam_account()
+                    .api_key
+                    .unwrap_or_default();
+                if api_key.is_empty() {
+                    crate::log_to_temp(&format!(
+                        "[fixes] goldberg achievements skipped: no Steam Web API key configured (app {app_id})"
+                    ));
+                } else {
+                    match generate_goldberg_achievements_json(
+                        app_id,
+                        &output_steam_settings,
+                        &api_key,
+                    ) {
+                        Ok(count) => {
+                            crate::log_to_temp(&format!(
+                                "[fixes] goldberg achievements.json written: {count} entries (app {app_id})"
+                            ));
+                        }
+                        Err(e) => {
+                            crate::log_to_temp(&format!(
+                                "[fixes] goldberg achievements skipped: {e} (app {app_id})"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Step 4: write steam_interfaces.txt into output
         if let Some(content) = &steam_interfaces_content {
             let _ = std::fs::create_dir_all(&output_steam_settings);
@@ -1311,6 +1483,14 @@ fn unfix_goldberg(game_path: &Path, app_id: u64) -> Result<GameFixResult, String
                 file_path = alt;
             }
         }
+        // Nested paths (e.g. <subdir>/steam_settings/*): resolve by basename
+        if !file_path.exists() {
+            if let Some(name) = Path::new(file_name).file_name().and_then(|n| n.to_str()) {
+                if let Some(found) = find_file_recursive_bounded(game_path, name, FIND_DLL_DEPTH) {
+                    file_path = found;
+                }
+            }
+        }
         if file_path.exists() {
             let _ = std::fs::remove_file(&file_path);
         }
@@ -1320,6 +1500,7 @@ fn unfix_goldberg(game_path: &Path, app_id: u64) -> Result<GameFixResult, String
         }
         removed += 1;
     }
+    clean_empty_dirs_recursive(game_path);
     rewrite_log_without(game_path, app_id, &["Goldberg"]);
     Ok(GameFixResult {
         ok: true,
@@ -1894,15 +2075,20 @@ fn patch_configs_user_ini(game_path: &Path, account_name: &str, steam_id: &str) 
         let Ok(content) = std::fs::read_to_string(ini_path) else {
             continue;
         };
-        let patched = content
-            .replace(
+        // Patch whichever value is available (steamid alone is still useful)
+        let mut patched = content.clone();
+        if !account_name.is_empty() {
+            patched = patched.replace(
                 "account_name=voices38",
                 &format!("account_name={account_name}"),
-            )
-            .replace(
+            );
+        }
+        if !steam_id.is_empty() {
+            patched = patched.replace(
                 "account_steamid=76561197960285355",
                 &format!("account_steamid={steam_id}"),
             );
+        }
         if patched != content {
             let _ = std::fs::write(ini_path, patched);
         }
@@ -2011,10 +2197,14 @@ fn apply_catalog(
     steam_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let installed = download_and_extract_catalog_archive(download_url, game_path)?;
-    if let (Some(acct), Some(sid)) = (account_name, steam_id) {
-        if !acct.is_empty() && !sid.is_empty() {
-            patch_configs_user_ini(game_path, acct, sid);
-        }
+    let has_acct = account_name.map(|a| !a.is_empty()).unwrap_or(false);
+    let has_sid = steam_id.map(|s| !s.is_empty()).unwrap_or(false);
+    if has_acct || has_sid {
+        patch_configs_user_ini(
+            game_path,
+            account_name.unwrap_or(""),
+            steam_id.unwrap_or(""),
+        );
     }
     write_fix_log(game_path, app_id, game_name, fix_type, &installed)?;
     Ok(installed)
@@ -2427,6 +2617,20 @@ fn run_apply_job(
                 .fix_type
                 .clone()
                 .unwrap_or_else(|| "Voices38Fix".to_string());
+            // Fallback to saved Steam account (config.json `steam` section)
+            let saved = crate::steam_account::load_steam_account();
+            let account_name = req
+                .account_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or(saved.account_name);
+            let steam_id = req
+                .steam_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or(saved.steam_id64);
             progress(15, "Downloading catalog fix…");
             let files = apply_catalog(
                 &game_path,
@@ -2434,8 +2638,8 @@ fn run_apply_job(
                 &game_name,
                 download_url,
                 &fix_type,
-                req.account_name.as_deref(),
-                req.steam_id.as_deref(),
+                account_name.as_deref(),
+                steam_id.as_deref(),
             )?;
             files
         }

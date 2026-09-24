@@ -11,6 +11,7 @@ pub mod platform;
 mod plugin;
 #[cfg(target_os = "linux")]
 mod slssteam;
+mod steam_account;
 pub mod theme;
 mod thirdparty;
 

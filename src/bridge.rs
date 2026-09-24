@@ -136,6 +136,53 @@ fn handle_connection(mut stream: std::net::TcpStream) {
     send_response(&mut stream, status, &response_body, "application/json");
 }
 
+fn handle_open_url(body: &str) -> (u16, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                400,
+                json!({"ok": false, "message": format!("Invalid JSON: {e}")}).to_string(),
+            )
+        }
+    };
+    let url = parsed
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !url.starts_with("https://") {
+        return (
+            400,
+            json!({"ok": false, "message": "Only https:// URLs are allowed"}).to_string(),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start", "", url]).creation_flags(CREATE_NO_WINDOW);
+        if let Err(e) = cmd.spawn() {
+            return (
+                500,
+                json!({"ok": false, "message": format!("Failed to open URL: {e}")}).to_string(),
+            );
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = std::process::Command::new("xdg-open").arg(url).spawn() {
+            return (
+                500,
+                json!({"ok": false, "message": format!("Failed to open URL: {e}")}).to_string(),
+            );
+        }
+    }
+
+    (200, json!({"ok": true}).to_string())
+}
+
 fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
     let query = path.splitn(2, '?').nth(1).unwrap_or("").to_string();
     let clean_path = path.splitn(2, '?').next().unwrap_or(path).to_string();
@@ -168,6 +215,16 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
     // Game fixes (apply/unfix SmokeAPI, Steamless, Goldberg, OnlineFix, catalog)
     if let Some(rust_resp) = crate::game_fix::try_handle_route(method, &clean_path, body) {
         return rust_resp;
+    }
+
+    // Steam account settings (Web API key, SteamID64/32, loginusers detect)
+    if let Some(rust_resp) = crate::steam_account::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
+    // Open external URL (https only) — e.g. "Get API key" button
+    if clean_path == "/api/open-url" && method == "POST" {
+        return handle_open_url(body);
     }
 
     // Depot download routes (Linux only)
