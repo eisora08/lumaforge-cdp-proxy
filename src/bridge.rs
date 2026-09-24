@@ -165,6 +165,11 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return rust_resp;
     }
 
+    // Game fixes (apply/unfix SmokeAPI, Steamless, Goldberg, OnlineFix, catalog)
+    if let Some(rust_resp) = crate::game_fix::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
     // Depot download routes (Linux only)
     #[cfg(target_os = "linux")]
     {

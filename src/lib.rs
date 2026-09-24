@@ -2,6 +2,7 @@ mod bridge;
 mod cdp;
 mod depot_downloader;
 mod discovery;
+mod game_fix;
 mod injector;
 mod ipc;
 mod lua_backend;

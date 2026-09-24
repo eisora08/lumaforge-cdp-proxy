@@ -291,7 +291,7 @@ fn save_state(state: &ThirdPartyState) {
     }
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -671,7 +671,11 @@ fn remove_dir_recursive(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_archive(zip_path: &Path, archive_ext: &str, extract_dir: &Path) -> Result<(), String> {
+pub(crate) fn extract_archive(
+    zip_path: &Path,
+    archive_ext: &str,
+    extract_dir: &Path,
+) -> Result<(), String> {
     std::fs::create_dir_all(extract_dir).map_err(|e| format!("Failed to create extract dir: {e}"))?;
     if archive_ext == "7z" {
         sevenz_rust::decompress_file(zip_path, extract_dir)

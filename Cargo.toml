@@ -47,6 +47,7 @@ regex = "1"
 zip = "0.6"
 sevenz-rust = "0.6"
 sha2 = "0.10"
+goblin = "0.8"
 open = "5"
 dirs = "5"
 
