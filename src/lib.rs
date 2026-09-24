@@ -12,6 +12,7 @@ mod plugin;
 #[cfg(target_os = "linux")]
 mod slssteam;
 mod steam_account;
+mod steam_keys;
 pub mod theme;
 mod thirdparty;
 

@@ -201,6 +201,12 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         query,
     };
 
+    // Steam Keys provider (lua generation, manifest fetch, pin/unpin) — must
+    // intercept POST /api/download for sourceId==steamkeys before package_installer
+    if let Some(rust_resp) = crate::steam_keys::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
     // Rust-native routes: intercept binary-heavy operations before Lua
     #[cfg(target_os = "windows")]
     if let Some(rust_resp) = crate::package_installer::try_handle_route(method, &clean_path, body) {
@@ -670,10 +676,12 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
                             let candidate = trimmed[2..].trim();
                             if !candidate.is_empty()
                                 && !candidate.contains("Lua")
+                                && !candidate.contains("LumaForge")
                                 && !candidate.contains("Manifest")
                                 && !candidate.contains("Created")
                                 && !candidate.contains("Website")
                                 && !candidate.contains("Total")
+                                && !candidate.contains("MAIN APPLICATION")
                             {
                                 game_name = candidate.to_string();
                                 break;
