@@ -93,7 +93,7 @@ fn drain_bridge_queue(client: &mut crate::cdp::CdpClient, injected: &std::collec
 }
 
 /// Make an HTTP request to the local bridge (called from Rust, not CEF).
-/// Tries port 21775 first (luma-lite primary), then 21777 (fallback).
+/// Tries the proxy's own ports only — no luma-lite dependency.
 fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_json::Value {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -104,8 +104,8 @@ fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_jso
             }
         };
 
-    // Try luma-lite port first (21777), then CDP proxy stub (21775)
-    let ports = [21777u16, 21775];
+    // Our own bridge ports: primary 21775, fallback 21776
+    let ports = [21775u16, 21776];
     for port in &ports {
         // Replace port in URL
         let target_url = if url.contains("127.0.0.1:") {

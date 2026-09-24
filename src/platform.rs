@@ -43,8 +43,75 @@ pub fn find_steam_install() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
+fn registry_steam_path(subkey: &str, value_name: &str) -> Option<PathBuf> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER,
+        KEY_READ, REG_SZ,
+    };
+
+    fn encode_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let hives = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER];
+    let key_path = encode_wide(subkey);
+    let value_name_w = encode_wide(value_name);
+
+    for hive in hives {
+        unsafe {
+            let mut hkey: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+            let res = RegOpenKeyExW(hive, key_path.as_ptr(), 0, KEY_READ, &mut hkey);
+            if res != 0 {
+                continue;
+            }
+
+            let mut buf = [0u16; 520];
+            let mut buf_len = (buf.len() * 2) as u32;
+            let mut reg_type = 0u32;
+
+            let res = RegQueryValueExW(
+                hkey,
+                value_name_w.as_ptr(),
+                std::ptr::null_mut(),
+                &mut reg_type,
+                buf.as_mut_ptr() as *mut u8,
+                &mut buf_len,
+            );
+            RegCloseKey(hkey);
+
+            if res != 0 || reg_type != REG_SZ {
+                continue;
+            }
+
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let install_path = String::from_utf16_lossy(&buf[..len]);
+            if install_path.is_empty() {
+                continue;
+            }
+            let p = PathBuf::from(&install_path);
+            if p.join("steam.exe").exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
 pub fn find_steam_install() -> Option<PathBuf> {
-    // Windows: check registry and common paths
+    // 1. Registry — authoritative, handles custom install paths
+    //    (e.g. "C:\Program Files (x86)\Steam Luma")
+    for (subkey, value_name) in [
+        (r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+        (r"SOFTWARE\Valve\Steam", "InstallPath"),
+        (r"Software\Valve\Steam", "SteamPath"),
+    ] {
+        if let Some(p) = registry_steam_path(subkey, value_name) {
+            return Some(p);
+        }
+    }
+
+    // 2. Hardcoded common paths
     let candidates = [
         "C:\\Program Files (x86)\\Steam",
         "C:\\Program Files\\Steam",

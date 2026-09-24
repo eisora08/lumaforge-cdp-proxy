@@ -998,8 +998,9 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
   };
   var _origFetch=window.fetch;
   window.fetch=function(url,opts){
-    if(typeof url==='string'&&url.indexOf('http://127.0.0.1:21775')===0){
-      var path=url.substring(22);
+    if(typeof url==='string'&&(url.indexOf('http://127.0.0.1:21775')===0||url.indexOf('http://127.0.0.1:21776')===0)){
+      var path=url.replace(/^https?:\/\/[^\/]+/,'');
+      if(!path)path='/';
       return window.__luma_bridge_call(path,opts);
     }
     return _origFetch.apply(this,arguments);
@@ -1321,7 +1322,17 @@ fn register_theme_injection_script(
     }
 }
 
-/// Iterate all CDP targets and evaluate the injection script in each page target
+/// Check if a target URL belongs to a real Steam page (not internal UI/popups).
+fn is_real_steam_page(url: &str) -> bool {
+    url.contains("store.steampowered.com")
+        || url.contains("steamcommunity.com")
+        || url.starts_with("steam://")
+        || url.contains("help.steampowered.com")
+        || url.contains("library.steampowered.com")
+}
+
+/// Iterate all CDP targets and reload real Steam page targets so that
+/// addScriptToEvaluateOnNewDocument scripts re-run on them.
 fn inject_into_existing_targets(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
@@ -1364,6 +1375,12 @@ fn inject_into_existing_targets(
 
         // Skip our own lumaforge.local and about:blank
         if target_url.contains("lumaforge.local") || target_url.starts_with("about:") {
+            continue;
+        }
+
+        // Only reload real Steam pages — internal UI (steamloopback, clientui,
+        // popups, settings windows) must not get extension scripts / settings button
+        if !is_real_steam_page(target_url) {
             continue;
         }
 

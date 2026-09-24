@@ -126,6 +126,8 @@ pub(crate) fn is_real_steam_page(url: &str) -> bool {
 /// Bridge proxy JS — intercepts fetch() to the CDP proxy bridge and routes
 /// it through a global queue so the Rust watcher loop can fulfill requests
 /// without mixed-content issues (HTTPS page → HTTP bridge).
+/// If the cef_hook native bridge (`__luma_bridge_call`) is present, that is
+/// preferred — it fulfills immediately without waiting for the Rust drain.
 pub const BRIDGE_PROXY_JS: &str = r#"
 (function(){
   if (window.__lumaBridgeProxyInstalled) return;
@@ -135,7 +137,15 @@ pub const BRIDGE_PROXY_JS: &str = r#"
   var _origFetch = window.fetch;
   window.fetch = function(url, opts) {
     var urlStr = (typeof url === 'string') ? url : (url && url.url) || '';
-    if (urlStr.indexOf('127.0.0.1:21775') !== -1 || urlStr.indexOf('localhost:21775') !== -1) {
+    var isBridge = (urlStr.indexOf('127.0.0.1:21775') !== -1 || urlStr.indexOf('localhost:21775') !== -1 ||
+                    urlStr.indexOf('127.0.0.1:21776') !== -1 || urlStr.indexOf('localhost:21776') !== -1);
+    if (isBridge) {
+      // Prefer native bridge (cef_hook) when available — no drain latency
+      if (typeof window.__luma_bridge_call === 'function') {
+        var nativePath = urlStr.replace(/^https?:\/\/[^\/]+/, '');
+        if (!nativePath) nativePath = '/';
+        return window.__luma_bridge_call(nativePath, opts);
+      }
       var id = 'bq' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
       var method = (opts && opts.method) || 'GET';
       var body = (opts && opts.body) || null;
@@ -391,6 +401,19 @@ pub fn inject_into_target(
 
     // ─── Plugins ──────────────────────────────────────────────────────
     for plugin in plugins {
+        // Respect activation.targetUrl — only inject into matching pages
+        if let Some(ref pattern) = plugin.target_url {
+            if !pattern.is_empty() && !target.url.contains(pattern.as_str()) {
+                crate::log_to_temp(&format!(
+                    "[steamcdp] Plugin '{}' skipped target#{} (targetUrl '{}' not in {})",
+                    plugin.name,
+                    target_num,
+                    pattern,
+                    &target.url[..target.url.len().min(80)]
+                ));
+                continue;
+            }
+        }
         let resp = client.send_cdp_wait(
             &json!({
                 "id": msg_id,

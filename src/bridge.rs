@@ -12,18 +12,18 @@ Access-Control-Max-Age: 86400\r\n";
 
 pub fn start_bridge_server() {
     std::thread::spawn(|| {
-        // Try primary port first (luma-lite's port), fall back to 21776
+        // Try primary port first, fall back to 21776
         let listener = match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT)) {
             Ok(l) => {
                 crate::log_to_temp(&format!(
-                    "[bridge] Mini-bridge listening on port {} (luma-lite not detected)",
+                    "[bridge] Mini-bridge listening on port {}",
                     BRIDGE_PORT
                 ));
                 l
             }
             Err(e) => {
                 crate::log_to_temp(&format!(
-                    "[bridge] Port {} in use (luma-lite running?), trying fallback port {}: {}",
+                    "[bridge] Port {} in use, trying fallback port {}: {}",
                     BRIDGE_PORT, BRIDGE_PORT_FALLBACK, e
                 ));
                 match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT_FALLBACK)) {
@@ -174,8 +174,7 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         }
     }
 
-    // Lua file management routes (Linux only)
-    #[cfg(target_os = "linux")]
+    // Lua file management routes (cross-platform: config/lua lives under Steam root)
     {
         if let Some(resp) = handle_lua_files_route(method, &clean_path, body) {
             return resp;
@@ -571,10 +570,9 @@ fn handle_slssteam_route(method: &str, path: &str, body: &str) -> Option<(u16, S
 }
 
 // ---------------------------------------------------------------------------
-// Lua file management routes (Linux only)
+// Lua file management routes (cross-platform)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
 fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16, String)> {
     if path == "/api/lua-files" && method == "GET" {
         let steam_root = crate::depot_downloader::steam_root();
@@ -660,8 +658,12 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
             }
         }
 
-        // Also remove from SLS Steam config
+        // Also remove from SLS Steam config (Linux only — slssteam is Linux-only)
+        #[cfg(target_os = "linux")]
         let mut removed_config = false;
+        #[cfg(not(target_os = "linux"))]
+        let removed_config = false;
+        #[cfg(target_os = "linux")]
         match crate::slssteam::config_remove_app(app_id) {
             Ok(removed) => {
                 removed_config = removed;

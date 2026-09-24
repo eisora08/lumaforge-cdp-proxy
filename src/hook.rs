@@ -136,77 +136,7 @@ unsafe extern "system" fn hook_create_process_w(
         INJECTION_STARTED.call_once(|| {
             let port = port;
             std::thread::spawn(move || {
-                let max_attempts = 10;
-                let mut attempt = 0;
-
-                loop {
-                    attempt += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-
-                    match crate::cdp::CdpClient::connect(port) {
-                        Ok(mut client) => {
-                            crate::log_to_temp(&format!(
-                                "[steamcdp] Connected to CDP (attempt {})",
-                                attempt
-                            ));
-                            match crate::injector::inject_all(&mut client) {
-                                Ok(()) => {
-                                    crate::log_to_temp("[steamcdp] Injection complete");
-                                }
-                                Err(e) => {
-                                    crate::log_to_temp(&format!("[steamcdp] Injection error: {}", e));
-                                }
-                            }
-
-                            let mut injected_targets: std::collections::HashSet<String> =
-                                std::collections::HashSet::new();
-                            if let Ok(targets) = client.get_targets() {
-                                for t in &targets {
-                                    if t.target_type == "page" {
-                                        injected_targets.insert(t.id.clone());
-                                    }
-                                }
-                            }
-
-                            crate::log_to_temp("[steamcdp] Watching for new targets...");
-                            let (theme_dir, theme_patches) = crate::injector::load_theme_patches();
-                            while client.is_alive() {
-                                std::thread::sleep(std::time::Duration::from_secs(1));
-
-                                if let Ok(new_targets) = client.get_targets() {
-                                    for t in &new_targets {
-                                        if t.target_type == "page" && !injected_targets.contains(&t.id) {
-                                            crate::log_to_temp(&format!(
-                                                "[steamcdp] New target: id={}, title=\"{}\", url={}",
-                                                t.id, t.title, &t.url[..t.url.len().min(100)]
-                                            ));
-                                            let plugins = crate::plugin_loader::load_enabled_plugins().unwrap_or_default();
-                                            if let Err(e) = crate::injector::inject_into_target(&mut client, t, &plugins, &theme_dir, &theme_patches, injected_targets.len() + 1) {
-                                                crate::log_to_temp(&format!("[steamcdp] New target injection failed: {}", e));
-                                            } else {
-                                                injected_targets.insert(t.id.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            crate::log_to_temp("[steamcdp] CDP connection lost, reconnecting...");
-                            attempt = 0;
-                        }
-                        Err(e) => {
-                            crate::log_to_temp(&format!(
-                                "[steamcdp] CDP connect attempt {} failed: {}",
-                                attempt, e
-                            ));
-                            if attempt >= max_attempts {
-                                crate::log_to_temp("[steamcdp] Max attempts reached, giving up");
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(3000));
-                            continue;
-                        }
-                    }
-                }
+                start_cdp_watch_loop(port);
             });
         });
     }
@@ -258,6 +188,430 @@ unsafe extern "system" fn hook_create_process_w(
     }
 
     result
+}
+
+// --- CDP watch loop (parity with hook_linux.rs) ---
+
+/// Drain the bridge proxy queue from all injected targets and fulfill
+/// pending HTTP requests from Rust (bypasses mixed-content blocking).
+fn drain_bridge_queue(
+    client: &mut crate::cdp::CdpClient,
+    injected: &std::collections::HashSet<String>,
+) {
+    for target_id in injected {
+        if target_id.is_empty() {
+            continue;
+        }
+        if client.attach_to_target(target_id).is_err() {
+            continue;
+        }
+        let drain_expr = r#"(function(){
+            if (!window.__lumaBridgeDrain) return '[]';
+            return window.__lumaBridgeDrain();
+        })()"#;
+        let resp = match client.send_cdp_wait(
+            &serde_json::json!({
+                "id": 7700,
+                "method": "Runtime.evaluate",
+                "params": { "expression": drain_expr, "returnByValue": true }
+            }),
+            7700,
+        ) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let queue_str = resp
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("[]");
+        let queue: Vec<serde_json::Value> = serde_json::from_str(queue_str).unwrap_or_default();
+        if queue.is_empty() {
+            continue;
+        }
+
+        for req in &queue {
+            let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let body = req.get("body").and_then(|v| v.as_str());
+
+            let result = make_bridge_request(method, url, body);
+            let inject_expr = format!(
+                "window.__lumaBridgeResults['{}'] = {};",
+                id.replace('\'', "\\'"),
+                serde_json::to_string(&result).unwrap_or_default()
+            );
+            let _ = client.send_cdp_wait(
+                &serde_json::json!({
+                    "id": 7701,
+                    "method": "Runtime.evaluate",
+                    "params": { "expression": &inject_expr, "returnByValue": true }
+                }),
+                7701,
+            );
+        }
+    }
+}
+
+/// Make an HTTP request to the local bridge (called from Rust, not CEF).
+/// Tries the proxy's own ports only — no luma-lite dependency.
+fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_json::Value {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": format!("Client build error: {}", e)});
+        }
+    };
+
+    // Our own bridge ports: primary 21775, fallback 21776
+    let ports = [21775u16, 21776];
+    for port in &ports {
+        let target_url = if url.contains("127.0.0.1:") || url.contains("localhost:") {
+            let host_part = if url.contains("127.0.0.1:") {
+                "127.0.0.1:"
+            } else {
+                "localhost:"
+            };
+            let prefix = url.split(host_part).next().unwrap_or("");
+            let suffix = url.splitn(2, host_part).nth(1).unwrap_or("");
+            let path = suffix.splitn(2, '/').nth(1).unwrap_or("");
+            if path.is_empty() {
+                format!("{}127.0.0.1:{}/", prefix, port)
+            } else {
+                format!("{}127.0.0.1:{}/{}", prefix, port, path)
+            }
+        } else {
+            url.to_string()
+        };
+
+        let req = match method {
+            "POST" => {
+                let mut r = client.post(&target_url);
+                if let Some(b) = body {
+                    r = r.body(b.to_string()).header("content-type", "application/json");
+                }
+                r
+            }
+            _ => client.get(&target_url),
+        };
+
+        match req.send() {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let headers: serde_json::Map<String, serde_json::Value> = resp
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            serde_json::Value::String(v.to_str().unwrap_or("").to_string()),
+                        )
+                    })
+                    .collect();
+                let body = resp.text().unwrap_or_default();
+                return serde_json::json!({
+                    "status": status,
+                    "body": body,
+                    "headers": headers,
+                    "statusText": ""
+                });
+            }
+            Err(_) => continue,
+        }
+    }
+
+    serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": "Bridge not available on any port"})
+}
+
+/// Main CDP watch loop for Windows: connect with exponential backoff,
+/// inject, drain bridge queue, re-inject on URL changes, reconnect on drop.
+fn start_cdp_watch_loop(port: u16) {
+    if let Err(e) = crate::discovery::publish_if_needed(port) {
+        crate::log_to_temp(&format!(
+            "[steamcdp] Failed to publish CDP discovery: {}",
+            e
+        ));
+    }
+
+    crate::log_to_temp(&format!(
+        "[steamcdp] Windows CDP injection loop started, port={}",
+        port
+    ));
+
+    // Exponential backoff: 100ms → 200ms → 400ms → 500ms
+    let max_attempts = 30;
+    for attempt in 1..=max_attempts {
+        let delay_ms = std::cmp::min(100 * (1u64 << ((attempt - 1).min(2))), 500);
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+
+        match crate::cdp::CdpClient::connect(port) {
+            Ok(mut client) => {
+                crate::log_to_temp(&format!(
+                    "[steamcdp] Connected to CDP (attempt {})",
+                    attempt
+                ));
+                match crate::injector::inject_all(&mut client) {
+                    Ok(()) => {
+                        crate::log_to_temp("[steamcdp] Injection complete");
+                    }
+                    Err(e) => {
+                        crate::log_to_temp(&format!("[steamcdp] Injection error: {}", e));
+                    }
+                }
+
+                // Mark existing page targets as seen (inject_all already filtered
+                // to real Steam pages). Skip shutdown/internal pages entirely.
+                let mut injected_targets: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                if let Ok(targets) = client.get_targets() {
+                    for t in &targets {
+                        if t.target_type == "page"
+                            && t.title != "Shutdown"
+                            && !t.url.contains("createflags=2")
+                            && !t.url.contains("centerOnBrowserID")
+                        {
+                            injected_targets.insert(t.id.clone());
+                        }
+                    }
+                }
+
+                crate::log_to_temp("[steamcdp] Watching for new targets...");
+                let (theme_dir, theme_patches) = crate::injector::load_theme_patches();
+                let mut recheck_counter = 0u32;
+                let mut known_urls: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                if let Ok(targets) = client.get_targets() {
+                    for t in &targets {
+                        if t.target_type == "page" && injected_targets.contains(&t.id) {
+                            known_urls.insert(t.id.clone(), t.url.clone());
+                        }
+                    }
+                }
+
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    recheck_counter += 1;
+
+                    // Drain bridge proxy queue every cycle (~1s) so extension fetch
+                    // requests are fulfilled within the 15s JS timeout
+                    drain_bridge_queue(&mut client, &injected_targets);
+
+                    // Every 30s, re-evaluate diagnostic on ALL injected targets to
+                    // catch SPA navigations. Store pages are checked first.
+                    if recheck_counter % 30 == 0 {
+                        if let Ok(all_targets) = client.get_targets() {
+                            let page_count = all_targets
+                                .iter()
+                                .filter(|t| t.target_type == "page")
+                                .count();
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] Recheck: {} total targets ({} pages), {} injected",
+                                all_targets.len(),
+                                page_count,
+                                injected_targets.len()
+                            ));
+
+                            let mut pages: Vec<_> = all_targets
+                                .iter()
+                                .filter(|t| {
+                                    t.target_type == "page"
+                                        && injected_targets.contains(&t.id)
+                                        && crate::injector::is_real_steam_page(&t.url)
+                                })
+                                .collect();
+                            pages.sort_by(|a, b| {
+                                let a_store = a.url.contains("store.steampowered.com");
+                                let b_store = b.url.contains("store.steampowered.com");
+                                b_store.cmp(&a_store)
+                            });
+
+                            let mut checked = 0u32;
+                            for t in pages {
+                                checked += 1;
+                                if client.attach_to_target(&t.id).is_err() {
+                                    continue;
+                                }
+                                let diag_expr = r#"JSON.stringify({url:window.location.href.substring(0,200),title:document.title.substring(0,80),bodyLen:document.body?document.body.innerHTML.length:-1,hasLuma:!!window.__lumaforge_ssh__,lumaActive:window.__lumaforge_ssh__&&window.__lumaforge_ssh__.active,lumaAppId:window.__lumaforge_ssh__&&window.__lumaforge_ssh__.currentAppId,btnExists:!!document.getElementById('luma-action-btn'),appLinks:document.querySelectorAll('a[href*="/app/"]').length})"#;
+                                let msg_id = 9000 + checked as u64;
+                                let mut diag_val = String::new();
+                                if let Ok(resp) = client.send_cdp_wait(
+                                    &serde_json::json!({
+                                        "id": msg_id,
+                                        "method": "Runtime.evaluate",
+                                        "params": { "expression": diag_expr, "returnByValue": true }
+                                    }),
+                                    msg_id,
+                                ) {
+                                    if let Some(v) = resp
+                                        .get("result")
+                                        .and_then(|r| r.get("result"))
+                                        .and_then(|r| r.get("value"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        diag_val = v.to_string();
+                                        crate::log_to_temp(&format!(
+                                            "[steamcdp] Recheck p#{}: {}",
+                                            checked, v
+                                        ));
+                                    }
+                                } else {
+                                    crate::log_to_temp(&format!(
+                                        "[steamcdp] Recheck p#{}: CDP eval failed",
+                                        checked
+                                    ));
+                                }
+
+                                let has_luma = diag_val.contains("\"hasLuma\":true");
+                                if !has_luma {
+                                    crate::log_to_temp(&format!(
+                                        "[steamcdp] Re-injecting target (hasLuma=false): id={}, title=\"{}\", url={}",
+                                        t.id,
+                                        t.title,
+                                        &t.url[..t.url.len().min(100)]
+                                    ));
+                                    let plugins = crate::plugin_loader::load_enabled_plugins()
+                                        .unwrap_or_default();
+                                    if let Err(e) = crate::injector::inject_into_target(
+                                        &mut client,
+                                        t,
+                                        &plugins,
+                                        &theme_dir,
+                                        &theme_patches,
+                                        checked as usize,
+                                    ) {
+                                        crate::log_to_temp(&format!(
+                                            "[steamcdp] Re-inject failed: {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    match client.get_targets() {
+                        Ok(new_targets) => {
+                            for t in &new_targets {
+                                if t.target_type == "page"
+                                    && !injected_targets.contains(&t.id)
+                                    && crate::injector::is_real_steam_page(&t.url)
+                                {
+                                    // Skip shutdown/close targets — injecting into these
+                                    // can destabilize Steam
+                                    if t.title == "Shutdown" || t.url.contains("createflags=2") {
+                                        injected_targets.insert(t.id.clone());
+                                        continue;
+                                    }
+                                    crate::log_to_temp(&format!(
+                                        "[steamcdp] New target: id={}, title=\"{}\", url={}",
+                                        t.id,
+                                        t.title,
+                                        &t.url[..t.url.len().min(100)]
+                                    ));
+                                    let plugins = crate::plugin_loader::load_enabled_plugins()
+                                        .unwrap_or_default();
+                                    if let Err(e) = crate::injector::inject_into_target(
+                                        &mut client,
+                                        t,
+                                        &plugins,
+                                        &theme_dir,
+                                        &theme_patches,
+                                        injected_targets.len() + 1,
+                                    ) {
+                                        crate::log_to_temp(&format!(
+                                            "[steamcdp] New target injection failed: {}",
+                                            e
+                                        ));
+                                    } else {
+                                        injected_targets.insert(t.id.clone());
+                                        known_urls.insert(t.id.clone(), t.url.clone());
+                                    }
+                                } else if t.target_type == "page"
+                                    && injected_targets.contains(&t.id)
+                                {
+                                    // Detect URL change on existing store target → re-inject
+                                    if t.url.contains("store.steampowered.com") {
+                                        if let Some(prev_url) = known_urls.get(&t.id) {
+                                            if prev_url != &t.url {
+                                                crate::log_to_temp(&format!(
+                                                    "[steamcdp] Store URL changed: id={}, prev={}, new={}",
+                                                    t.id,
+                                                    &prev_url[..prev_url.len().min(80)],
+                                                    &t.url[..t.url.len().min(80)]
+                                                ));
+                                                let plugins =
+                                                    crate::plugin_loader::load_enabled_plugins()
+                                                        .unwrap_or_default();
+                                                if let Err(e) = crate::injector::inject_into_target(
+                                                    &mut client,
+                                                    t,
+                                                    &plugins,
+                                                    &theme_dir,
+                                                    &theme_patches,
+                                                    1,
+                                                ) {
+                                                    crate::log_to_temp(&format!(
+                                                        "[steamcdp] URL-change re-inject failed: {}",
+                                                        e
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        known_urls.insert(t.id.clone(), t.url.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] get_targets error: {}, trying reconnect...",
+                                e
+                            ));
+                            match crate::cdp::CdpClient::connect(port) {
+                                Ok(new_client) => {
+                                    crate::log_to_temp("[steamcdp] Reconnected to CDP");
+                                    client = new_client;
+                                    injected_targets.clear();
+                                    known_urls.clear();
+                                    if let Ok(targets) = client.get_targets() {
+                                        for t in &targets {
+                                            if t.target_type == "page" {
+                                                injected_targets.insert(t.id.clone());
+                                                known_urls.insert(t.id.clone(), t.url.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e2) => {
+                                    crate::log_to_temp(&format!(
+                                        "[steamcdp] Reconnect failed: {}",
+                                        e2
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                // Unreachable: the watch loop only exits via reconnect path above.
+                #[allow(unreachable_code)]
+                {
+                    crate::log_to_temp("[steamcdp] CDP connection lost, reconnecting...");
+                }
+            }
+            Err(e) => {
+                crate::log_to_temp(&format!(
+                    "[steamcdp] CDP connect attempt {} failed: {}",
+                    attempt, e
+                ));
+            }
+        }
+    }
+    crate::log_to_temp("[steamcdp] Max attempts reached, giving up");
 }
 
 // --- Instalación de hooks (solo CreateProcessW) ---
