@@ -418,12 +418,17 @@ fn thirdparty_dir() -> PathBuf {
 
 fn depot_downloader_exe() -> Option<PathBuf> {
     let base = thirdparty_dir().join("depotdownloader");
-    let exe = base.join("DepotDownloaderMod");
-    if exe.exists() {
-        Some(exe)
-    } else {
-        None
+    #[cfg(target_os = "windows")]
+    let candidates = ["DepotDownloaderMod.exe", "DepotDownloaderMod"];
+    #[cfg(target_os = "linux")]
+    let candidates = ["DepotDownloaderMod"];
+    for name in candidates {
+        let exe = base.join(name);
+        if exe.exists() {
+            return Some(exe);
+        }
     }
+    None
 }
 
 fn lua_dir() -> Option<PathBuf> {

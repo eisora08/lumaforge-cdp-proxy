@@ -160,6 +160,11 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return rust_resp;
     }
 
+    // Third-party tools (install/update/uninstall + list) — cross-platform
+    if let Some(rust_resp) = crate::thirdparty::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
     // Depot download routes (Linux only)
     #[cfg(target_os = "linux")]
     {
@@ -237,7 +242,7 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            (200, json!({"ok": false, "message": "Restart not supported on this platform"}).to_string())
+            crate::thirdparty::restart_steam_request()
         }
     } else {
         (404, json!({"error": "not found"}).to_string())

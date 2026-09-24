@@ -11,6 +11,7 @@ mod plugin;
 #[cfg(target_os = "linux")]
 mod slssteam;
 pub mod theme;
+mod thirdparty;
 
 #[cfg(target_os = "windows")]
 mod hook;
