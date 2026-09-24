@@ -1012,27 +1012,20 @@ fn proxy_bridge_request(path: &str, method: &str, body: Option<&str>) -> Result<
     let mut stream = TcpStream::connect("127.0.0.1:21775").map_err(|e| format!("connect: {}", e))?;
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
-    let mut req = format!(
-        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:21775\r\nConnection: close\r\n",
-        path
-    );
     let method_upper = method.to_uppercase();
-    if method_upper == "POST" {
-        if let Some(body_str) = body {
-            let body_bytes = body_str.as_bytes();
-            req = format!(
-                "POST {} HTTP/1.1\r\nHost: 127.0.0.1:21775\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                path, body_bytes.len(), body_str
-            );
-        } else {
-            req = format!(
-                "POST {} HTTP/1.1\r\nHost: 127.0.0.1:21775\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                path
-            );
-        }
-    } else {
-        req.push_str("\r\n");
-    }
+    let req = match body {
+        Some(body_str) => format!(
+            "{} {} HTTP/1.1\r\nHost: 127.0.0.1:21775\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            method_upper,
+            path,
+            body_str.as_bytes().len(),
+            body_str
+        ),
+        None => format!(
+            "{} {} HTTP/1.1\r\nHost: 127.0.0.1:21775\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            method_upper, path
+        ),
+    };
 
     stream.write_all(req.as_bytes()).map_err(|e| format!("write: {}", e))?;
     let mut resp = Vec::new();

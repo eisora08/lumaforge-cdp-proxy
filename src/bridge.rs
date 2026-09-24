@@ -692,12 +692,19 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
 
                 let meta = std::fs::metadata(entry.path()).ok();
                 let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let modified = meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
 
                 files.push(json!({
                     "appId": app_id,
                     "filename": name_str,
                     "name": game_name,
-                    "size": size
+                    "size": size,
+                    "modified": modified
                 }));
             }
         }

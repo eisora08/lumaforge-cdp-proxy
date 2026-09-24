@@ -121,16 +121,11 @@ fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_jso
             url.to_string()
         };
 
-        let mut req = match method {
-            "POST" => {
-                let mut r = client.post(&target_url);
-                if let Some(b) = body {
-                    r = r.body(b.to_string()).header("content-type", "application/json");
-                }
-                r
-            }
-            _ => client.get(&target_url),
-        };
+        let http_method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let mut req = client.request(http_method, &target_url);
+        if let Some(b) = body {
+            req = req.body(b.to_string()).header("content-type", "application/json");
+        }
 
         match req.send() {
             Ok(resp) => {
