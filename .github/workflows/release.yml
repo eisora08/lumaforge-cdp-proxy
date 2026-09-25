@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build wsock32 bootstrap
+        run: cmd /c bootstrap\build.bat
+
+      - name: Build proxy
+        run: cargo build --release
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Path "$stage\lumaforge" -Force | Out-Null
+          Copy-Item bootstrap\wsock32.dll "$stage\"
+          Copy-Item target\release\lumaforge.dll "$stage\lumaforge\"
+          if (Test-Path target\release\lumaforge_cef_hook.dll) {
+            Copy-Item target\release\lumaforge_cef_hook.dll "$stage\lumaforge\"
+          }
+          if (Test-Path target\release\steam_launcher.exe) {
+            Copy-Item target\release\steam_launcher.exe "$stage\"
+          }
+          foreach ($f in @('README.md', 'LICENSE', 'LICENSE.md')) {
+            if (Test-Path $f) { Copy-Item $f "$stage\" }
+          }
+          Compress-Archive -Path "$stage\*" -DestinationPath lumaforge-proxy-windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy-windows
+          path: lumaforge-proxy-windows-x64.zip
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib pkg-config libssl-dev libssl-dev:i386
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: i686
+
+      - name: Build proxy (i686)
+        env:
+          CC_i686_unknown_linux_gnu: gcc -m32
+          OPENSSL_DIR: /usr
+          OPENSSL_LIB_DIR: /usr/lib/i386-linux-gnu
+          OPENSSL_INCLUDE_DIR: /usr/include
+        run: cargo build --release --target i686-unknown-linux-gnu
+
+      - name: Package zip
+        run: |
+          mkdir -p stage/ubuntu12_32
+          cp target/i686-unknown-linux-gnu/release/liblumaforge.so stage/ubuntu12_32/
+          cp hook/target/i686-unknown-linux-gnu/release/libXtst.so stage/ubuntu12_32/libXtst.so.6
+          (cd stage && zip -r ../lumaforge-proxy-linux-i686.zip .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxy-linux
+          path: lumaforge-proxy-linux-i686.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          name: LumaForge CDP Proxy ${{ github.ref_name }}
+          body: 'See the assets for download links.'
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
