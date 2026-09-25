@@ -108,14 +108,19 @@ fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_jso
     let ports = [21775u16, 21776];
     for port in &ports {
         // Replace port in URL
-        let target_url = if url.contains("127.0.0.1:") {
-            let prefix = url.split("127.0.0.1:").next().unwrap_or("");
-            let suffix = url.splitn(2, "127.0.0.1:").nth(1).unwrap_or("");
+        let target_url = if url.contains("127.0.0.1:") || url.contains("localhost:") {
+            let host_part = if url.contains("127.0.0.1:") {
+                "127.0.0.1:"
+            } else {
+                "localhost:"
+            };
+            let prefix = url.split(host_part).next().unwrap_or("");
+            let suffix = url.splitn(2, host_part).nth(1).unwrap_or("");
             let path = suffix.splitn(2, '/').nth(1).unwrap_or("");
             if path.is_empty() {
-                format!("http://127.0.0.1:{}/", port)
+                format!("{}127.0.0.1:{}/", prefix, port)
             } else {
-                format!("http://127.0.0.1:{}/{}", port, path)
+                format!("{}127.0.0.1:{}/{}", prefix, port, path)
             }
         } else {
             url.to_string()

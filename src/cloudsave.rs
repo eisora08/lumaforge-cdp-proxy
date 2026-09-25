@@ -103,8 +103,13 @@ mod w {
     }
 
     fn installed() -> bool {
+        let dll_name = if cfg!(target_os = "linux") {
+            "cloud_redirect.so"
+        } else {
+            "cloud_redirect.dll"
+        };
         steam_root()
-            .map(|r| r.join("cloud_redirect.dll").exists())
+            .map(|r| r.join(dll_name).exists())
             .unwrap_or(false)
     }
 
@@ -1403,7 +1408,12 @@ mod w {
         let mut cloud_count = 0u64;
         let mut cloud_message: Option<String> = None;
         if !installed() {
-            cloud_message = Some("cloud_redirect.dll is not installed".to_string());
+            let dll_name = if cfg!(target_os = "linux") {
+                "cloud_redirect.so"
+            } else {
+                "cloud_redirect.dll"
+            };
+            cloud_message = Some(format!("{dll_name} is not installed"));
         } else if provider == "gdrive" {
             if let Some(acct) = &account {
                 match gdrive_delete_app(acct, &id) {

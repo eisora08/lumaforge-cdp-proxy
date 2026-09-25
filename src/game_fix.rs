@@ -477,7 +477,9 @@ fn find_goldberg_bak_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
                 find_goldberg_bak_recursive(&path, results);
             } else if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                 let lower = n.to_lowercase();
-                lower == "steam_api64.dll.bak" || lower == "steam_api.dll.bak"
+                lower == "steam_api64.dll.bak"
+                    || lower == "steam_api.dll.bak"
+                    || lower == "libsteam_api.so.bak"
             }) {
                 results.push(path);
             }
@@ -815,15 +817,9 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn apply_smoke_api(game_path: &Path) -> Result<Vec<String>, String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = game_path;
-        return Err("SmokeAPI is only available on Windows".to_string());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let plugins = thirdparty_tool_dir("smokeapi");
+    // Portable: parses the game PE with goblin (host-independent) and copies
+    // DLLs into the game dir — works for native Windows games and Proton.
+    let plugins = thirdparty_tool_dir("smokeapi");
         if !is_dir_populated(&plugins) {
             return Err("SmokeAPI is not installed. Install it from Tools first.".to_string());
         }
@@ -856,10 +852,19 @@ fn apply_smoke_api(game_path: &Path) -> Result<Vec<String>, String> {
                 Ok(vec![proxy_name.to_string()])
             }
             None => {
+                // No proxy candidate in imports: the game either has no
+                // Steamworks DLL (native Linux game) or needs Koaloader.
+                if imported.is_empty() {
+                    return Err(
+                        "No Steamworks DLL found in this game (native Linux game?). \
+                         SmokeAPI applies to Windows/Proton titles with steam_api dlls."
+                            .to_string(),
+                    );
+                }
                 // Koaloader mode: download if missing, then copy d3d11 + smoke dll
                 let koaloader_dir = thirdparty_tool_dir("koaloader");
                 if !is_dir_populated(&koaloader_dir) {
-                    install_tool_from_github("acidicoala", "Koaloader", &koaloader_dir)?;
+                    install_tool_from_github("acidicoala", "Koaloader", &koaloader_dir, None)?;
                 }
                 let subdir = if architecture == "x64" { "d3d11-64" } else { "d3d11-32" };
                 let koaloader_src = find_file_recursive(&koaloader_dir.join(subdir), "d3d11.dll")
@@ -875,7 +880,6 @@ fn apply_smoke_api(game_path: &Path) -> Result<Vec<String>, String> {
                 Ok(vec!["d3d11.dll".to_string(), dll_name.to_string()])
             }
         }
-    }
 }
 
 fn unfix_smoke_api(game_path: &Path, app_id: u64) -> Result<GameFixResult, String> {
@@ -936,96 +940,107 @@ fn strip_extended_prefix(path: &Path) -> PathBuf {
 }
 
 fn run_steamless_on_exe(game_exe: &Path) -> Result<Vec<String>, String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = game_exe;
-        return Err("Steamless is only available on Windows".to_string());
+    let plugins = thirdparty_tool_dir("steamless");
+    if !is_dir_populated(&plugins) {
+        return Err("Steamless is not installed. Install it from Tools first.".to_string());
+    }
+    let steamless_exe = find_file_recursive(&plugins, "Steamless.CLI.exe")
+        .or_else(|| find_file_recursive(&plugins, "Steamless.exe"))
+        .ok_or_else(|| "Could not find Steamless.CLI.exe".to_string())?;
+
+    let exe_name = game_exe
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if exe_name.ends_with(".bak") || exe_name.contains(".unpacked") {
+        return Err("Invalid target exe (already unpacked or backup)".into());
+    }
+    let backup_path = PathBuf::from(format!("{}.bak", game_exe.to_string_lossy()));
+    if backup_path.exists() {
+        return Err(format!(
+            "Steamless already applied (backup exists: {})",
+            backup_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
     }
 
+    // Windows runs the .NET exe directly; Linux runs it through mono (Steamless
+    // is a Windows/.NET tool, but the game exe it unpacks is a PE either way).
     #[cfg(target_os = "windows")]
-    {
-        let plugins = thirdparty_tool_dir("steamless");
-        if !is_dir_populated(&plugins) {
-            return Err("Steamless is not installed. Install it from Tools first.".to_string());
+    let mut cmd = std::process::Command::new(&steamless_exe);
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mono_check = std::process::Command::new("mono")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !matches!(mono_check, Ok(s) if s.success()) {
+            return Err(
+                "Steamless requires 'mono' on Linux (install mono, e.g. `sudo dnf install mono-core`)"
+                    .to_string(),
+            );
         }
-        let steamless_exe = find_file_recursive(&plugins, "Steamless.CLI.exe")
-            .or_else(|| find_file_recursive(&plugins, "Steamless.exe"))
-            .ok_or_else(|| "Could not find Steamless.CLI.exe".to_string())?;
+        let mut c = std::process::Command::new("mono");
+        c.arg(&steamless_exe);
+        c
+    };
+    cmd.current_dir(&plugins)
+        .arg(
+            strip_extended_prefix(game_exe)
+                .to_str()
+                .unwrap_or_default(),
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    hide_window(&mut cmd);
+    let result = cmd
+        .output()
+        .map_err(|e| format!("Failed to run Steamless: {e}"))?;
 
-        let exe_name = game_exe
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+
+    let no_drm = stdout.contains("All unpackers failed to unpack file")
+        || stdout.contains("is not supported")
+        || (!result.status.success()
+            && !stdout.contains("Successfully unpacked file!")
+            && !stdout.contains("Error"));
+
+    if no_drm {
+        return Ok(vec![
+            "__no_drm__".to_string(),
+            "__no_unpack_needed__".to_string(),
+        ]);
+    }
+    if !result.status.success() {
+        return Err(format!(
+            "Steamless failed (exit {}): {stdout} {stderr}",
+            result.status.code().unwrap_or(-1)
+        ));
+    }
+    if !stdout.contains("Successfully unpacked file!") {
+        return Err(format!("Steamless did not unpack: {stdout} {stderr}"));
+    }
+    let unpacked_path = PathBuf::from(format!("{}.unpacked.exe", game_exe.to_string_lossy()));
+    if !unpacked_path.exists() {
+        return Err(format!(
+            "Steamless reported success but unpacked file missing: {}",
+            unpacked_path.display()
+        ));
+    }
+    std::fs::rename(game_exe, &backup_path)
+        .map_err(|e| format!("rename original to .bak: {e}"))?;
+    std::fs::rename(&unpacked_path, game_exe)
+        .map_err(|e| format!("rename unpacked: {e}"))?;
+    Ok(vec![
+        exe_name,
+        backup_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string();
-        if exe_name.ends_with(".bak") || exe_name.contains(".unpacked") {
-            return Err("Invalid target exe (already unpacked or backup)".into());
-        }
-        let backup_path = PathBuf::from(format!("{}.bak", game_exe.to_string_lossy()));
-        if backup_path.exists() {
-            return Err(format!(
-                "Steamless already applied (backup exists: {})",
-                backup_path.file_name().unwrap_or_default().to_string_lossy()
-            ));
-        }
-
-        let mut cmd = std::process::Command::new(&steamless_exe);
-        cmd.current_dir(&plugins)
-            .arg(
-                strip_extended_prefix(game_exe)
-                    .to_str()
-                    .unwrap_or_default(),
-            )
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        hide_window(&mut cmd);
-        let result = cmd
-            .output()
-            .map_err(|e| format!("Failed to run Steamless: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&result.stdout);
-        let stderr = String::from_utf8_lossy(&result.stderr);
-
-        let no_drm = stdout.contains("All unpackers failed to unpack file")
-            || stdout.contains("is not supported")
-            || (!result.status.success()
-                && !stdout.contains("Successfully unpacked file!")
-                && !stdout.contains("Error"));
-
-        if no_drm {
-            return Ok(vec![
-                "__no_drm__".to_string(),
-                "__no_unpack_needed__".to_string(),
-            ]);
-        }
-        if !result.status.success() {
-            return Err(format!(
-                "Steamless failed (exit {}): {stdout} {stderr}",
-                result.status.code().unwrap_or(-1)
-            ));
-        }
-        if !stdout.contains("Successfully unpacked file!") {
-            return Err(format!("Steamless did not unpack: {stdout} {stderr}"));
-        }
-        let unpacked_path = PathBuf::from(format!("{}.unpacked.exe", game_exe.to_string_lossy()));
-        if !unpacked_path.exists() {
-            return Err(format!(
-                "Steamless reported success but unpacked file missing: {}",
-                unpacked_path.display()
-            ));
-        }
-        std::fs::rename(game_exe, &backup_path)
-            .map_err(|e| format!("rename original to .bak: {e}"))?;
-        std::fs::rename(&unpacked_path, game_exe)
-            .map_err(|e| format!("rename unpacked: {e}"))?;
-        Ok(vec![
-            exe_name,
-            backup_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-        ])
-    }
+            .to_string(),
+    ])
 }
 
 fn apply_steamless(game_path: &Path) -> Result<Vec<String>, String> {
@@ -1248,35 +1263,74 @@ fn download_icon_file(
     std::fs::write(dest, &bytes).map_err(|e| e.to_string())
 }
 
-fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (game_path, app_id);
-        return Err("Goldberg is only available on Windows".to_string());
-    }
+/// Finds a bundled tool by base name, trying the extensionless (Linux) build
+/// first and the `.exe` (Windows) build as fallback.
+fn find_tool_bin(dir: &Path, base: &str, depth: u32) -> Option<PathBuf> {
+    find_file_recursive_bounded(dir, base, depth)
+        .or_else(|| find_file_recursive_bounded(dir, &format!("{base}.exe"), depth))
+}
 
-    #[cfg(target_os = "windows")]
-    {
-        let emu_dir = thirdparty_tool_dir("goldberg_fork");
-        if !is_dir_populated(&emu_dir) {
-            return Err(
-                "Goldberg not installed. Install it from Tools first.".to_string(),
-            );
-        }
-        let (_, has_64, has_32) = detect_architecture(game_path);
-        if !has_64 && !has_32 {
-            return Err(
-                "No steam_api dll found. Goldberg needs the real steam_api dll to proxy."
-                    .to_string(),
-            );
-        }
-        let mut present_dlls: Vec<&str> = Vec::new();
+/// True when a `.exe` is being resolved on a non-Windows host: those tools
+/// can't run natively (they're not .NET), so callers should skip them.
+fn is_foreign_windows_exe(path: &Path) -> bool {
+    !cfg!(target_os = "windows")
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_lowercase().ends_with(".exe"))
+}
+
+fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> {
+    let emu_dir = thirdparty_tool_dir("goldberg_fork");
+    if !is_dir_populated(&emu_dir) {
+        return Err(
+            "Goldberg not installed. Install it from Tools first.".to_string(),
+        );
+    }
+    let (_, has_64, has_32) = detect_architecture(game_path);
+
+    // Native Linux games ship their own libsteam_api.so; Windows/Proton games
+    // ship steam_api64.dll / steam_api.dll.
+    let has_native_so =
+        find_file_recursive_bounded(game_path, "libsteam_api.so", FIND_DLL_DEPTH).is_some();
+    let mut present_dlls: Vec<&str> = Vec::new();
+    if has_64 || has_32 {
         if has_64 {
             present_dlls.push("steam_api64.dll");
         }
         if has_32 {
             present_dlls.push("steam_api.dll");
         }
+    } else if has_native_so {
+        present_dlls.push("libsteam_api.so");
+    } else {
+        return Err(
+            "No steam_api library found. Goldberg needs the real steam_api dll/so to proxy."
+                .to_string(),
+        );
+    }
+
+    // On Linux the release tarball ships libsteam_api.so only. Proton games
+    // still need the Windows DLLs — fetch the win release on demand into a
+    // `win/` subdir (same mechanism as Koaloader).
+    let mut source_dir = emu_dir.clone();
+    if cfg!(target_os = "linux") && present_dlls.iter().any(|d| d.ends_with(".dll")) {
+        let have_all = present_dlls
+            .iter()
+            .all(|d| find_file_recursive_bounded(&emu_dir, d, FIND_DLL_DEPTH).is_some());
+        if !have_all {
+            let win_dir = emu_dir.join("win");
+            if !is_dir_populated(&win_dir) {
+                install_tool_from_github(
+                    "Detanup01",
+                    "gbe_fork",
+                    &win_dir,
+                    Some("emu-win-release"),
+                )?;
+            }
+            source_dir = win_dir;
+        }
+    }
 
         let mut installed: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
@@ -1287,36 +1341,39 @@ fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> 
             .join("steam_settings");
 
         // Step 1: generate steam_interfaces.txt from original DLL
-        let generate_interfaces = find_file_recursive_bounded(
-            &emu_dir,
-            "generate_interfaces_x64.exe",
-            8,
-        )
-        .or_else(|| find_file_recursive_bounded(&emu_dir, "generate_interfaces_x86.exe", 8));
+        let generate_interfaces = find_tool_bin(&emu_dir, "generate_interfaces_x64", 8)
+            .or_else(|| find_tool_bin(&emu_dir, "generate_interfaces_x86", 8));
         let original_dll_path = present_dlls
             .iter()
             .filter_map(|dll| find_file_recursive_bounded(game_path, dll, FIND_DLL_DEPTH))
             .next();
         let mut steam_interfaces_content: Option<String> = None;
         if let (Some(tool), Some(dll)) = (&generate_interfaces, &original_dll_path) {
-            let temp = std::env::temp_dir().join(format!("lf_goldberg_{app_id}"));
-            let _ = std::fs::create_dir_all(&temp);
-            let mut cmd = std::process::Command::new(tool);
-            cmd.arg(dll).current_dir(&temp);
-            hide_window(&mut cmd);
-            match cmd.output() {
-                Ok(_) => {
-                    let p = temp.join("steam_interfaces.txt");
-                    steam_interfaces_content = std::fs::read_to_string(&p).ok();
+            if is_foreign_windows_exe(tool) {
+                errors.push(format!(
+                    "{} is a Windows binary; install the Linux gbe_fork_tools build",
+                    tool.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            } else {
+                let temp = std::env::temp_dir().join(format!("lf_goldberg_{app_id}"));
+                let _ = std::fs::create_dir_all(&temp);
+                let mut cmd = std::process::Command::new(tool);
+                cmd.arg(dll).current_dir(&temp);
+                hide_window(&mut cmd);
+                match cmd.output() {
+                    Ok(_) => {
+                        let p = temp.join("steam_interfaces.txt");
+                        steam_interfaces_content = std::fs::read_to_string(&p).ok();
+                    }
+                    Err(e) => errors.push(format!("generate_interfaces failed: {e}")),
                 }
-                Err(e) => errors.push(format!("generate_interfaces failed: {e}")),
+                let _ = std::fs::remove_dir_all(&temp);
             }
-            let _ = std::fs::remove_dir_all(&temp);
         }
 
         // Step 2: backup + copy Goldberg DLLs
         for emu_dll in &present_dlls {
-            let Some(src_dll) = find_file_recursive_bounded(&emu_dir, emu_dll, FIND_DLL_DEPTH)
+            let Some(src_dll) = find_file_recursive_bounded(&source_dir, emu_dll, FIND_DLL_DEPTH)
             else {
                 errors.push(format!("Could not find {emu_dll} in installed Goldberg"));
                 continue;
@@ -1346,17 +1403,23 @@ fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> 
                 .map(|mut e| e.next().is_some())
                 .unwrap_or(false);
         if !output_has_content {
-            if let Some(tool) = find_file_recursive_bounded(&emu_dir, "generate_emu_config.exe", 8)
-            {
-                let mut cmd = std::process::Command::new(&tool);
-                cmd.args(["-anon", "-skip_ach", &app_id_str])
-                    .current_dir(&emu_dir);
-                hide_window(&mut cmd);
-                if cmd.output().is_err() {
-                    errors.push("generate_emu_config failed to run".into());
+            if let Some(tool) = find_tool_bin(&emu_dir, "generate_emu_config", 8) {
+                if is_foreign_windows_exe(&tool) {
+                    errors.push(
+                        "generate_emu_config.exe is a Windows binary; install the Linux gbe_fork_tools build"
+                            .into(),
+                    );
+                } else {
+                    let mut cmd = std::process::Command::new(&tool);
+                    cmd.args(["-anon", "-skip_ach", &app_id_str])
+                        .current_dir(&emu_dir);
+                    hide_window(&mut cmd);
+                    if cmd.output().is_err() {
+                        errors.push("generate_emu_config failed to run".into());
+                    }
                 }
             } else {
-                errors.push("generate_emu_config.exe not found".into());
+                errors.push("generate_emu_config not found".into());
             }
         }
 
@@ -1430,7 +1493,6 @@ fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> 
         }
 
         Ok(installed)
-    }
 }
 
 fn unfix_goldberg(game_path: &Path, app_id: u64) -> Result<GameFixResult, String> {
@@ -1472,7 +1534,11 @@ fn unfix_goldberg(game_path: &Path, app_id: u64) -> Result<GameFixResult, String
     for file_name in &files {
         let lower = file_name.to_lowercase();
         let mut file_path = game_exe_dir.join(file_name);
-        if !file_path.exists() && (lower == "steam_api64.dll" || lower == "steam_api.dll") {
+        if !file_path.exists()
+            && (lower == "steam_api64.dll"
+                || lower == "steam_api.dll"
+                || lower == "libsteam_api.so")
+        {
             if let Some(found) = find_file_recursive_bounded(game_path, &lower, FIND_DLL_DEPTH) {
                 file_path = found;
             }
@@ -2000,18 +2066,16 @@ fn catalog_key() -> String {
             return k;
         }
     }
-    // config.json: fixes.catalogKey (outside the repo)
-    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
-        let path = PathBuf::from(lad).join("LumaForge").join("config.json");
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(k) = val
-                    .get("fixes")
-                    .and_then(|f| f.get("catalogKey"))
-                    .and_then(|v| v.as_str())
-                {
-                    return k.to_string();
-                }
+    // config.json: fixes.catalogKey (outside the repo, per-OS config dir)
+    let path = crate::platform::config_dir().join("config.json");
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(k) = val
+                .get("fixes")
+                .and_then(|f| f.get("catalogKey"))
+                .and_then(|v| v.as_str())
+            {
+                return k.to_string();
             }
         }
     }
@@ -2257,6 +2321,7 @@ fn install_tool_from_github(
     owner: &str,
     repo: &str,
     target_dir: &Path,
+    preferred_asset_contains: Option<&str>,
 ) -> Result<Vec<String>, String> {
     let client = http_client(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))?;
     let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
@@ -2276,9 +2341,20 @@ fn install_tool_from_github(
     let asset = assets
         .iter()
         .find(|a| {
-            a["name"]
-                .as_str()
-                .is_some_and(|n| n.ends_with(".zip") || n.ends_with(".7z"))
+            preferred_asset_contains.is_some_and(|needle| {
+                a["name"]
+                    .as_str()
+                    .is_some_and(|n| n.to_lowercase().contains(&needle.to_lowercase()))
+            })
+        })
+        .or_else(|| {
+            assets
+                .iter()
+                .find(|a| {
+                    a["name"]
+                        .as_str()
+                        .is_some_and(|n| n.ends_with(".zip") || n.ends_with(".7z"))
+                })
         })
         .or_else(|| assets.first())
         .ok_or_else(|| "No downloadable asset".to_string())?;
@@ -2300,10 +2376,15 @@ fn install_tool_from_github(
 
     let extract_dir = temp.join("extracted");
     let _ = std::fs::create_dir_all(&extract_dir);
-    let ext = Path::new(zip_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("zip");
+    let lower_name = zip_name.to_lowercase();
+    let ext = if lower_name.ends_with(".tar.bz2") || lower_name.ends_with(".tbz2") {
+        "tar.bz2"
+    } else {
+        Path::new(zip_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("zip")
+    };
     crate::thirdparty::extract_archive(&archive_path, ext, &extract_dir)?;
 
     std::fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;

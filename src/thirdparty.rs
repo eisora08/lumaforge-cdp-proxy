@@ -98,7 +98,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         id: "smokeapi",
         name: "SmokeAPI",
-        description: "Legit DLC Unlocker for Steamworks — emulates DLC ownership for games you own on Steam",
+        description: "SmokeAPI is a tool for Steamworks DLC ownership emulation in games that are legitimately owned in Steam",
         github_owner: "acidicoala",
         github_repo: "SmokeAPI",
         preferred_asset: None,
@@ -133,11 +133,11 @@ const TOOL_DEFS: &[ToolDef] = &[
         description: "Goldberg Steam Emu fork by Detanup01 + config tools",
         github_owner: "Detanup01",
         github_repo: "gbe_fork",
-        preferred_asset: Some("emu-win-release.7z"),
-        preferred_asset_contains: None,
-        linux_github_owner: None,
-        linux_github_repo: None,
-        linux_preferred_asset: None,
+        preferred_asset: None,
+        preferred_asset_contains: Some("emu-win-release"),
+        linux_github_owner: Some("Detanup01"),
+        linux_github_repo: Some("gbe_fork"),
+        linux_preferred_asset: Some("emu-linux-release.tar.bz2"),
         extra_repos: Some(&[ExtraRepo {
             owner: "Detanup01",
             repo: "gbe_fork_tools",
@@ -185,15 +185,23 @@ const TOOL_DEFS: &[ToolDef] = &[
         description: "Redirect Steam Cloud saves to Google Drive, OneDrive, S3, R2, or local folder",
         github_owner: "Selectively11",
         github_repo: "CloudRedirect",
-        preferred_asset: Some("cloud_redirect.dll"),
+        preferred_asset: if cfg!(target_os = "linux") {
+            Some("cloud_redirect.so")
+        } else {
+            Some("cloud_redirect.dll")
+        },
         preferred_asset_contains: None,
         linux_github_owner: None,
         linux_github_repo: None,
         linux_preferred_asset: None,
         extra_repos: None,
         install_to_steam_root: true,
-        steam_dll_names: &["cloud_redirect.dll"],
-        platform: ToolPlatform::WindowsOnly,
+        steam_dll_names: if cfg!(target_os = "linux") {
+            &["cloud_redirect.so"]
+        } else {
+            &["cloud_redirect.dll"]
+        },
+        platform: ToolPlatform::Any,
     },
     ToolDef {
         id: "slssteam",
@@ -433,6 +441,29 @@ fn select_asset(
     preferred_asset_contains: Option<&str>,
 ) -> Option<(String, String, String)> {
     let contains_lower = preferred_asset_contains.map(|s| s.to_lowercase());
+    let os_is_linux = cfg!(target_os = "linux");
+    let lower_name = |a: &serde_json::Value| a["name"].as_str().map(|n| n.to_lowercase());
+
+    // Prefer a ZIP built for this OS (Linux releases ship `-linux` archives,
+    // Windows releases ship plain/-windows ones) before falling back to any ZIP.
+    let os_zip = |n: &str| -> bool {
+        if !n.ends_with(".zip") {
+            return false;
+        }
+        if os_is_linux {
+            n.contains("linux")
+        } else {
+            !n.contains("linux")
+        }
+    };
+    let native_lib = |n: &str| -> bool {
+        if os_is_linux {
+            n.ends_with(".so")
+        } else {
+            n.ends_with(".dll")
+        }
+    };
+
     let asset = assets
         .iter()
         .find(|a| {
@@ -448,34 +479,43 @@ fn select_asset(
                 })
             })
         })
+        .or_else(|| assets.iter().find(|a| lower_name(a).is_some_and(|n| os_zip(&n))))
+        .or_else(|| {
+            assets
+                .iter()
+                .find(|a| lower_name(a).is_some_and(|n| n.ends_with(".zip")))
+        })
+        .or_else(|| {
+            assets
+                .iter()
+                .find(|a| lower_name(a).is_some_and(|n| n.ends_with(".7z")))
+        })
         .or_else(|| {
             assets.iter().find(|a| {
-                a["name"].as_str().is_some_and(|n| {
-                    n.ends_with(".zip") && !n.to_lowercase().contains("linux")
-                })
+                lower_name(a)
+                    .is_some_and(|n| n.ends_with(".tar.bz2") || n.ends_with(".tbz2"))
             })
         })
+        .or_else(|| assets.iter().find(|a| lower_name(a).is_some_and(|n| native_lib(&n))))
         .or_else(|| {
             assets
                 .iter()
-                .find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(".zip")))
+                .find(|a| lower_name(a).is_some_and(|n| n.ends_with(".dll")))
         })
         .or_else(|| {
             assets
                 .iter()
-                .find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(".7z")))
-        })
-        .or_else(|| {
-            assets
-                .iter()
-                .find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(".dll")))
+                .find(|a| lower_name(a).is_some_and(|n| n.ends_with(".so")))
         })?;
 
     let name = asset["name"].as_str().unwrap_or("release.zip").to_string();
     let url = asset["browser_download_url"].as_str()?.to_string();
-    let archive_ext = if name.ends_with(".7z") {
+    let lower = name.to_lowercase();
+    let archive_ext = if lower.ends_with(".7z") {
         "7z"
-    } else if name.ends_with(".dll") || name.ends_with(".so") {
+    } else if lower.ends_with(".tar.bz2") || lower.ends_with(".tbz2") {
+        "tar.bz2"
+    } else if lower.ends_with(".dll") || lower.ends_with(".so") {
         "dll"
     } else {
         "zip"
@@ -680,6 +720,23 @@ pub(crate) fn extract_archive(
     if archive_ext == "7z" {
         sevenz_rust::decompress_file(zip_path, extract_dir)
             .map_err(|e| format!("Failed to extract 7z: {e}"))
+    } else if archive_ext == "tar.bz2" {
+        // `.tar.bz2` assets (e.g. Goldberg's linux release) — system tar ships
+        // with every Linux distro, so no extra crate is needed.
+        let output = std::process::Command::new("tar")
+            .arg("-xjf")
+            .arg(zip_path)
+            .arg("-C")
+            .arg(extract_dir)
+            .output()
+            .map_err(|e| format!("Failed to run tar: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "tar extraction failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
     } else {
         let zip_file = std::fs::File::open(zip_path).map_err(|e| format!("Failed to open ZIP: {e}"))?;
         let mut archive =
