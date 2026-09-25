@@ -98,7 +98,7 @@ const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         id: "smokeapi",
         name: "SmokeAPI",
-        description: "Steam API proxy for offline Steam games",
+        description: "Legit DLC Unlocker for Steamworks — emulates DLC ownership for games you own on Steam",
         github_owner: "acidicoala",
         github_repo: "SmokeAPI",
         preferred_asset: None,
