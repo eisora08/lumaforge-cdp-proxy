@@ -1,5 +1,6 @@
 mod bridge;
 mod cdp;
+mod cloudsave;
 mod depot_downloader;
 mod discovery;
 mod game_fix;
