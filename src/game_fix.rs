@@ -159,7 +159,7 @@ fn temp_fix_dir() -> PathBuf {
 }
 
 /// Enumerate all Steam library roots (steam_root + paths from libraryfolders.vdf).
-fn library_roots() -> Vec<PathBuf> {
+pub(crate) fn library_roots() -> Vec<PathBuf> {
     let mut libs = Vec::new();
     let Some(steam_root) = crate::depot_downloader::steam_root() else {
         return libs;
@@ -214,7 +214,7 @@ fn library_roots() -> Vec<PathBuf> {
     libs
 }
 
-fn parse_acf_field(content: &str, key: &str) -> Option<String> {
+pub(crate) fn parse_acf_field(content: &str, key: &str) -> Option<String> {
     // Matches: "key"   "value"  (tabs/spaces flexible)
     let pattern = format!("\"{}\"", key);
     let idx = content.find(&pattern)?;

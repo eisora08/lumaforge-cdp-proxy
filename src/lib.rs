@@ -1,5 +1,6 @@
 mod bridge;
 mod cdp;
+mod catalog;
 mod cloudsave;
 mod depot_downloader;
 mod discovery;

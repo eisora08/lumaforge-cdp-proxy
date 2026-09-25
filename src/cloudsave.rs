@@ -5,6 +5,12 @@ pub fn try_handle_route(method: &str, path: &str, body: &str) -> Option<(u16, St
     w::handle(method, path, body)
 }
 
+/// Lightweight cloudsave rows for the unified catalog (no network, no names —
+/// the catalog resolves names from its local appnames cache).
+pub fn catalog_rows() -> Vec<serde_json::Value> {
+    w::catalog_rows()
+}
+
 #[cfg(windows)]
 mod w {
     use serde_json::{json, Value};
@@ -631,6 +637,43 @@ mod w {
             })
             .collect();
         (200, json!({"ok": true, "files": files}).to_string())
+    }
+
+    /// Catalog rows: appId + fileCount/sizeBytes/modified per app dir.
+    pub(super) fn catalog_rows() -> Vec<Value> {
+        let mut rows: Vec<Value> = Vec::new();
+        let Some(root) = storage_root() else {
+            return rows;
+        };
+        for acct in account_ids() {
+            let Ok(rd) = std::fs::read_dir(root.join(&acct)) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let app_id = e.file_name().to_string_lossy().into_owned();
+                if app_id == "0" || app_id.is_empty() || app_id.parse::<u64>().is_err() {
+                    continue;
+                }
+                let (files, size) = scan_app_dir(&e.path());
+                let modified = e
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                rows.push(json!({
+                    "appId": app_id,
+                    "fileCount": files,
+                    "sizeBytes": size,
+                    "modified": modified,
+                }));
+            }
+        }
+        rows
     }
 
     // -------------------------------------------------------------------------
@@ -1446,5 +1489,9 @@ mod w {
             ));
         }
         None
+    }
+
+    pub(crate) fn catalog_rows() -> Vec<serde_json::Value> {
+        Vec::new()
     }
 }

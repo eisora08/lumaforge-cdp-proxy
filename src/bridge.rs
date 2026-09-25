@@ -233,6 +233,11 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return rust_resp;
     }
 
+    // Unified catalog + artwork (librarycache, installed, cloudsave, lua)
+    if let Some(rust_resp) = crate::catalog::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
     // Open external URL (https only) — e.g. "Get API key" button
     if clean_path == "/api/open-url" && method == "POST" {
         return handle_open_url(body);
