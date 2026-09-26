@@ -22,10 +22,13 @@ const APP_USER_AGENT: &str = concat!(
     " (+https://github.com/eisora08/lumaforge-cdp-proxy)"
 );
 
-// Catalog (Cloudflare Pages) — key lives in config.json (fixes.catalogKey),
-// never in the frontend bundle. Env override: LUMAFORGE_FIXES_KEY.
+// Catalog (Cloudflare Pages) — key precedence: env LUMAFORGE_FIXES_KEY,
+// then config.json (fixes.catalogKey), then the bundled default so the
+// catalog works out of the box. The key never ships in the frontend bundle.
 const CATALOG_URL: &str = "https://lumaforge-fixes.pages.dev/catalog.json";
 const CATALOG_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_CATALOG_KEY: &str =
+    "lf_e2ecff2175c36048d05a950d8c1d21bbf6a9dea8608ac47f";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -2075,11 +2078,13 @@ fn catalog_key() -> String {
                 .and_then(|f| f.get("catalogKey"))
                 .and_then(|v| v.as_str())
             {
-                return k.to_string();
+                if !k.is_empty() {
+                    return k.to_string();
+                }
             }
         }
     }
-    String::new()
+    DEFAULT_CATALOG_KEY.to_string()
 }
 
 struct CatalogCache {
