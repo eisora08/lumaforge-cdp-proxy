@@ -26,6 +26,9 @@ jobs:
       - name: Build proxy
         run: cargo build --release
 
+      - name: Build CEF hook
+        run: cargo build --release --manifest-path cef_hook/Cargo.toml
+
       - name: Package zip
         shell: pwsh
         run: |
@@ -33,9 +36,7 @@ jobs:
           New-Item -ItemType Directory -Path "$stage\lumaforge" -Force | Out-Null
           Copy-Item bootstrap\wsock32.dll "$stage\"
           Copy-Item target\release\lumaforge.dll "$stage\lumaforge\"
-          if (Test-Path target\release\lumaforge_cef_hook.dll) {
-            Copy-Item target\release\lumaforge_cef_hook.dll "$stage\lumaforge\"
-          }
+          Copy-Item cef_hook\target\release\lumaforge_cef_hook.dll "$stage\lumaforge\"
           foreach ($f in @('README.md', 'LICENSE', 'LICENSE.md')) {
             if (Test-Path $f) { Copy-Item $f "$stage\" }
           }
