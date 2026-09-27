@@ -91,15 +91,36 @@ jobs:
     needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      # Auto-generated notes only list commits when PRs exist, so build the
+      # "What's Changed" list straight from git log.
+      - name: Build release notes
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          prev="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+          {
+            echo 'See the assets for download links.'
+            echo
+            if [ -n "$prev" ]; then
+              echo "## What's Changed"
+              git log --no-merges --pretty='- `%h` %s' "${prev}..${tag}"
+              echo
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+            fi
+          } > release-notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*.zip
           name: LumaForge CDP Proxy ${{ github.ref_name }}
-          body: 'See the assets for download links.'
-          generate_release_notes: true
+          body_path: release-notes.md
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
