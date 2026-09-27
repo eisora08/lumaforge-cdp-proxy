@@ -208,7 +208,6 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
     }
 
     // Rust-native routes: intercept binary-heavy operations before Lua
-    #[cfg(target_os = "windows")]
     if let Some(rust_resp) = crate::package_installer::try_handle_route(method, &clean_path, body) {
         return rust_resp;
     }

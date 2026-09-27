@@ -20,7 +20,6 @@ mod thirdparty;
 
 #[cfg(target_os = "windows")]
 mod hook;
-#[cfg(target_os = "windows")]
 mod package_installer;
 #[cfg(target_os = "windows")]
 mod plugin_loader;

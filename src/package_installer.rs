@@ -63,14 +63,17 @@ struct ProviderStatus {
 // Section 2: Metadata Path, Cache, Load and Atomic Save
 // =========================================================================
 
-fn metadata_path() -> PathBuf {
-    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(lad)
-            .join("LumaForge")
-            .join("installed_packages.json")
-    } else {
-        PathBuf::from("C:\\Windows\\Temp\\lumaforge_installed_packages.json")
+/// Join path segments under `base` with the platform separator.
+fn jpath<S: AsRef<Path>>(base: impl AsRef<Path>, segments: &[S]) -> String {
+    let mut path = base.as_ref().to_path_buf();
+    for segment in segments {
+        path.push(segment);
     }
+    path.to_string_lossy().to_string()
+}
+
+fn metadata_path() -> PathBuf {
+    crate::platform::local_data_dir().join("installed_packages.json")
 }
 
 static METADATA_CACHE: OnceLock<RwLock<InstalledPackagesDB>> = OnceLock::new();
@@ -140,9 +143,7 @@ fn save_metadata_to_disk(db: &InstalledPackagesDB) -> Result<(), String> {
 fn save_metadata_to_path(db: &InstalledPackagesDB, path: &Path) -> Result<(), String> {
     let json = serde_json::to_string_pretty(db).map_err(|e| format!("Serialize error: {}", e))?;
 
-    let dir = path
-        .parent()
-        .unwrap_or_else(|| Path::new("C:\\Windows\\Temp"));
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let temp_name = format!(
         ".installed_packages.{}.tmp",
         std::time::SystemTime::now()
@@ -225,7 +226,7 @@ fn write_metadata_migration(record: ProviderInstallRecord) -> Result<bool, Strin
 
 fn get_lua_path_for_package(app_id: &str) -> String {
     let steam = detect_steam_root();
-    format!("{}\\config\\lua\\{}.lua", steam, app_id)
+    jpath(&steam, &["config", "lua", &format!("{}.lua", app_id)])
 }
 
 // =========================================================================
@@ -539,30 +540,43 @@ struct Provider {
 }
 
 fn detect_steam_root() -> String {
-    let candidates = [
-        "C:\\Program Files (x86)\\Steam",
-        "C:\\Program Files (x86)\\Steam Luma",
-    ];
-    for c in &candidates {
-        if Path::new(c).join("steam.exe").exists() {
-            return c.to_string();
-        }
+    // Same discovery as the rest of the proxy (registry on Windows,
+    // ~/.steam/steam and friends on Linux).
+    if let Some(root) = crate::depot_downloader::steam_root() {
+        return root.to_string_lossy().to_string();
     }
-    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-        let p = PathBuf::from(&local_appdata).join("Steam");
-        if p.join("steam.exe").exists() {
-            return p.to_string_lossy().to_string();
+
+    #[cfg(target_os = "windows")]
+    {
+        let candidates = [
+            "C:\\Program Files (x86)\\Steam",
+            "C:\\Program Files (x86)\\Steam Luma",
+        ];
+        for c in &candidates {
+            if Path::new(c).join("steam.exe").exists() {
+                return c.to_string();
+            }
         }
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            let p = PathBuf::from(&local_appdata).join("Steam");
+            if p.join("steam.exe").exists() {
+                return p.to_string_lossy().to_string();
+            }
+        }
+        "C:\\Program Files (x86)\\Steam".to_string()
     }
-    "C:\\Program Files (x86)\\Steam".to_string()
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.steam/steam", home)
+    }
 }
 
 fn config_path() -> PathBuf {
-    if let Ok(lad) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(lad).join("LumaForge").join("config.json")
-    } else {
-        PathBuf::from("C:\\Windows\\Temp\\lumaforge_config.json")
-    }
+    // Matches what backend.lua sees via local_appdata(): `%LOCALAPPDATA%\LumaForge`
+    // on Windows, `~/.local/share/LumaForge` on Linux.
+    crate::platform::local_data_dir().join("config.json")
 }
 
 fn load_providers_from_config() -> Vec<Provider> {
@@ -702,7 +716,7 @@ struct FileVerification {
 }
 
 fn verify_lua_file(record: &ProviderInstallRecord, steam: &str) -> FileVerification {
-    let lua_path = format!("{}\\config\\lua\\{}", steam, record.lua_filename);
+    let lua_path = jpath(steam, &["config", "lua", record.lua_filename.as_str()]);
     let file_exists = Path::new(&lua_path).exists();
     if !file_exists {
         return FileVerification {
@@ -744,16 +758,16 @@ fn verify_lua_file(record: &ProviderInstallRecord, steam: &str) -> FileVerificat
 }
 
 fn verify_all_files(record: &ProviderInstallRecord, steam: &str) -> Vec<serde_json::Value> {
-    let manifest_dir = format!("{}\\depotcache", steam);
-    let lua_dir = format!("{}\\config\\lua", steam);
+    let manifest_dir = jpath(steam, &["depotcache"]);
+    let lua_dir = jpath(steam, &["config", "lua"]);
     record
         .files
         .iter()
         .map(|fi| {
             let full_path = if fi.kind == "lua" {
-                format!("{}\\{}", lua_dir, fi.filename)
+                jpath(&lua_dir, &[fi.filename.as_str()])
             } else {
-                format!("{}\\{}", manifest_dir, fi.filename)
+                jpath(&manifest_dir, &[fi.filename.as_str()])
             };
             let exists = Path::new(&full_path).exists();
             let ok = if exists {
@@ -1306,8 +1320,8 @@ fn download_and_install(request_id: String, provider: Provider, hint: Option<Rem
     };
 
     let steam = detect_steam_root();
-    let lua_dir = format!("{}\\config\\lua", steam);
-    let manifest_dir = format!("{}\\depotcache", steam);
+    let lua_dir = jpath(&steam, &["config", "lua"]);
+    let manifest_dir = jpath(&steam, &["depotcache"]);
 
     let _ = std::fs::create_dir_all(&lua_dir);
     let _ = std::fs::create_dir_all(&manifest_dir);
@@ -1356,9 +1370,9 @@ fn download_and_install(request_id: String, provider: Provider, hint: Option<Rem
         }
 
         let dest = if ext == "lua" {
-            format!("{}\\{}", lua_dir, basename)
+            jpath(&lua_dir, &[basename.as_str()])
         } else {
-            format!("{}\\{}", manifest_dir, basename)
+            jpath(&manifest_dir, &[basename.as_str()])
         };
 
         match std::fs::write(&dest, &file_bytes) {
@@ -1424,9 +1438,9 @@ fn download_and_install(request_id: String, provider: Provider, hint: Option<Rem
 
     for fi in &installed_meta_files {
         let full_path = if fi.kind == "lua" {
-            format!("{}\\{}", lua_dir, fi.filename)
+            jpath(&lua_dir, &[fi.filename.as_str()])
         } else {
-            format!("{}\\{}", manifest_dir, fi.filename)
+            jpath(&manifest_dir, &[fi.filename.as_str()])
         };
         if !Path::new(&full_path).exists() {
             update_job(&request_id, |j| {
@@ -1446,9 +1460,9 @@ fn download_and_install(request_id: String, provider: Provider, hint: Option<Rem
 
     for fi in &mut installed_meta_files {
         let full_path = if fi.kind == "lua" {
-            format!("{}\\{}", lua_dir, fi.filename)
+            jpath(&lua_dir, &[fi.filename.as_str()])
         } else {
-            format!("{}\\{}", manifest_dir, fi.filename)
+            jpath(&manifest_dir, &[fi.filename.as_str()])
         };
         if let Some(hash) = compute_file_sha256(&full_path) {
             fi.sha256 = hash;
@@ -1655,8 +1669,10 @@ mod tests {
 
     #[test]
     fn test_compute_file_sha256_missing() {
-        let hash = compute_file_sha256("C:\\nonexistent_path_for_test_12345.lua");
+        let d = test_dir("sha256_missing");
+        let hash = compute_file_sha256(&d.join("nope.lua").to_string_lossy());
         assert!(hash.is_none());
+        cleanup(&d);
     }
 
     #[test]
@@ -1902,9 +1918,9 @@ mod tests {
     #[test]
     fn test_verify_lua_file_matches() {
         let d = test_dir("verify_match");
-        fs::create_dir_all(d.join("config\\lua")).unwrap();
+        fs::create_dir_all(d.join("config").join("lua")).unwrap();
         let content = b"return {version='1.0'}\n";
-        let lua_path = d.join("config\\lua\\12345.lua");
+        let lua_path = d.join("config").join("lua").join("12345.lua");
         fs::write(&lua_path, content).unwrap();
         let sha = compute_sha256(content);
         let record = make_record("12345", "hubcapdb", "12345.lua", &sha, content.len());
@@ -1918,9 +1934,9 @@ mod tests {
     #[test]
     fn test_verify_lua_file_size_mismatch() {
         let d = test_dir("verify_size");
-        fs::create_dir_all(d.join("config\\lua")).unwrap();
+        fs::create_dir_all(d.join("config").join("lua")).unwrap();
         let content = b"return {version='1.0'}\n";
-        let lua_path = d.join("config\\lua\\12345.lua");
+        let lua_path = d.join("config").join("lua").join("12345.lua");
         fs::write(&lua_path, content).unwrap();
         let sha = compute_sha256(content);
         let record = make_record("12345", "hubcapdb", "12345.lua", &sha, 9999);
@@ -1933,9 +1949,9 @@ mod tests {
     #[test]
     fn test_verify_lua_file_hash_mismatch_same_size() {
         let d = test_dir("verify_hash");
-        fs::create_dir_all(d.join("config\\lua")).unwrap();
+        fs::create_dir_all(d.join("config").join("lua")).unwrap();
         let content = b"return {version='1.0'}\n";
-        let lua_path = d.join("config\\lua\\12345.lua");
+        let lua_path = d.join("config").join("lua").join("12345.lua");
         fs::write(&lua_path, content).unwrap();
         let wrong_sha = compute_sha256(b"different content here!!\n");
         let record = make_record("12345", "hubcapdb", "12345.lua", &wrong_sha, content.len());
@@ -1949,7 +1965,7 @@ mod tests {
     #[test]
     fn test_verify_lua_file_missing() {
         let d = test_dir("verify_miss");
-        fs::create_dir_all(d.join("config\\lua")).unwrap();
+        fs::create_dir_all(d.join("config").join("lua")).unwrap();
         let sha = compute_sha256(b"content");
         let record = make_record("12345", "hubcapdb", "12345.lua", &sha, 7);
         let fv = verify_lua_file(&record, &d.to_string_lossy().as_ref());
@@ -1961,7 +1977,7 @@ mod tests {
     #[test]
     fn test_verify_all_files_full() {
         let d = test_dir("verify_all");
-        let lua_dir = d.join("config\\lua");
+        let lua_dir = d.join("config").join("lua");
         let manif_dir = d.join("depotcache");
         fs::create_dir_all(&lua_dir).unwrap();
         fs::create_dir_all(&manif_dir).unwrap();
@@ -2011,7 +2027,7 @@ mod tests {
     #[test]
     fn test_verify_all_files_manifest_corrupted() {
         let d = test_dir("verify_corrupt");
-        let lua_dir = d.join("config\\lua");
+        let lua_dir = d.join("config").join("lua");
         let manif_dir = d.join("depotcache");
         fs::create_dir_all(&lua_dir).unwrap();
         fs::create_dir_all(&manif_dir).unwrap();
@@ -2419,7 +2435,7 @@ mod tests {
     #[test]
     fn test_copied_file_sha256_wins_over_size() {
         let d = test_dir("copied_file");
-        let lua_dir = d.join("config\\lua");
+        let lua_dir = d.join("config").join("lua");
         fs::create_dir_all(&lua_dir).unwrap();
 
         let original = b"-- Created: May 20, 2026 at 12:00:00 EDT\nreturn {version='old'}\n";
@@ -2455,7 +2471,7 @@ mod tests {
     #[test]
     fn test_copied_file_newer_mtime_different_content() {
         let d = test_dir("mtime_spoof");
-        let lua_dir = d.join("config\\lua");
+        let lua_dir = d.join("config").join("lua");
         fs::create_dir_all(&lua_dir).unwrap();
 
         let original = b"-- Created: May 20, 2026 at 12:00:00 EDT\nreturn {}\n";
