@@ -101,4 +101,5 @@ jobs:
           files: dist/*.zip
           name: LumaForge CDP Proxy ${{ github.ref_name }}
           body: 'See the assets for download links.'
+          generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
