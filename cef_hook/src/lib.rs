@@ -3,13 +3,35 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{connect, Message};
 use serde_json::{json, Value};
 use serde::Deserialize;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+// Flattened CDP sessions for targets we auto-attached to (targetId → sessionId),
+// plus targets that already got the theme script registered/evaluated.
+static SESSIONS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+static REGISTERED_TARGETS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+// (sessionId, target url) — used to re-push the CSS payload to steamloopback
+// sessions after a theme reload.
+static SESSION_URLS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+mod accent;
+
 fn log_to_temp(msg: &str) {
+    // Relative timestamp (+ss.mmm since this process loaded the DLL) so that
+    // interleaved lines from multiple webhelper processes can be ordered and
+    // crash timing can be measured.
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed();
+    let stamped = format!(
+        "[+{}.{:03}] {}",
+        elapsed.as_secs(),
+        elapsed.subsec_millis(),
+        msg
+    );
+
     let Ok(local_appdata) = std::env::var("LOCALAPPDATA") else {
         return;
     };
@@ -23,8 +45,57 @@ fn log_to_temp(msg: &str) {
         .append(true)
         .open(&log_path)
     {
-        let _ = writeln!(f, "{}", msg);
+        let _ = writeln!(f, "{}", stamped);
     }
+}
+
+// ─── CDP tracing (STEAMCDP_TRACE=1) ─────────────────────────────────────────
+
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("STEAMCDP_TRACE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+thread_local! {
+    // (sent count, last sent "method id", received count, last received summary)
+    static CONN_STATS: std::cell::RefCell<(u64, String, u64, String)> =
+        std::cell::RefCell::new((0, String::new(), 0, String::new()));
+}
+
+/// Record every received CDP message so the log of a dead connection shows
+/// exactly what arrived last before the reset.
+fn note_rx(msg: &Value) {
+    let method = msg.get("method").and_then(|m| m.as_str()).map(|s| s.to_string());
+    let summary = match &method {
+        Some(m) => m.clone(),
+        None => format!(
+            "response id={}",
+            msg.get("id").and_then(|i| i.as_u64()).unwrap_or(0)
+        ),
+    };
+    CONN_STATS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.2 += 1;
+        s.3 = summary.clone();
+    });
+    if trace_enabled() {
+        log_to_temp(&format!("[cef_hook] ← {}", summary));
+    }
+}
+
+fn conn_stats_snapshot() -> String {
+    CONN_STATS.with(|s| {
+        let s = s.borrow();
+        format!("tx={} last_tx='{}' rx={} last_rx='{}'", s.0, s.1, s.2, s.3)
+    })
+}
+
+fn reset_conn_stats() {
+    CONN_STATS.with(|s| *s.borrow_mut() = (0, String::new(), 0, String::new()));
 }
 
 fn resolve_debug_port() -> Option<u16> {
@@ -104,13 +175,17 @@ struct ThemeState {
     webkit_js_path: Option<String>,
     root_colors_content: Option<String>,
     condition_css: Vec<ConditionEntry>,
-    condition_js: Vec<String>,
+    condition_js: Vec<ConditionEntry>,
     slider_css: String,
     last_signal_mtime: Option<u64>,
     active_json_mtime: Option<u64>,
     skin_json_mtime: Option<u64>,
     plugins: Vec<LoadedPlugin>,
     plugins_mtime: Option<u64>,
+    // Serialized CSS payload ({webkit, conds, cjs, patches}) pushed into
+    // steamloopback sessions as window.__lumaCSS. Built lazily, invalidated
+    // whenever the manifest reloads.
+    css_payload: Option<String>,
 }
 
 impl ThemeState {
@@ -130,6 +205,7 @@ impl ThemeState {
             skin_json_mtime: None,
             plugins: Vec::new(),
             plugins_mtime: None,
+            css_payload: None,
         }
     }
 
@@ -182,6 +258,8 @@ struct ConditionTargetCss {
 struct ConditionValue {
     #[serde(alias = "TargetCss")]
     target_css: Option<ConditionTargetCss>,
+    #[serde(alias = "TargetJs")]
+    target_js: Option<ConditionTargetCss>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -257,6 +335,26 @@ fn themes_base_dir() -> Option<PathBuf> {
     Some(PathBuf::from(local_appdata).join("LumaForge").join("themes"))
 }
 
+/// No active.json (or no activeTheme in it): pick the first theme dir that has
+/// a skin.json, mirroring Millennium's behavior of activating themes on import.
+fn auto_select_theme(themes_dir: &PathBuf) -> Option<String> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(themes_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort();
+    for p in entries {
+        if p.join("skin.json").exists() {
+            if let Some(name) = p.file_name() {
+                return Some(name.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 fn load_theme_manifest(state: &mut ThemeState) {
     let themes_dir = match themes_base_dir() {
         Some(d) => d,
@@ -271,13 +369,30 @@ fn load_theme_manifest(state: &mut ThemeState) {
         return;
     }
     state.active_json_mtime = active_json_mtime;
+    state.css_payload = None;
 
     let active_json_content = match fs::read_to_string(&active_json_path) {
         Ok(c) => c,
         Err(_) => {
-            log_to_temp("[cef_hook] No active.json found, loading legacy theme");
-            load_legacy_theme(state);
-            return;
+            // No active.json → auto-select the first installed theme so a bare
+            // themes/ dir (theme copied in, nothing configured) still applies.
+            match auto_select_theme(&themes_dir) {
+                Some(name) => {
+                    log_to_temp(&format!(
+                        "[cef_hook] No active.json found — auto-selected theme '{}'",
+                        name
+                    ));
+                    format!(
+                        r#"{{"themes":{{"activeTheme":{}}}}}"#,
+                        serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".into())
+                    )
+                }
+                None => {
+                    log_to_temp("[cef_hook] No active.json found and no themes installed, loading legacy theme");
+                    load_legacy_theme(state);
+                    return;
+                }
+            }
         }
     };
 
@@ -320,15 +435,25 @@ fn load_theme_manifest(state: &mut ThemeState) {
     let theme_name = active_json
         .get("themes").and_then(|t| t.get("activeTheme"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
 
     let theme_name = match theme_name {
         Some(n) => n,
-        None => {
-            log_to_temp("[cef_hook] No activeTheme in active.json");
-            load_legacy_theme(state);
-            return;
-        }
+        None => match auto_select_theme(&themes_dir) {
+            Some(n) => {
+                log_to_temp(&format!(
+                    "[cef_hook] No activeTheme in active.json — auto-selected '{}'",
+                    n
+                ));
+                n
+            }
+            None => {
+                log_to_temp("[cef_hook] No activeTheme in active.json");
+                load_legacy_theme(state);
+                return;
+            }
+        },
     };
 
     let theme_dir = themes_dir.join(&theme_name);
@@ -339,6 +464,7 @@ fn load_theme_manifest(state: &mut ThemeState) {
         return;
     }
     state.skin_json_mtime = skin_json_mtime;
+    state.css_payload = None;
 
     // 2. Read skin.json directly
     let skin_content = match fs::read_to_string(&skin_json_path) {
@@ -448,9 +574,12 @@ fn load_theme_manifest(state: &mut ThemeState) {
 
             // Slider condition
             if let Some(ref slider) = cond.slider {
-                if let (Some(ref var_name), Some(val)) = (&slider.css_variable, saved_conditions
+                // ThemeConditionConfig::save writes selections as strings, so accept
+                // both JSON numbers and numeric strings.
+                let saved_val = saved_conditions
                     .and_then(|sc| sc.get(cond_name))
-                    .and_then(|v| v.as_f64()))
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok())));
+                if let (Some(ref var_name), Some(val)) = (&slider.css_variable, saved_val)
                 {
                     let unit = slider.unit.as_deref().unwrap_or("");
                     slider_vars.push((var_name.clone(), format!("{}{}", val, unit)));
@@ -461,7 +590,7 @@ fn load_theme_manifest(state: &mut ThemeState) {
                 continue;
             }
 
-            // Dropdown condition — resolve selected value → TargetCss with affects
+            // Dropdown condition — resolve selected value → TargetCss/TargetJs with affects
             if !selected.is_empty() {
                 if let Some(values) = cond.values.as_ref().and_then(|v| v.as_object()) {
                     if let Some(val_obj) = values.get(selected) {
@@ -476,6 +605,15 @@ fn load_theme_manifest(state: &mut ThemeState) {
                                 if !src.is_empty() && !affects.is_empty() {
                                     let abs_path = theme_dir.join(src).to_string_lossy().into_owned();
                                     state.condition_css.push(ConditionEntry { affects, src: abs_path });
+                                }
+                            }
+                        }
+                        if let Some(ref target_js) = entry.target_js {
+                            let affects = target_js.affects.clone().unwrap_or_default();
+                            if let Some(ref src) = target_js.src {
+                                if !src.is_empty() && !affects.is_empty() {
+                                    let abs_path = theme_dir.join(src).to_string_lossy().into_owned();
+                                    state.condition_js.push(ConditionEntry { affects, src: abs_path });
                                 }
                             }
                         }
@@ -655,6 +793,10 @@ fn handle_vfs_request(url: &str, theme_state: &ThemeState) -> Result<Vec<u8>, ()
         return Err(());
     };
 
+    // Strip query string / fragment so cache-busted URLs still map to a file
+    let cut = relative.find(|c| c == '?' || c == '#').unwrap_or(relative.len());
+    let relative = relative[..cut].to_string();
+
     // Decode URL encoding
     let decoded = percent_decode(&relative);
 
@@ -710,6 +852,46 @@ fn regex_matches(pattern: &str, text: &str) -> bool {
     }
 }
 
+/// Case-insensitive ASCII substring search (byte offsets valid for the input).
+fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    for i in 0..=(h.len() - n.len()) {
+        if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Millennium-compatible window matching — port of patcher/index.ts
+/// EvaluatePatches + Dispatch.ts classListMatch:
+/// - title: regex against the window title
+/// - classes: substring match of the pattern against ".<token>" entries built
+///   from <html class> + <body class> (Millennium: '.token'.includes(pattern))
+/// - alias: patches matching `^Steam$` also apply to "Steam Games List" windows
+///   (only for patches; Millennium's EvaluatePatch skips the alias)
+fn window_matches(pattern: &str, title: &str, html_class: &str, body_class: &str, use_alias: bool) -> bool {
+    if pattern == ".*" {
+        return true;
+    }
+    if regex_matches(pattern, title) {
+        return true;
+    }
+    for token in html_class.split_whitespace().chain(body_class.split_whitespace()) {
+        if format!(".{}", token).contains(pattern) {
+            return true;
+        }
+    }
+    if use_alias && pattern == "^Steam$" && regex_matches("^Steam Games List$", title) {
+        return true;
+    }
+    false
+}
+
 // ─── Theme injection ────────────────────────────────────────────────────────
 
 fn build_vfs_css_url(theme_dir: &str, file_path: &str) -> String {
@@ -725,6 +907,8 @@ fn inject_theme_html(
     html: &str,
     theme_state: &ThemeState,
     window_title: &str,
+    html_class: &str,
+    body_class: &str,
     url: &str,
     plugins: &[LoadedPlugin],
     css_only: bool,
@@ -734,6 +918,13 @@ fn inject_theme_html(
 
     let mut head_inject = String::new();
     let mut body_inject = String::new();
+
+    // 1a. System accent colors (--SystemAccentColor*), injected before the
+    //     theme's own variables so var(--SystemAccentColor*) resolves.
+    head_inject.push_str(&format!(
+        "<style data-lumaforge=\"accent-colors\" id=\"SystemAccentColorInject\">\n{}\n</style>\n",
+        accent::system_accent_css()
+    ));
 
     // 1. Root colors (inline :root variables)
     if let Some(ref root_colors) = theme_state.root_colors_content {
@@ -766,9 +957,9 @@ fn inject_theme_html(
         ));
     }
 
-    // 3. Patches matching this window title
+    // 3. Patches matching this window (title + html/body classes, Millennium alias)
     for patch in &theme_state.patches {
-        if regex_matches(&patch.match_regex, window_title) {
+        if window_matches(&patch.match_regex, window_title, html_class, body_class, true) {
             if let Some(ref css_path) = patch.target_css {
                 let vfs_url = build_vfs_css_url(&theme_dir, css_path);
                 head_inject.push_str(&format!(
@@ -814,9 +1005,12 @@ fn inject_theme_html(
         }
     }
 
-    // 5. Condition CSS (dropdown selections) — match affects against window title
+    // 5. Condition CSS (dropdown selections) — match affects against this window
     for cond in &theme_state.condition_css {
-        let matches = cond.affects.iter().any(|affect| regex_matches(affect, window_title));
+        let matches = cond
+            .affects
+            .iter()
+            .any(|affect| window_matches(affect, window_title, html_class, body_class, false));
         if matches {
             let vfs_url = build_vfs_css_url(&theme_dir, &cond.src);
             head_inject.push_str(&format!(
@@ -834,14 +1028,20 @@ fn inject_theme_html(
         ));
     }
 
-    // 7. Condition JS
+    // 7. Condition JS — same affects matching as condition CSS
     if !css_only {
-        for js_path in &theme_state.condition_js {
-            let vfs_url = build_vfs_css_url(&theme_dir, js_path);
-            body_inject.push_str(&format!(
-                "<script type=\"module\" data-lumaforge=\"condition-js\" src=\"{}\"></script>\n",
-                vfs_url
-            ));
+        for cond in &theme_state.condition_js {
+            let matches = cond
+                .affects
+                .iter()
+                .any(|affect| window_matches(affect, window_title, html_class, body_class, false));
+            if matches {
+                let vfs_url = build_vfs_css_url(&theme_dir, &cond.src);
+                body_inject.push_str(&format!(
+                    "<script type=\"module\" data-lumaforge=\"condition-js\" src=\"{}\"></script>\n",
+                    vfs_url
+                ));
+            }
         }
     }
 
@@ -935,14 +1135,46 @@ fn check_theme_reload_signal(state: &mut ThemeState) -> bool {
 }
 
 fn send_cdp(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, msg: &Value) -> bool {
+    let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("?").to_string();
+    let id = msg.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
     if let Err(e) = socket.send(Message::Text(msg.to_string())) {
-        log_to_temp(&format!("[cef_hook] WebSocket send error: {}", e));
+        log_to_temp(&format!(
+            "[cef_hook] WebSocket send error: {} (while sending {} id={})",
+            e, method, id
+        ));
         return false;
+    }
+    CONN_STATS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.0 += 1;
+        s.1 = format!("{} id={}", method, id);
+    });
+    if trace_enabled() {
+        log_to_temp(&format!("[cef_hook] → {} id={}", method, id));
     }
     true
 }
 
-fn recv_cdp_response(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, expected_id: u64) -> Option<Value> {
+/// Wait for the CDP response with `expected_id`.
+///
+/// Messages that arrive while waiting (Fetch.requestPaused events, responses
+/// to other in-flight commands) are queued into `pending` instead of being
+/// dropped: the main loop dispatches them afterwards. Discarding them used to
+/// leave paused requests hanging forever — the browser never finished loading
+/// those resources (JS/CSS) and pages rendered broken or not at all.
+fn recv_cdp_response(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    pending: &mut Vec<Value>,
+    expected_id: u64,
+) -> Option<Value> {
+    // A response for this id may already have been queued during a previous wait.
+    if let Some(pos) = pending
+        .iter()
+        .position(|m| m.get("id").and_then(|i| i.as_u64()) == Some(expected_id))
+    {
+        return Some(pending.remove(pos));
+    }
+
     let deadline = SystemTime::now() + Duration::from_secs(10);
     loop {
         if SystemTime::now() > deadline {
@@ -952,9 +1184,16 @@ fn recv_cdp_response(socket: &mut tungstenite::WebSocket<tungstenite::stream::Ma
         match socket.read() {
             Ok(Message::Text(text)) => {
                 if let Ok(msg) = serde_json::from_str::<Value>(&text) {
+                    note_rx(&msg);
                     if msg.get("id").and_then(|i| i.as_u64()) == Some(expected_id) {
                         return Some(msg);
                     }
+                    // Not the response we are waiting for — keep it for the
+                    // main loop (events must never be discarded).
+                    if pending.len() >= 4096 {
+                        pending.remove(0);
+                    }
+                    pending.push(msg);
                 }
             }
             Ok(_) => {}
@@ -965,7 +1204,11 @@ fn recv_cdp_response(socket: &mut tungstenite::WebSocket<tungstenite::stream::Ma
                 continue;
             }
             Err(e) => {
-                log_to_temp(&format!("[cef_hook] WebSocket read error: {}", e));
+                log_to_temp(&format!(
+                    "[cef_hook] WebSocket read error: {} ({})",
+                    e,
+                    conn_stats_snapshot()
+                ));
                 return None;
             }
         }
@@ -1138,19 +1381,101 @@ fn js_escape_str(s: &str) -> String {
      .replace('\r', "\\r")
 }
 
-fn register_theme_injection_script(
+/// Build (and cache) the serialized CSS payload pushed into steamloopback
+/// sessions as `window.__lumaCSS`. Link tags to `lumaforge.local` are only
+/// intercepted by Fetch for store-origin documents — requests from
+/// steamloopback documents (Shared + every popup window) go out to DNS and
+/// fail, so those docs must receive the theme CSS as text instead.
+fn theme_css_payload_json(state: &mut ThemeState) -> String {
+    if let Some(p) = &state.css_payload {
+        return p.clone();
+    }
+    let webkit = state
+        .webkit_css_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let conds: Vec<Value> = state
+        .condition_css
+        .iter()
+        .map(|c| {
+            json!({
+                "affects": c.affects,
+                "css": fs::read_to_string(&c.src).unwrap_or_default(),
+            })
+        })
+        .collect();
+    let cjs: Vec<Value> = state
+        .condition_js
+        .iter()
+        .map(|c| {
+            json!({
+                "affects": c.affects,
+                "js": fs::read_to_string(&c.src).unwrap_or_default(),
+            })
+        })
+        .collect();
+    let patches: Vec<Value> = state
+        .patches
+        .iter()
+        .map(|p| {
+            json!({
+                "r": p.match_regex,
+                "css": p.target_css.as_ref().and_then(|f| fs::read_to_string(f).ok()),
+                "js": p.target_js.as_ref().and_then(|f| fs::read_to_string(f).ok()),
+            })
+        })
+        .collect();
+    let payload = json!({
+        "webkit": webkit,
+        "conds": conds,
+        "cjs": cjs,
+        "patches": patches,
+    });
+    let s = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    log_to_temp(&format!(
+        "[cef_hook] CSS payload built: {} bytes ({} conditions, {} patches)",
+        s.len(),
+        state.condition_css.len(),
+        state.patches.len()
+    ));
+    state.css_payload = Some(s.clone());
+    s
+}
+
+/// Evaluate `window.__lumaCSS = {...}` in the given session.
+fn push_css_payload(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
-    theme_state: &ThemeState,
-    inject_existing: bool,
+    state: &mut ThemeState,
+    sid: &str,
 ) {
+    let payload = theme_css_payload_json(state);
+    let expr = format!("try{{window.__lumaCSS={};}}catch(e){{}}", payload);
+    log_to_temp(&format!("[cef_hook] pushCSS: sid={} expr_len={}", sid, expr.len()));
+    let eval = json!({
+        "id": *msg_id,
+        "method": "Runtime.evaluate",
+        "params": {"expression": expr, "awaitPromise": false},
+        "sessionId": sid
+    });
+    *msg_id += 1;
+    send_cdp(socket, &eval);
+}
+
+fn build_theme_js(theme_state: &ThemeState) -> String {
     let theme_dir = theme_state.theme_dir_str();
 
     let mut js = String::new();
     js.push_str(r#"(function(){
   if(window.__lumaforge_theme_injected) return;
   window.__lumaforge_theme_injected=true;
-  var _patched={};
+  // SharedJSContext is headless — Steam mirrors its <head> links into popups
+  // (login window, toasts). Theme links there block Steam's renderWhenReady
+  // gate and the popup never becomes visible (WasHidden stays 1). Detect it
+  // by title (window.name is empty) and strip any links we already added.
+  function isSharedCtx(){ try{ return document.title==='SharedJSContext' || window.name==='SP Shared JS Context'; }catch(e){ return false; } }
+  function stripLmf(){ try{ var h=document.head; if(!h)return; var ls=h.querySelectorAll('link[data-lmf],style[data-lmf],script[data-lmf]'); for(var i=0;i<ls.length;i++){ ls[i].parentNode.removeChild(ls[i]); } }catch(e){} }
   function waitForHead(cb){
     var tries=0;
     (function poll(){
@@ -1158,80 +1483,251 @@ fn register_theme_injection_script(
       else setTimeout(poll,20);
     })();
   }
-  function addCSS(href){
-    var h=document.head||document.documentElement;
+  function headOf(doc){ return doc.head||doc.documentElement; }
+  function addCSS(doc,href){
+    var h=headOf(doc);
     if(!href||!h||h.querySelector('link[data-lmf="'+href+'"]'))return;
-    var l=document.createElement('link');
+    var l=doc.createElement('link');
     l.rel='stylesheet';l.href=href;
     l.setAttribute('data-lmf',href);
     h.appendChild(l);
   }
-  function addStyle(css,id){
-    var h=document.head||document.documentElement;
+  function addStyle(doc,css,id){
+    var h=headOf(doc);
     if(!css||!h)return;
     if(id&&h.querySelector('#'+id))return;
-    var s=document.createElement('style');
+    var s=doc.createElement('style');
     if(id)s.id=id;
+    s.setAttribute('data-lmf',id||'css');
     s.textContent=css;h.appendChild(s);
   }
-  function addJS(src){
-    var h=document.head||document.documentElement;
+  function addJS(doc,src){
+    var h=headOf(doc);
     if(!src||!h||h.querySelector('script[data-lmf="'+src+'"]'))return;
-    var s=document.createElement('script');
+    var s=doc.createElement('script');
     s.type='module';s.src=src;
     s.setAttribute('data-lmf',src);
     h.appendChild(s);
   }
-  function patchByTitle(t){
-    if(_patched[t])return;_patched[t]=1;
-    var _p=PATCHES_PLACEHOLDER;
-    _p.forEach(function(p){
-      try{var re=new RegExp(p.r);if(!re.test(t))return;}
-      catch(e){if(t.indexOf(p.r)===-1)return;}
-      if(p.c)addCSS(p.c);
-      if(p.j)addJS(p.j);
-    });
+  function addInlineJS(doc,txt,id){
+    var h=headOf(doc);
+    if(!txt||!h)return;
+    if(id&&h.querySelector('#'+id))return;
+    var s=doc.createElement('script');
+    if(id)s.id=id;
+    s.setAttribute('data-lmf',id||'js');
+    s.textContent=txt;h.appendChild(s);
   }
-  function injectAllPatches(){
-    var _p=PATCHES_PLACEHOLDER;
-    _p.forEach(function(p){
-      if(p.c)addCSS(p.c);
-      if(p.j)addJS(p.j);
-    });
+  function winClasses(doc){
+    var out=[];
+    var h=(doc.documentElement&&doc.documentElement.className)||'';
+    var b=(doc.body&&doc.body.className)||'';
+    (h+' '+b).split(/\s+/).forEach(function(tk){ if(tk) out.push('.'+tk); });
+    return out;
   }
-  function injectAll(){
-    addStyle('ROOTCOLORS_PLACEHOLDER','RootColors');
-    addCSS('WEBKITCSS_PLACEHOLDER');
-    CONDITION_CSS_PLACEHOLDER
-    addStyle('SLIDER_PLACEHOLDER','MillenniumSliderConditions');
-    CONDITION_JS_PLACEHOLDER
-    var t=document.title||'';
-    patchByTitle(t);
-    injectAllPatches();
+  function reTest(p,t){ try{ return new RegExp(p).test(t); }catch(e){ return t.indexOf(p)>-1; } }
+  function clsTest(p,cl){ for(var i=0;i<cl.length;i++){ if(cl[i].indexOf(p)>-1) return true; } return false; }
+  function matchWin(p,t,cl,alias){
+    if(p==='.*') return true;
+    if(reTest(p,t)||clsTest(p,cl)) return true;
+    if(alias&&p==='^Steam$'&&reTest('^Steam Games List$',t)) return true;
+    return false;
   }
-  waitForHead(function(){
-    injectAll();
-    var titleEl=document.querySelector('title');
-    if(titleEl){
-      var obs=new MutationObserver(function(){
-        var t=document.title||'';
-        if(!_patched[t])patchByTitle(t);
-      });
-      obs.observe(titleEl,{childList:true,subtree:true,characterData:true});
-      setTimeout(function(){var t=document.title||'';if(!_patched[t])patchByTitle(t);},500);
-      setTimeout(function(){var t=document.title||'';if(!_patched[t])patchByTitle(t);},2000);
-    }
-    var obs2=new MutationObserver(function(){
-      if(document.head&&!document.head._lumaObs){
-        document.head._lumaObs=1;
-        injectAll();
+  function applyWindow(doc){
+    if(!doc)return;
+    var P=window.__lumaCSS||null;
+    if(P&&P.webkit)addStyle(doc,P.webkit,'LmfWebkit');
+    var t=doc.title||'';
+    var cl=winClasses(doc);
+    var _p=(P&&P.patches)?P.patches:PATCHES_PLACEHOLDER;
+    for(var i=0;i<_p.length;i++){
+      var p=_p[i];
+      if(matchWin(p.r,t,cl,true)){
+        if(P){ if(p.css)addStyle(doc,p.css,'LmfP'+i); if(p.js)addInlineJS(doc,p.js,'LmfPJ'+i); }
+        else{ if(p.c)addCSS(doc,p.c); if(p.j)addJS(doc,p.j); }
       }
+    }
+    var _c=(P&&P.conds)?P.conds:CONDITION_CSS_PLACEHOLDER;
+    for(var j=0;j<_c.length;j++){
+      var c=_c[j];
+      var ok=false;
+      for(var k=0;k<c.affects.length;k++){ if(matchWin(c.affects[k],t,cl,false)){ ok=true; break; } }
+      if(ok){
+        if(c.css)addStyle(doc,c.css,'LmfC'+j);
+        else if(c.url)addCSS(doc,c.url);
+      }
+    }
+    var _jd=(P&&P.cjs)?P.cjs:CONDITION_JS_PLACEHOLDER;
+    for(var m=0;m<_jd.length;m++){
+      var d=_jd[m];
+      var ok2=false;
+      for(var n=0;n<d.affects.length;n++){ if(matchWin(d.affects[n],t,cl,false)){ ok2=true; break; } }
+      if(ok2){
+        if(d.js)addInlineJS(doc,d.js,'LmfJ'+m);
+        else if(d.url)addJS(doc,d.url);
+      }
+    }
+  }
+  function injectDoc(doc){
+    var P=window.__lumaCSS||null;
+    addStyle(doc,'ACCENT_PLACEHOLDER','SystemAccentColorInject');
+    addStyle(doc,'ROOTCOLORS_PLACEHOLDER','RootColors');
+    if(P&&P.webkit){ addStyle(doc,P.webkit,'LmfWebkit'); }
+    else{ addCSS(doc,'WEBKITCSS_PLACEHOLDER'); }
+    addStyle(doc,'SLIDER_PLACEHOLDER','MillenniumSliderConditions');
+    applyWindow(doc);
+  }
+  function watchDoc(doc){
+    try{
+      if(doc.__lumaWatch)return; doc.__lumaWatch=1;
+      var titleEl=doc.querySelector('title');
+      if(titleEl){
+        new MutationObserver(function(){ applyWindow(doc); }).observe(titleEl,{childList:true,subtree:true,characterData:true});
+      }
+      if(doc.documentElement){
+        new MutationObserver(function(){ applyWindow(doc); }).observe(doc.documentElement,{attributes:true,attributeFilter:['class']});
+      }
+      if(doc.body){
+        new MutationObserver(function(){ applyWindow(doc); }).observe(doc.body,{attributes:true,attributeFilter:['class']});
+      }
+      setTimeout(function(){ applyWindow(doc); },500);
+      setTimeout(function(){ applyWindow(doc); },2000);
+      var obs2=new MutationObserver(function(){
+        if(doc.head&&!doc.head._lumaObs){
+          doc.head._lumaObs=1;
+          injectDoc(doc);
+        }
+      });
+      obs2.observe(doc.documentElement||doc,{childList:true,subtree:true});
+    }catch(e){}
+  }
+  function startInjection(){
+    waitForHead(function(){
+      if(isSharedCtx()) return;
+      injectDoc(document);
+      watchDoc(document);
     });
-    obs2.observe(document.documentElement||document,{childList:true,subtree:true});
-  });
+  }
+  // ── SharedJSContext popup patcher (Millennium-style) ──
+  // Steam's client UI (library, topbar, footer, menus, supernavs) lives in
+  // popup windows created by SharedJSContext, reachable via
+  // g_PopupManager.GetPopups(). Inject the theme into each popup's document
+  // from here — never into Shared's own head (that blocks renderWhenReady).
+  function themedDoc(doc,quiet){
+    try{
+      injectDoc(doc);
+      watchDoc(doc);
+      if(!quiet) console.log('[LUMA] popup themed: '+(doc.title||'?'));
+      return true;
+    }catch(e){ return false; }
+  }
+  function themedPopup(win){
+    try{
+      if(!win||!win.document)return;
+      var doc=win.document;
+      if(doc.title==='SharedJSContext')return;
+      if(win.__luma_lmf_done){
+        // Re-apply silently if a navigation wiped our nodes (SPA doc swap).
+        if(doc.readyState==='complete'&&!doc.querySelector('link[data-lmf],style[data-lmf]')&&!doc.querySelector('#RootColors')){
+          themedDoc(doc,true);
+        }
+        return;
+      }
+      // Same deferral as the popup path: document written, Steam's
+      // renderWhenReady gate (popup_target ctor) already ran.
+      if(doc.readyState!=='complete')return;
+      if(!doc.getElementById('popup_target'))return;
+      if(!themedDoc(doc))return;
+      win.__luma_lmf_done=1;
+    }catch(e){}
+  }
+  function sweepPopups(){
+    try{
+      if(typeof g_PopupManager==='undefined'||!g_PopupManager)return;
+      if(typeof g_PopupManager.GetPopups!=='function')return;
+      var it=g_PopupManager.GetPopups();var s;
+      while(!(s=it.next()).done){
+        var w=null;
+        try{ w=s.value&&(s.value.window||null); }catch(e){}
+        if(!w){ try{ w=s.value&&(s.value.m_popup&&s.value.m_popup.window)||null; }catch(e2){} }
+        if(w)themedPopup(w);
+      }
+    }catch(e){}
+  }
+  function ensureCreatedHook(){
+    if(window.__luma_cb_hooked)return;
+    try{
+      if(typeof g_PopupManager==='undefined'||!g_PopupManager)return;
+      if(typeof g_PopupManager.AddPopupCreatedCallback!=='function')return;
+      g_PopupManager.AddPopupCreatedCallback(function(p){
+        try{
+          var w=p&&(p.window||p.m_popup&&p.m_popup.window)||null;
+          if(w){ themedPopup(w); setTimeout(function(){themedPopup(w);},600); setTimeout(function(){themedPopup(w);},2000); }
+        }catch(e){}
+      });
+      window.__luma_cb_hooked=1;
+      console.log('[LUMA] popup created-hook installed');
+    }catch(e){}
+  }
+  function startPatcher(){
+    if(window.__luma_patcher)return;
+    if(typeof g_PopupManager==='undefined'||!g_PopupManager)return;
+    window.__luma_patcher=1;
+    ensureCreatedHook();
+    sweepPopups();
+    setInterval(function(){ ensureCreatedHook(); sweepPopups(); },1000);
+    console.log('[LUMA] popup patcher started');
+  }
+  if(isSharedCtx()){
+    // Never theme Shared's own head — Steam mirrors it into popups and a
+    // dirty head blocks renderWhenReady. Strip anything present, then patch
+    // the popup windows from here instead (Millennium's approach).
+    startPatcher();
+    [100,500,1500].forEach(function(d){ setTimeout(stripLmf,d); });
+    return;
+  }
+  // Popup documents (about:blank?createflags=... or steamloopback UI windows)
+  // are created blank and then document.write()'d by Steam; their
+  // renderWhenReady gate tracks <link> elements present right after the
+  // write. Adding theme links earlier races that gate (login window never
+  // shows). Wait until #popup_target exists (= write finished, Q ctor ran)
+  // and the document is fully parsed before injecting.
+  var isPopupDoc=(location.protocol==='about:'||location.href.indexOf('createflags')!==-1||location.href.indexOf('steamloopback.host')!==-1);
+  if(isPopupDoc){
+    var started=false;
+    var go=function(){ if(started)return; started=true; startInjection(); };
+    var consider=function(){
+      // Ready state complete = document.write finished and Steam's
+      // renderWhenReady gate already ran; injecting earlier lets our links
+      // race that gate and the popup never becomes visible.
+      if(document.getElementById('popup_target') && document.readyState==='complete') go();
+    };
+    consider();
+    if(!started){
+      window.addEventListener('load',consider);
+      try{
+        new MutationObserver(consider).observe(document,{childList:true,subtree:true});
+      }catch(e){}
+      var iv=setInterval(function(){ consider(); if(started) clearInterval(iv); },150);
+      setTimeout(go,5000);
+    }
+  }else{
+    startInjection();
+  }
+  // The script can run at document start (title not parsed yet), so Shared
+  // detection and g_PopupManager visibility may both be false right now —
+  // retry later. startPatcher is idempotent and self-healing.
+  [500,1500,3000,6000].forEach(function(d){ setTimeout(function(){
+    if(isSharedCtx()){ stripLmf(); }
+    startPatcher();
+  },d); });
 })();"#);
 
     // Replace placeholders with actual values
+    // 0. System accent colors (--SystemAccentColor*)
+    let accent_css = accent::system_accent_css();
+    js = js.replace("ACCENT_PLACEHOLDER", &js_escape_str(accent_css));
+
     // 1. Root colors
     let root_colors_inline = theme_state.root_colors_content.as_deref().unwrap_or("");
     js = js.replace("ROOTCOLORS_PLACEHOLDER", &js_escape_str(root_colors_inline));
@@ -1242,38 +1738,37 @@ fn register_theme_injection_script(
         .unwrap_or_default();
     js = js.replace("WEBKITCSS_PLACEHOLDER", &webkit_url);
 
-    // 3. Condition CSS — build JSON array with affects for runtime title matching
-    let mut cond_css_entries: Vec<Value> = Vec::new();
-    for cond in &theme_state.condition_css {
-        let vfs_url = build_vfs_css_url(&theme_dir, &cond.src);
-        let affects: Vec<Value> = cond.affects.iter().map(|a| Value::String(a.clone())).collect();
-        cond_css_entries.push(json!({"url": vfs_url, "affects": affects}));
-    }
+    // 3. Condition CSS — JSON array with affects for runtime window matching
+    let cond_css_entries: Vec<Value> = theme_state
+        .condition_css
+        .iter()
+        .map(|cond| {
+            json!({
+                "url": build_vfs_css_url(&theme_dir, &cond.src),
+                "affects": cond.affects,
+            })
+        })
+        .collect();
     let cond_css_json = serde_json::to_string(&cond_css_entries).unwrap_or_else(|_| "[]".to_string());
-    let mut cond_css_js = String::new();
-    cond_css_js.push_str(&format!("var _condCss={};\n", cond_css_json));
-    cond_css_js.push_str("_condCss.forEach(function(c){\n");
-    cond_css_js.push_str("  var t=document.title||'';\n");
-    cond_css_js.push_str("  var cls=(document.documentElement&&document.documentElement.className)||'';\n");
-    cond_css_js.push_str("  var match=c.affects.some(function(a){\n");
-    cond_css_js.push_str("    try{return new RegExp(a).test(t)||new RegExp(a).test(cls);}\n");
-    cond_css_js.push_str("    catch(e){return t.indexOf(a)>-1||cls.indexOf(a)>-1;}\n");
-    cond_css_js.push_str("  });\n");
-    cond_css_js.push_str("  if(match)addCSS(c.url);\n");
-    cond_css_js.push_str("});\n");
-    js = js.replace("CONDITION_CSS_PLACEHOLDER", &cond_css_js);
+    js = js.replace("CONDITION_CSS_PLACEHOLDER", &cond_css_json);
 
     // 4. Slider CSS
     let slider_escaped = js_escape_str(&theme_state.slider_css);
     js = js.replace("SLIDER_PLACEHOLDER", &slider_escaped);
 
-    // 5. Condition JS
-    let mut cond_js_js = String::new();
-    for js_path in &theme_state.condition_js {
-        let vfs_url = build_vfs_css_url(&theme_dir, js_path);
-        cond_js_js.push_str(&format!("addJS('{}');\n", vfs_url));
-    }
-    js = js.replace("CONDITION_JS_PLACEHOLDER", &cond_js_js);
+    // 5. Condition JS — same {url, affects} JSON as condition CSS
+    let cond_js_entries: Vec<Value> = theme_state
+        .condition_js
+        .iter()
+        .map(|cond| {
+            json!({
+                "url": build_vfs_css_url(&theme_dir, &cond.src),
+                "affects": cond.affects,
+            })
+        })
+        .collect();
+    let cond_js_json = serde_json::to_string(&cond_js_entries).unwrap_or_else(|_| "[]".to_string());
+    js = js.replace("CONDITION_JS_PLACEHOLDER", &cond_js_json);
 
     // 6. Build patches JSON array
     let mut patches_json = String::from("[");
@@ -1291,6 +1786,18 @@ fn register_theme_injection_script(
     }
     patches_json.push(']');
     js = js.replace("PATCHES_PLACEHOLDER", &patches_json);
+
+    js
+}
+
+fn register_theme_injection_script(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg_id: &mut u64,
+    theme_state: &ThemeState,
+    pending: &mut Vec<Value>,
+    inject_existing: bool,
+) {
+    let js = build_theme_js(theme_state);
 
     // Register via CDP
     let add_script = json!({
@@ -1311,7 +1818,7 @@ fn register_theme_injection_script(
 
     // Now inject into all EXISTING page targets
     if inject_existing {
-        inject_into_existing_targets(socket, msg_id, &js);
+        inject_into_existing_targets(socket, msg_id, pending, &js);
     }
 }
 
@@ -1329,7 +1836,8 @@ fn is_real_steam_page(url: &str) -> bool {
 fn inject_into_existing_targets(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
-    _js: &str,
+    pending: &mut Vec<Value>,
+    js: &str,
 ) {
     let get_targets = json!({
         "id": *msg_id,
@@ -1340,7 +1848,7 @@ fn inject_into_existing_targets(
     if !send_cdp(socket, &get_targets) {
         return;
     }
-    let resp = match recv_cdp_response(socket, *msg_id - 1) {
+    let resp = match recv_cdp_response(socket, pending, *msg_id - 1) {
         Some(r) => r,
         None => {
             log_to_temp("[cef_hook] Failed to get targets");
@@ -1362,18 +1870,18 @@ fn inject_into_existing_targets(
         let target_id = target.get("targetId").and_then(|t| t.as_str()).unwrap_or("");
         let target_url = target.get("url").and_then(|u| u.as_str()).unwrap_or("");
 
+        log_to_temp(&format!(
+            "[cef_hook] Existing target: type={} url={}",
+            target_type,
+            &target_url[..target_url.len().min(140)]
+        ));
+
         if target_type != "page" || target_id.is_empty() {
             continue;
         }
 
-        // Skip our own lumaforge.local and about:blank
-        if target_url.contains("lumaforge.local") || target_url.starts_with("about:") {
-            continue;
-        }
-
-        // Only reload real Steam pages — internal UI (steamloopback, clientui,
-        // popups, settings windows) must not get extension scripts / settings button
-        if !is_real_steam_page(target_url) {
+        // Skip our own lumaforge.local VFS targets
+        if target_url.contains("lumaforge.local") {
             continue;
         }
 
@@ -1390,9 +1898,16 @@ fn inject_into_existing_targets(
         if !send_cdp(socket, &attach) {
             continue;
         }
-        let attach_resp = match recv_cdp_response(socket, *msg_id - 1) {
+        let attach_resp = match recv_cdp_response(socket, pending, *msg_id - 1) {
             Some(r) => r,
-            None => continue,
+            None => {
+                log_to_temp(&format!(
+                    "[cef_hook] No response attaching to target {} ({})",
+                    target_id,
+                    &target_url[..target_url.len().min(80)]
+                ));
+                continue;
+            }
         };
         let session_id = attach_resp.get("result")
             .and_then(|r| r.get("sessionId"))
@@ -1404,20 +1919,50 @@ fn inject_into_existing_targets(
             continue;
         }
 
-        // Navigate to same URL to trigger addScriptToEvaluateOnNewDocument
-        let navigate = json!({
-            "id": *msg_id,
-            "method": "Page.reload",
-            "params": {},
-            "sessionId": session_id
-        });
-        *msg_id += 1;
-        send_cdp(socket, &navigate);
-        injected_count += 1;
-        log_to_temp(&format!("[cef_hook] Reloaded target: {} ({})", &target_url[..target_url.len().min(80)], target_id));
+        if is_real_steam_page(target_url) {
+            // Real web pages: evaluate directly. Reloading used to be needed so
+            // addScriptToEvaluateOnNewDocument scripts re-ran, but that
+            // registration is sent on the browser endpoint (ignored by CEF) —
+            // per-session registration now happens via Target.autoAttach.
+            let eval = json!({
+                "id": *msg_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": js,
+                    "awaitPromise": false
+                },
+                "sessionId": session_id
+            });
+            *msg_id += 1;
+            if send_cdp(socket, &eval) {
+                injected_count += 1;
+            }
+            log_to_temp(&format!("Injected target: {} ({})", &target_url[..target_url.len().min(80)], target_id));
+        } else {
+            // Internal windows (about:blank popups, steamloopback UI, clientui):
+            // evaluate the theme script directly — no reload, since reloading
+            // internal UI loops (frameNavigated → re-register) and disrupts the
+            // client. The script is idempotent (window guard + data-lmf dedupe).
+            let eval = json!({
+                "id": *msg_id,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": js,
+                    "awaitPromise": false
+                },
+                "sessionId": session_id
+            });
+            *msg_id += 1;
+            if send_cdp(socket, &eval) {
+                injected_count += 1;
+            }
+        }
     }
 
-    log_to_temp(&format!("[cef_hook] Injected into {} existing targets", injected_count));
+    log_to_temp(&format!(
+        "[cef_hook] Injected into {} existing targets",
+        injected_count
+    ));
 }
 
 fn register_webkit_js(
@@ -1455,6 +2000,7 @@ fn handle_fetch_paused(
     msg: &Value,
     msg_id: &mut u64,
     theme_state: &mut ThemeState,
+    pending: &mut Vec<Value>,
 ) {
     let params = match msg.get("params") {
         Some(p) => p,
@@ -1668,7 +2214,7 @@ fn handle_fetch_paused(
         return;
     }
 
-    let body_response = recv_cdp_response(socket, current_id);
+    let body_response = recv_cdp_response(socket, pending, current_id);
     let body_msg = match body_response {
         Some(m) => m,
         None => {
@@ -1700,10 +2246,19 @@ fn handle_fetch_paused(
 
     let body_str = String::from_utf8_lossy(&decoded_body).to_string();
 
-    // Get window title from the HTML
-    let window_title = extract_title_from_html(&body_str);
+    // Get window identity from the HTML (title + <html>/<body> classes)
+    let (window_title, html_class, body_class) = extract_window_identity(&body_str);
 
-    let modified = inject_theme_html(&body_str, theme_state, &window_title, url, &theme_state.plugins.clone(), false);
+    let modified = inject_theme_html(
+        &body_str,
+        theme_state,
+        &window_title,
+        &html_class,
+        &body_class,
+        url,
+        &theme_state.plugins.clone(),
+        false,
+    );
 
     let encoded = STANDARD.encode(modified.as_bytes());
     let mut fulfill_params = json!({
@@ -1743,20 +2298,369 @@ fn handle_fetch_paused(
     }
 }
 
-/// Try to extract a window title hint from the HTML
-fn extract_title_from_html(html: &str) -> String {
-    // Look for <title> tag
-    if let Some(start) = html.to_lowercase().find("<title>") {
+/// Extract window identity hints from raw HTML: <title> text plus the class
+/// attributes of <html> and <body> (used by window_matches, mirroring what
+/// Millennium reads from g_PopupManager params html_class/body_class).
+fn extract_window_identity(html: &str) -> (String, String, String) {
+    let mut title = String::new();
+    if let Some(start) = find_ascii_ci(html, "<title>") {
         let content_start = start + 7;
-        if let Some(end) = html[content_start..].to_lowercase().find("</title>") {
-            return html[content_start..content_start + end].trim().to_string();
+        if content_start < html.len() {
+            if let Some(rel_end) = find_ascii_ci(&html[content_start..], "</title>") {
+                title = html[content_start..content_start + rel_end].trim().to_string();
+            }
         }
     }
-    // Fallback: empty string (will match .* patches)
+    (
+        title,
+        extract_tag_class(html, "<html"),
+        extract_tag_class(html, "<body"),
+    )
+}
+
+/// Find `class="..."` inside the first occurrence of `tag` (case-insensitive).
+fn extract_tag_class(html: &str, tag: &str) -> String {
+    let start = match find_ascii_ci(html, tag) {
+        Some(s) => s,
+        None => return String::new(),
+    };
+    let tag_end = html[start..].find('>').map(|e| start + e).unwrap_or(html.len());
+    let region = &html[start..tag_end];
+    let lc_region = region.to_ascii_lowercase();
+    if let Some(cs) = lc_region.find("class=\"") {
+        let val_start = cs + 7;
+        if let Some(ce) = lc_region[val_start..].find('"') {
+            return region[val_start..val_start + ce].to_string();
+        }
+    }
     String::new()
 }
 
 // ─── CDP main loop ──────────────────────────────────────────────────────────
+
+/// Dispatch one received CDP message. Events are handled here; plain responses
+/// to our fire-and-forget commands are dropped. Messages that arrived while a
+/// recv_cdp_response wait was in progress were already queued into `pending`
+/// and are re-dispatched through this function by the main loop.
+fn dispatch_cdp_message(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg: &Value,
+    msg_id: &mut u64,
+    theme_state: &mut ThemeState,
+    pending: &mut Vec<Value>,
+) {
+    let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+    match method {
+        "Fetch.requestPaused" => {
+            handle_fetch_paused(socket, msg, msg_id, theme_state, pending);
+        }
+        "Runtime.bindingCalled" => {
+            let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            let payload = msg.get("params").and_then(|p| p.get("payload")).and_then(|p| p.as_str()).unwrap_or("");
+            if name == "__lumaNativeBridge" {
+                handle_bridge_binding(socket, msg_id, payload);
+            }
+        }
+        "Runtime.consoleAPICalled" => {
+            let args = msg.get("params").and_then(|p| p.get("args")).and_then(|a| a.as_array());
+            if let Some(arr) = args {
+                let parts: Vec<String> = arr.iter().filter_map(|a| a.get("value").and_then(|v| v.as_str()).map(|s| s.to_string())).collect();
+                let text = parts.join(" ");
+                if text.contains("LUMA") || text.contains("Bridge") || text.contains("luma") || text.contains("bridge") {
+                    log_to_temp(&format!("[cef_hook] JS console: {}", &text[..text.len().min(200)]));
+                }
+            }
+        }
+        "Page.frameNavigated" => {
+            let frame = msg.get("params").and_then(|p| p.get("frame"));
+            let _nav_url = frame.and_then(|f| f.get("url")).and_then(|u| u.as_str()).unwrap_or("");
+            let is_main = frame.and_then(|f| f.get("parentId")).is_none();
+
+            if is_main {
+                load_theme_manifest(theme_state);
+                load_plugins(theme_state);
+                register_webkit_js(socket, msg_id, theme_state);
+                // Re-register only the persistent script — addScriptToEvaluateOnNewDocument
+                // handles new documents automatically. We must NOT call
+                // inject_into_existing_targets here because it does Page.reload
+                // on all targets, causing an infinite reload loop (frameNavigated
+                // → reload → frameNavigated → ...).
+                register_theme_injection_script(socket, msg_id, theme_state, pending, false);
+                install_bridge_shim(socket, msg_id);
+                // New document in a payload-carrying session: the window realm
+                // is fresh (window.__lumaCSS gone) — re-push the payload. The
+                // patcher's delayed re-applies pick it up.
+                if let Some(sid) = msg.get("sessionId").and_then(|s| s.as_str()) {
+                    let needed = SESSION_URLS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(s, _)| s == sid);
+                    log_to_temp(&format!(
+                        "[cef_hook] frameNav main: sid={} needed={}",
+                        sid, needed
+                    ));
+                    if needed {
+                        push_css_payload(socket, msg_id, theme_state, sid);
+                    }
+                }
+            }
+        }
+        "Target.attachedToTarget" => {
+            let params = msg.get("params");
+            let raw = params.map(|p| p.to_string()).unwrap_or_default();
+            log_to_temp(&format!(
+                "[cef_hook] attachedToTarget: {}",
+                &raw[..raw.len().min(700)]
+            ));
+            let sid = params
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let tinfo = params.and_then(|p| p.get("targetInfo"));
+            let ttype = tinfo.and_then(|t| t.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+            let turl = tinfo.and_then(|t| t.get("url")).and_then(|t| t.as_str()).unwrap_or("");
+            let tid = tinfo
+                .and_then(|t| t.get("targetId"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let waiting = params
+                .and_then(|p| p.get("waitingForDebugger"))
+                .and_then(|w| w.as_bool())
+                .unwrap_or(false);
+            log_to_temp(&format!(
+                "[cef_hook] attachedToTarget: type={} waiting={} url={}",
+                ttype, waiting, turl
+            ));
+
+            if sid.is_empty() || tid.is_empty() || turl.contains("lumaforge.local") {
+                return;
+            }
+            if let Ok(mut sessions) = SESSIONS.lock() {
+                sessions.retain(|(t, _)| *t != tid);
+                sessions.push((tid.clone(), sid.to_string()));
+            }
+            // Always release the target — CEF can hold a freshly created popup
+            // before its renderer starts (login window then never loads and the
+            // native window stays hidden forever).
+            let resume = json!({
+                "id": *msg_id,
+                "method": "Runtime.runIfWaitingForDebugger",
+                "params": {},
+                "sessionId": sid
+            });
+            *msg_id += 1;
+            send_cdp(socket, &resume);
+
+            // Popup targets attach as type=other with an empty URL before their
+            // document exists; register the script right away (browser-side, no
+            // renderer needed) but skip the evaluate until it's a real page.
+            // steamloopback documents (Shared, main window) and popup windows
+            // (about:blank/empty target url) can't fetch lumaforge.local — no
+            // Fetch interception for them — so push the CSS payload as text
+            // before the script eval. Store docs keep the link path (Fetch
+            // interception works from that origin). SESSION_URLS doubles as
+            // the set of sessions that carry the payload, so frameNavigated
+            // and theme-reload know who needs a re-push.
+            if ttype == "page"
+                && !turl.contains("devtools://")
+                && !turl.contains("store.steampowered.com")
+            {
+                push_css_payload(socket, msg_id, theme_state, sid);
+                if let Ok(mut urls) = SESSION_URLS.lock() {
+                    urls.retain(|(s, _)| s != sid);
+                    urls.push((sid.to_string(), turl.to_string()));
+                }
+            }
+            register_session_theme(socket, msg_id, theme_state, sid);
+            if let Ok(mut reg) = REGISTERED_TARGETS.lock() {
+                if !reg.contains(&tid) {
+                    reg.push(tid.clone());
+                }
+            }
+            if ttype == "page" && !turl.is_empty() {
+                let js = build_theme_js(theme_state);
+                let eval = json!({
+                    "id": *msg_id,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": js, "awaitPromise": false},
+                    "sessionId": sid
+                });
+                *msg_id += 1;
+                send_cdp(socket, &eval);
+            }
+            log_to_temp(&format!(
+                "[cef_hook] Registered theme script for target ({}) {}",
+                ttype,
+                &turl[..turl.len().min(100)]
+            ));
+        }
+        "Target.targetInfoChanged" => {
+            let params = msg.get("params");
+            let tinfo = params.and_then(|p| p.get("targetInfo"));
+            let ttype = tinfo.and_then(|t| t.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+            let turl = tinfo.and_then(|t| t.get("url")).and_then(|t| t.as_str()).unwrap_or("");
+            let tid = tinfo
+                .and_then(|t| t.get("targetId"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if ttype != "page" || turl.is_empty() || turl.contains("lumaforge.local") || tid.is_empty() {
+                return;
+            }
+            {
+                let reg = REGISTERED_TARGETS.lock().unwrap();
+                if reg.iter().any(|t| t == tid) {
+                    return;
+                }
+            }
+            let sid = {
+                let sessions = SESSIONS.lock().unwrap();
+                sessions.iter().find(|(t, _)| t == tid).map(|(_, s)| s.clone())
+            };
+            if let Some(sid) = sid {
+                let js = build_theme_js(theme_state);
+                let eval = json!({
+                    "id": *msg_id,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": js, "awaitPromise": false},
+                    "sessionId": &sid
+                });
+                *msg_id += 1;
+                send_cdp(socket, &eval);
+                if let Ok(mut reg) = REGISTERED_TARGETS.lock() {
+                    reg.push(tid.to_string());
+                }
+                log_to_temp(&format!(
+                    "[cef_hook] targetInfoChanged → evaluated theme in target {} ({})",
+                    tid, turl
+                ));
+            }
+        }
+        "Target.detachedFromTarget" => {
+            let sid = msg
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if !sid.is_empty() {
+                if let Ok(mut sessions) = SESSIONS.lock() {
+                    sessions.retain(|(_, s)| s != sid);
+                }
+            }
+        }
+        "" => {
+            // Response to a fire-and-forget command: surface errors/exceptions
+            // (evaluating our script in a target must never fail silently).
+            if let Some(err) = msg.get("error") {
+                log_to_temp(&format!("[cef_hook] CDP command error: {}", err));
+            }
+            if let Some(ed) = msg.pointer("/result/exceptionDetails") {
+                let s = ed.to_string();
+                log_to_temp(&format!("[cef_hook] CDP exception: {}", &s[..s.len().min(300)]));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Register the theme script on a per-session Page domain. Browser-level
+/// Page.* commands are rejected by this CEF build ("wasn't found"), so every
+/// session needs its own registration for future documents.
+fn register_session_theme(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg_id: &mut u64,
+    theme_state: &ThemeState,
+    sid: &str,
+) {
+    let enable = json!({
+        "id": *msg_id,
+        "method": "Page.enable",
+        "params": {},
+        "sessionId": sid
+    });
+    *msg_id += 1;
+    send_cdp(socket, &enable);
+
+    let js = build_theme_js(theme_state);
+    let add = json!({
+        "id": *msg_id,
+        "method": "Page.addScriptToEvaluateOnNewDocument",
+        "params": {"source": js, "runImmediately": true},
+        "sessionId": sid
+    });
+    *msg_id += 1;
+    send_cdp(socket, &add);
+}
+
+/// Periodically discover page targets that acquired a real URL and attach to
+/// them so the Target.attachedToTarget handler registers the theme script for
+/// their session. about:blank popup targets are skipped on purpose: attaching
+/// while they are being created stalls CEF's target creation (the login
+/// window's renderer never starts and the native window stays hidden).
+fn poll_new_targets(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg_id: &mut u64,
+    pending: &mut Vec<Value>,
+) {
+    let get_targets = json!({
+        "id": *msg_id,
+        "method": "Target.getTargets",
+        "params": {}
+    });
+    *msg_id += 1;
+    if !send_cdp(socket, &get_targets) {
+        return;
+    }
+    let resp = match recv_cdp_response(socket, pending, *msg_id - 1) {
+        Some(r) => r,
+        None => return,
+    };
+    let targets = match resp.get("result").and_then(|r| r.get("targetInfos")).and_then(|t| t.as_array()) {
+        Some(arr) => arr,
+        None => return,
+    };
+
+    for target in targets {
+        let ttype = target.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let tid = target.get("targetId").and_then(|t| t.as_str()).unwrap_or("");
+        let url = target.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if ttype != "page" || tid.is_empty() || url.is_empty() {
+            continue;
+        }
+        if url.starts_with("about:")
+            || url.starts_with("devtools:")
+            || url.contains("lumaforge.local")
+        {
+            continue;
+        }
+        {
+            let reg = REGISTERED_TARGETS.lock().unwrap();
+            if reg.iter().any(|t| t == tid) {
+                continue;
+            }
+        }
+        {
+            let sessions = SESSIONS.lock().unwrap();
+            if sessions.iter().any(|(t, _)| t == tid) {
+                continue;
+            }
+        }
+        let attach = json!({
+            "id": *msg_id,
+            "method": "Target.attachToTarget",
+            "params": {"targetId": tid, "flatten": true}
+        });
+        *msg_id += 1;
+        if send_cdp(socket, &attach) {
+            log_to_temp(&format!(
+                "[cef_hook] Poll: attaching to new target {} ({})",
+                tid, url
+            ));
+        }
+    }
+}
 
 fn handle_cdp_connection(port: u16) {
     let mut retry_count = 0u32;
@@ -1784,6 +2688,9 @@ fn handle_cdp_connection(port: u16) {
         log_to_temp("[cef_hook] Connected to CDP browser endpoint");
 
         let mut msg_id = 1u64;
+        // Messages received while waiting for a specific response are queued
+        // here and dispatched by the main loop (never discarded).
+        let mut pending: Vec<Value> = Vec::new();
 
         // Enable Fetch interception
         let enable_fetch = json!({
@@ -1837,6 +2744,12 @@ fn handle_cdp_connection(port: u16) {
         }
         msg_id += 1;
 
+        // NOTE: Target.setAutoAttach is intentionally NOT used. Auto-attaching a
+        // popup the instant it is created (type=other, url="") stalls CEF's
+        // target creation: the login window's renderer never starts and the
+        // native window stays hidden forever. New targets are picked up by the
+        // periodic poll instead, only once they have a real URL.
+
         // Load theme manifest
         let mut theme_state = ThemeState::new();
         load_theme_manifest(&mut theme_state);
@@ -1846,81 +2759,73 @@ fn handle_cdp_connection(port: u16) {
         register_webkit_js(&mut socket, &mut msg_id, &theme_state);
 
         // Register persistent theme injection for ALL documents (including internal Steam windows)
-        register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, true);
+        register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, &mut pending, true);
 
         install_bridge_shim(&mut socket, &mut msg_id);
 
+        reset_conn_stats();
         let mut lost = false;
         let mut loop_iter = 0u64;
+        let mut last_poll = Instant::now();
         while !lost {
             loop_iter += 1;
             if loop_iter % 5 == 0 {
                 if check_theme_reload_signal(&mut theme_state) {
                     register_webkit_js(&mut socket, &mut msg_id, &theme_state);
-                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, true);
+                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, &mut pending, true);
+                    // Re-push the (rebuilt) CSS payload to every session that
+                    // carries it so the patcher sees the new CSS in existing docs.
+                    let sids: Vec<String> = SESSION_URLS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(s, _)| s.clone())
+                        .collect();
+                    for sid in &sids {
+                        push_css_payload(&mut socket, &mut msg_id, &mut theme_state, sid);
+                    }
                 }
                 load_plugins(&mut theme_state);
+            }
+
+            // Dispatch messages that were queued while a recv_cdp_response
+            // wait was in progress (Fix: Fetch.requestPaused events must
+            // never be dropped or the paused request hangs forever).
+            let mut drained = 0usize;
+            while !pending.is_empty() && drained < 512 && !lost {
+                let queued = pending.remove(0);
+                drained += 1;
+                dispatch_cdp_message(&mut socket, &queued, &mut msg_id, &mut theme_state, &mut pending);
+            }
+            if lost {
+                break;
+            }
+
+            if last_poll.elapsed() >= Duration::from_secs(1) {
+                last_poll = Instant::now();
+                poll_new_targets(&mut socket, &mut msg_id, &mut pending);
             }
 
             match socket.read() {
                 Ok(Message::Text(text)) => {
                     if let Ok(msg) = serde_json::from_str::<Value>(&text) {
-                        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-
-                        match method {
-                            "Fetch.requestPaused" => {
-                                handle_fetch_paused(
-                                    &mut socket,
-                                    &msg,
-                                    &mut msg_id,
-                                    &mut theme_state,
-                                );
-                            }
-                            "Runtime.bindingCalled" => {
-                                let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-                                let payload = msg.get("params").and_then(|p| p.get("payload")).and_then(|p| p.as_str()).unwrap_or("");
-                                if name == "__lumaNativeBridge" {
-                                    handle_bridge_binding(&mut socket, &mut msg_id, payload);
-                                }
-                            }
-                            "Runtime.consoleAPICalled" => {
-                                let args = msg.get("params").and_then(|p| p.get("args")).and_then(|a| a.as_array());
-                                if let Some(arr) = args {
-                                    let parts: Vec<String> = arr.iter().filter_map(|a| a.get("value").and_then(|v| v.as_str()).map(|s| s.to_string())).collect();
-                                    let text = parts.join(" ");
-                                    if text.contains("LUMA") || text.contains("Bridge") || text.contains("luma") || text.contains("bridge") {
-                                        log_to_temp(&format!("[cef_hook] JS console: {}", &text[..text.len().min(200)]));
-                                    }
-                                }
-                            }
-                            "Page.frameNavigated" => {
-                                let frame = msg.get("params").and_then(|p| p.get("frame"));
-                                let _nav_url = frame.and_then(|f| f.get("url")).and_then(|u| u.as_str()).unwrap_or("");
-                                let is_main = frame.and_then(|f| f.get("parentId")).is_none();
-
-                                if is_main {
-                                    load_theme_manifest(&mut theme_state);
-                                    load_plugins(&mut theme_state);
-                                    register_webkit_js(&mut socket, &mut msg_id, &theme_state);
-                                    // Re-register only the persistent script — addScriptToEvaluateOnNewDocument
-                                    // handles new documents automatically. We must NOT call
-                                    // inject_into_existing_targets here because it does Page.reload
-                                    // on all targets, causing an infinite reload loop (frameNavigated
-                                    // → reload → frameNavigated → ...).
-                                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, false);
-                                    install_bridge_shim(&mut socket, &mut msg_id);
-                                }
-                            }
-                            _ => {}
-                        }
+                        note_rx(&msg);
+                        dispatch_cdp_message(&mut socket, &msg, &mut msg_id, &mut theme_state, &mut pending);
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    log_to_temp("[cef_hook] WebSocket closed, reconnecting...");
+                    log_to_temp(&format!(
+                        "[cef_hook] WebSocket closed, reconnecting... ({})",
+                        conn_stats_snapshot()
+                    ));
                     lost = true;
                 }
-            Err(e) => {
-                log_to_temp(&format!("[cef_hook] WebSocket error: {}, reconnecting...", e));
+                Err(e) => {
+                    log_to_temp(&format!(
+                        "[cef_hook] WebSocket error: {}, reconnecting... ({})",
+                        e,
+                        conn_stats_snapshot()
+                    ));
                     lost = true;
                 }
                 _ => {}
@@ -1935,7 +2840,10 @@ fn handle_cdp_connection(port: u16) {
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 unsafe extern "system" fn dll_main_thread(_param: *mut c_void) -> u32 {
-    log_to_temp("[cef_hook] DLL loaded into webhelper process");
+    log_to_temp(&format!(
+        "[cef_hook] DLL loaded into webhelper process (pid={})",
+        std::process::id()
+    ));
 
     let port = match resolve_debug_port() {
         Some(p) => p,
@@ -1947,6 +2855,10 @@ unsafe extern "system" fn dll_main_thread(_param: *mut c_void) -> u32 {
 
     handle_cdp_connection(port);
 
+    log_to_temp(&format!(
+        "[cef_hook] CDP thread exiting (pid={})",
+        std::process::id()
+    ));
     0
 }
 
@@ -1965,5 +2877,70 @@ pub unsafe extern "system" fn DllMain(
         }
         0 | 2 | 3 => 1,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod window_match_tests {
+    use super::window_matches;
+
+    #[test]
+    fn title_regex_match() {
+        assert!(window_matches("^Steam$", "Steam", "", "", true));
+        assert!(window_matches("^Account", "Account Menu", "", "", false));
+        assert!(!window_matches("^Steam$", "Account Menu", "", "", true));
+    }
+
+    #[test]
+    fn steam_games_list_alias_only_for_patches() {
+        assert!(window_matches("^Steam$", "Steam Games List", "", "", true));
+        assert!(!window_matches("^Steam$", "Steam Games List", "", "", false));
+    }
+
+    #[test]
+    fn class_token_substring_match() {
+        assert!(window_matches(
+            ".friendsui-container",
+            "Friends List",
+            "SomeOtherClass",
+            "friendsui-container DesktopUI",
+            false
+        ));
+        assert!(window_matches(
+            ".friendsui-container",
+            "whatever",
+            "client_chat_frame friendsui-container",
+            "",
+            false
+        ));
+        assert!(!window_matches(".friendsui-container", "Steam", "", "", true));
+    }
+
+    #[test]
+    fn dot_star_matches_everything() {
+        assert!(window_matches(".*", "", "", "", true));
+    }
+
+    #[test]
+    fn invalid_regex_falls_back_to_substring() {
+        assert!(window_matches("Menu$[", "a Menu$[ b", "", "", false));
+    }
+}
+
+#[cfg(test)]
+mod accent_tests {
+    #[test]
+    fn accent_css_has_required_vars() {
+        let css = super::accent::system_accent_css();
+        for var in [
+            "--SystemAccentColor:",
+            "--SystemAccentColor-RGB:",
+            "--SystemAccentColorAccent:",
+            "--SystemAccentColorAccent-RGB:",
+            "--SystemAccentColorLight1:",
+            "--SystemAccentColorDark3:",
+        ] {
+            assert!(css.contains(var), "missing {} in {}", var, css);
+        }
     }
 }

@@ -13,7 +13,7 @@ fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
     crate::plugin_loader_linux::load_enabled_plugins()
 }
 
-// ─── Theme patch (parsed from theme-manifest.json) ──────────────────────────
+// ─── Theme data (parsed from theme-manifest.json) ───────────────────────────
 
 pub struct ThemePatchEntry {
     pub match_regex: String,
@@ -21,8 +21,37 @@ pub struct ThemePatchEntry {
     pub target_js: Option<String>,
 }
 
-/// Load theme patches from theme-manifest.json written by main crate
-pub fn load_theme_patches() -> (String, Vec<ThemePatchEntry>) {
+pub struct ThemeConditionEntry {
+    pub affects: Vec<String>,
+    pub src: String,
+}
+
+/// Everything the injector needs for one injection pass.
+pub struct ThemeBundle {
+    pub dir: String,
+    pub patches: Vec<ThemePatchEntry>,
+    pub webkit_css: Option<String>,
+    pub webkit_js: Option<String>,
+    pub root_colors: Option<String>,
+    pub condition_css: Vec<ThemeConditionEntry>,
+    pub condition_js: Vec<ThemeConditionEntry>,
+    pub slider_css: String,
+}
+
+impl ThemeBundle {
+    pub fn is_empty(&self) -> bool {
+        self.patches.is_empty()
+            && self.webkit_css.is_none()
+            && self.webkit_js.is_none()
+            && self.root_colors.is_none()
+            && self.condition_css.is_empty()
+            && self.condition_js.is_empty()
+            && self.slider_css.is_empty()
+    }
+}
+
+/// Load theme data from theme-manifest.json written by theme.rs
+pub fn load_theme_patches() -> ThemeBundle {
     let manifest_path = crate::platform::runtime_dir()
         .join("theme-manifest.json");
 
@@ -30,7 +59,16 @@ pub fn load_theme_patches() -> (String, Vec<ThemePatchEntry>) {
         Ok(c) => c,
         Err(_) => {
             crate::log_to_temp("[steamcdp] No theme-manifest.json found");
-            return (String::new(), Vec::new());
+            return ThemeBundle {
+                dir: String::new(),
+                patches: Vec::new(),
+                webkit_css: None,
+                webkit_js: None,
+                root_colors: None,
+                condition_css: Vec::new(),
+                condition_js: Vec::new(),
+                slider_css: String::new(),
+            };
         }
     };
 
@@ -41,7 +79,16 @@ pub fn load_theme_patches() -> (String, Vec<ThemePatchEntry>) {
                 "[steamcdp] Failed to parse theme-manifest.json: {}",
                 e
             ));
-            return (String::new(), Vec::new());
+            return ThemeBundle {
+                dir: String::new(),
+                patches: Vec::new(),
+                webkit_css: None,
+                webkit_js: None,
+                root_colors: None,
+                condition_css: Vec::new(),
+                condition_js: Vec::new(),
+                slider_css: String::new(),
+            };
         }
     };
 
@@ -77,12 +124,110 @@ pub fn load_theme_patches() -> (String, Vec<ThemePatchEntry>) {
         }
     }
 
+    let webkit_css = manifest
+        .get("webkitCss")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let webkit_js = manifest
+        .get("webkitJs")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let root_colors = manifest
+        .get("rootColors")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Conditions: resolve selectedValue → values[targetCss/targetJs] with affects
+    let mut condition_css = Vec::new();
+    let mut condition_js = Vec::new();
+    let mut slider_css = String::new();
+    let mut slider_vars: Vec<(String, String)> = Vec::new();
+
+    if let Some(conds) = manifest.get("conditions").and_then(|c| c.as_object()) {
+        for (name, cond) in conds {
+            // Slider conditions → :root variables
+            if let Some(slider) = cond.get("slider") {
+                if let (Some(var_name), Some(current)) = (
+                    slider.get("cssVariable").and_then(|v| v.as_str()),
+                    slider.get("currentValue").and_then(|v| v.as_f64()),
+                ) {
+                    let unit = slider.get("unit").and_then(|v| v.as_str()).unwrap_or("");
+                    slider_vars.push((var_name.to_string(), format!("{}{}", current, unit)));
+                }
+                continue;
+            }
+
+            let selected = match cond.get("selectedValue").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => cond.get("default").and_then(|v| v.as_str()).unwrap_or(""),
+            };
+            if selected.is_empty() {
+                continue;
+            }
+            let values = match cond.get("values").and_then(|v| v.as_object()) {
+                Some(v) => v,
+                None => continue,
+            };
+            let val_obj = match values.get(selected) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let mut push_entry = |target: &str, dest: &mut Vec<ThemeConditionEntry>| {
+                if let Some(obj) = val_obj.get(target) {
+                    let src = obj.get("src").and_then(|v| v.as_str()).unwrap_or("");
+                    let affects: Vec<String> = obj
+                        .get("affects")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|a| a.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !src.is_empty() && !affects.is_empty() {
+                        dest.push(ThemeConditionEntry {
+                            affects,
+                            src: src.to_string(),
+                        });
+                    }
+                }
+            };
+            let _ = name;
+            push_entry("targetCss", &mut condition_css);
+            push_entry("targetJs", &mut condition_js);
+        }
+    }
+
+    if !slider_vars.is_empty() {
+        slider_css.push_str(":root {\n");
+        for (var, val) in &slider_vars {
+            slider_css.push_str(&format!("    {}: {};\n", var, val));
+        }
+        slider_css.push_str("}\n");
+    }
+
     crate::log_to_temp(&format!(
-        "[steamcdp] Loaded {} theme patches, theme_dir={}",
+        "[steamcdp] Loaded theme: {} patches, webkit={}, rootColors={}, cond_css={}, cond_js={}, slider_vars={}, theme_dir={}",
         patches.len(),
+        webkit_css.is_some(),
+        root_colors.is_some(),
+        condition_css.len(),
+        condition_js.len(),
+        slider_vars.len(),
         theme_dir
     ));
-    (theme_dir, patches)
+
+    ThemeBundle {
+        dir: theme_dir,
+        patches,
+        webkit_css,
+        webkit_js,
+        root_colors,
+        condition_css,
+        condition_js,
+        slider_css,
+    }
 }
 
 /// Convert a Windows absolute path to a VFS URL.
@@ -110,6 +255,141 @@ fn regex_matches(pattern: &str, text: &str) -> bool {
         Ok(re) => re.is_match(text),
         Err(_) => text.contains(pattern),
     }
+}
+
+/// Millennium-compatible window matching (same semantics as cef_hook):
+/// regex on the window title, substring on ".<class token>" entries from
+/// <html>/<body> classes, plus the `^Steam$` → `^Steam Games List$` alias for
+/// patches (Millennium patcher/index.ts EvaluatePatches).
+fn window_matches(pattern: &str, title: &str, html_class: &str, body_class: &str, use_alias: bool) -> bool {
+    if pattern == ".*" {
+        return true;
+    }
+    if regex_matches(pattern, title) {
+        return true;
+    }
+    for token in html_class.split_whitespace().chain(body_class.split_whitespace()) {
+        if format!(".{}", token).contains(pattern) {
+            return true;
+        }
+    }
+    if use_alias && pattern == "^Steam$" && regex_matches("^Steam Games List$", title) {
+        return true;
+    }
+    false
+}
+
+/// Fallback accent palette (Steam blue) — the injector path can't call the
+/// Windows uxtheme APIs (cef_hook does that on Windows); Linux gets this.
+const ACCENT_FALLBACK: [&str; 7] = [
+    "#66c0ff", "#8fd1ff", "#abdfff", "#ccefff", "#4da6e8", "#3b8bc9", "#2a70aa",
+];
+
+fn accent_css() -> String {
+    let rgb = |hex: &str| -> String {
+        let h = hex.trim_start_matches('#');
+        let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(0);
+        format!("{}, {}, {}", r, g, b)
+    };
+    let mut css = String::from(":root {\n");
+    let mut push = |name: &str, hex: &str| {
+        if name.is_empty() {
+            css.push_str(&format!("    --SystemAccentColor: {};\n", hex));
+            css.push_str(&format!("    --SystemAccentColor-RGB: {};\n", rgb(hex)));
+        } else {
+            css.push_str(&format!("    --SystemAccentColor{}: {};\n", name, hex));
+            css.push_str(&format!("    --SystemAccentColor{}-RGB: {};\n", name, rgb(hex)));
+        }
+    };
+    push("", ACCENT_FALLBACK[0]);
+    push("Accent", ACCENT_FALLBACK[0]);
+    push("Light1", ACCENT_FALLBACK[1]);
+    push("Light2", ACCENT_FALLBACK[2]);
+    push("Light3", ACCENT_FALLBACK[3]);
+    push("Dark1", ACCENT_FALLBACK[4]);
+    push("Dark2", ACCENT_FALLBACK[5]);
+    push("Dark3", ACCENT_FALLBACK[6]);
+    push("OriginalAccent", ACCENT_FALLBACK[0]);
+    css.push_str("}\n");
+    css
+}
+
+fn js_escape_str(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn eval_js(client: &mut CdpClient, msg_id: &mut u64, expression: String) -> Result<(), String> {
+    let id = *msg_id;
+    let resp = client.send_cdp_wait(
+        &json!({
+            "id": id,
+            "method": "Runtime.evaluate",
+            "params": { "expression": expression, "returnByValue": true }
+        }),
+        id,
+    )?;
+    if let Some(err) = resp.get("error") {
+        crate::log_to_temp(&format!("[steamcdp] theme evaluate error: {}", err));
+    }
+    *msg_id += 1;
+    Ok(())
+}
+
+/// Add a <link rel=stylesheet> to the page, deduped via a data-lmf attribute.
+fn inject_stylesheet(client: &mut CdpClient, msg_id: &mut u64, vfs_url: &str) -> Result<(), String> {
+    let script = format!(
+        "(function(){{\
+            var u='{}';\
+            if(document.querySelector('[data-lmf=\"'+u+'\"]'))return;\
+            var l=document.createElement('link');\
+            l.rel='stylesheet';l.href=u;l.setAttribute('data-lmf',u);\
+            (document.head||document.documentElement).appendChild(l);\
+        }})();",
+        vfs_url
+    );
+    eval_js(client, msg_id, script)
+}
+
+/// Add a <script type=module> to the page, deduped via a data-lmf attribute.
+fn inject_module_script(client: &mut CdpClient, msg_id: &mut u64, vfs_url: &str) -> Result<(), String> {
+    let script = format!(
+        "(function(){{\
+            var u='{}';\
+            if(document.querySelector('[data-lmf=\"'+u+'\"]'))return;\
+            var s=document.createElement('script');\
+            s.type='module';s.src=u;s.setAttribute('data-lmf',u);\
+            (document.head||document.documentElement).appendChild(s);\
+        }})();",
+        vfs_url
+    );
+    eval_js(client, msg_id, script)
+}
+
+/// Add an inline <style> with the given id, deduped by id.
+fn inject_inline_style(
+    client: &mut CdpClient,
+    msg_id: &mut u64,
+    style_id: &str,
+    css: &str,
+) -> Result<(), String> {
+    let script = format!(
+        "(function(){{\
+            if(document.getElementById('{}'))return;\
+            var s=document.createElement('style');\
+            s.id='{}';\
+            s.textContent='{}';\
+            (document.head||document.documentElement).appendChild(s);\
+        }})();",
+        style_id,
+        style_id,
+        js_escape_str(css)
+    );
+    eval_js(client, msg_id, script)
 }
 
 // ─── Main injection entry point ─────────────────────────────────────────────
@@ -188,13 +468,13 @@ pub const BRIDGE_PROXY_JS: &str = r#"
 
 pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     let plugins = load_enabled_plugins().unwrap_or_default();
-    let (theme_dir, patches) = load_theme_patches();
+    let bundle = load_theme_patches();
 
     // Skip injection entirely when there's nothing to inject — avoids unnecessary
     // CDP connections, Page.enable, and Page.setBypassCSP that can break page
     // functionality (e.g., Steam agecheck pages).
-    if plugins.is_empty() && patches.is_empty() {
-        crate::log_to_temp("[steamcdp] No plugins or theme patches, skipping injection");
+    if plugins.is_empty() && bundle.is_empty() {
+        crate::log_to_temp("[steamcdp] No plugins or theme data, skipping injection");
         return Ok(());
     }
 
@@ -213,11 +493,11 @@ pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
         pages.len(),
         targets.len(),
         plugins.len(),
-        patches.len()
+        bundle.patches.len()
     ));
 
     for (idx, target) in pages.iter().enumerate() {
-        inject_into_target(client, target, &plugins, &theme_dir, &patches, idx + 1)?;
+        inject_into_target(client, target, &plugins, &bundle, idx + 1)?;
     }
 
     Ok(())
@@ -229,8 +509,7 @@ pub fn inject_into_target(
     client: &mut CdpClient,
     target: &Target,
     plugins: &[crate::plugin::LoadedPlugin],
-    theme_dir: &str,
-    theme_patches: &[ThemePatchEntry],
+    bundle: &ThemeBundle,
     target_num: usize,
 ) -> Result<(), String> {
     crate::log_to_temp(&format!(
@@ -270,93 +549,104 @@ pub fn inject_into_target(
     }
     msg_id += 1;
 
-    // ─── Theme patches: inject <link>/<script type="module"> via VFS URLs ─
-    for patch in theme_patches {
-        let matches_title = regex_matches(&patch.match_regex, &target.title);
-        let matches_url = regex_matches(&patch.match_regex, &target.url);
+    // ─── Theme: window identity (title + <html>/<body> classes) ────────────
+    let identity_expr = r#"JSON.stringify({t:document.title||'',h:(document.documentElement&&document.documentElement.className)||'',b:(document.body&&document.body.className)||''})"#;
+    let (win_title, html_class, body_class) = match client.send_cdp_wait(
+        &json!({
+            "id": msg_id,
+            "method": "Runtime.evaluate",
+            "params": { "expression": identity_expr, "returnByValue": true }
+        }),
+        msg_id,
+    ) {
+        Ok(resp) => {
+            resp.get("result")
+                .and_then(|r| r.get("result"))
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+                .and_then(|v| serde_json::from_str::<Value>(v).ok())
+                .map(|v| {
+                    (
+                        v.get("t").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        v.get("h").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        v.get("b").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    )
+                })
+                .unwrap_or_else(|| (target.title.clone(), String::new(), String::new()))
+        }
+        Err(_) => (target.title.clone(), String::new(), String::new()),
+    };
+    msg_id += 1;
 
-        if !matches_title && !matches_url {
+    // ─── Theme: accent colors, root colors, webkit, slider vars ────────────
+    if !bundle.is_empty() {
+        inject_inline_style(client, &mut msg_id, "SystemAccentColorInject", &accent_css())?;
+        if let Some(ref rc) = bundle.root_colors {
+            match fs::read_to_string(rc) {
+                Ok(css) => inject_inline_style(client, &mut msg_id, "RootColors", &css)?,
+                Err(e) => crate::log_to_temp(&format!(
+                    "[steamcdp] rootColors read error ({}): {}",
+                    rc, e
+                )),
+            }
+        }
+        if let Some(ref css) = bundle.webkit_css {
+            inject_stylesheet(client, &mut msg_id, css)?;
+        }
+        if !bundle.slider_css.is_empty() {
+            inject_inline_style(client, &mut msg_id, "MillenniumSliderConditions", &bundle.slider_css)?;
+        }
+    }
+
+    // ─── Theme patches: inject <link>/<script type="module"> via VFS URLs ─
+    for patch in &bundle.patches {
+        let matches = window_matches(&patch.match_regex, &win_title, &html_class, &body_class, true)
+            || regex_matches(&patch.match_regex, &target.url);
+
+        if !matches {
             continue;
         }
 
-        let matched_by = if matches_title { "title" } else { "url" };
-
-        // CSS: inject <link rel="stylesheet" href="VFS_URL">
+        // CSS: inject <link rel="stylesheet" href="VFS_URL"> (deduped)
         if let Some(ref css_path) = patch.target_css {
-            let vfs_url = path_to_vfs_url(theme_dir, css_path);
-            let script = format!(
-                "(function(){{\
-                    var l=document.createElement('link');\
-                    l.rel='stylesheet';\
-                    l.href='{}';\
-                    (document.head||document.documentElement).appendChild(l);\
-                }})();",
-                vfs_url
-            );
-
-            let resp = client.send_cdp_wait(
-                &json!({
-                    "id": msg_id,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": &script,
-                        "returnByValue": true
-                    }
-                }),
-                msg_id,
-            )?;
-
-            if let Some(err) = resp.get("error") {
-                crate::log_to_temp(&format!(
-                    "[steamcdp] Theme CSS error patch='{}' target#{}: {}",
-                    patch.match_regex, target_num, err
-                ));
-            } else {
-                crate::log_to_temp(&format!(
-                    "[steamcdp] Patch '{}' CSS link injected (matched by {}) target#{}: {}",
-                    patch.match_regex, matched_by, target_num, vfs_url
-                ));
-            }
-            msg_id += 1;
+            let vfs_url = path_to_vfs_url(&bundle.dir, css_path);
+            inject_stylesheet(client, &mut msg_id, &vfs_url)?;
+            crate::log_to_temp(&format!(
+                "[steamcdp] Patch '{}' CSS link injected target#{}: {}",
+                patch.match_regex, target_num, vfs_url
+            ));
         }
 
-        // JS: inject <script type="module" src="VFS_URL">
+        // JS: inject <script type="module" src="VFS_URL"> (deduped)
         if let Some(ref js_path) = patch.target_js {
-            let vfs_url = path_to_vfs_url(theme_dir, js_path);
-            let script = format!(
-                "(function(){{\
-                    var s=document.createElement('script');\
-                    s.type='module';\
-                    s.src='{}';\
-                    (document.head||document.documentElement).appendChild(s);\
-                }})();",
-                vfs_url
-            );
+            let vfs_url = path_to_vfs_url(&bundle.dir, js_path);
+            inject_module_script(client, &mut msg_id, &vfs_url)?;
+            crate::log_to_temp(&format!(
+                "[steamcdp] Patch '{}' JS module injected target#{}: {}",
+                patch.match_regex, target_num, vfs_url
+            ));
+        }
+    }
 
-            let resp = client.send_cdp_wait(
-                &json!({
-                    "id": msg_id,
-                    "method": "Runtime.evaluate",
-                    "params": {
-                        "expression": &script,
-                        "returnByValue": true
-                    }
-                }),
-                msg_id,
-            )?;
-
-            if let Some(err) = resp.get("error") {
-                crate::log_to_temp(&format!(
-                    "[steamcdp] Theme JS error patch='{}' target#{}: {}",
-                    patch.match_regex, target_num, err
-                ));
-            } else {
-                crate::log_to_temp(&format!(
-                    "[steamcdp] Patch '{}' JS module injected (matched by {}) target#{}: {}",
-                    patch.match_regex, matched_by, target_num, vfs_url
-                ));
+    // ─── Conditions: selected value → targetCss/targetJs with affects ──────
+    for cond in &bundle.condition_css {
+        let matched = cond.affects.iter().any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
+        if matched {
+            let vfs_url = path_to_vfs_url(&bundle.dir, &cond.src);
+            inject_stylesheet(client, &mut msg_id, &vfs_url)?;
+            crate::log_to_temp(&format!(
+                "[steamcdp] Condition CSS injected target#{}: {}",
+                target_num, vfs_url
+            ));
+        }
+    }
+    if !bundle.condition_js.is_empty() {
+        for cond in &bundle.condition_js {
+            let matched = cond.affects.iter().any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
+            if matched {
+                let vfs_url = path_to_vfs_url(&bundle.dir, &cond.src);
+                inject_module_script(client, &mut msg_id, &vfs_url)?;
             }
-            msg_id += 1;
         }
     }
 
@@ -531,4 +821,34 @@ pub fn inject_into_target(
     msg_id += 1;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_matches_millennium_semantics() {
+        assert!(window_matches("^Steam$", "Steam", "", "", true));
+        assert!(window_matches("^Steam$", "Steam Games List", "", "", true));
+        assert!(!window_matches("^Steam$", "Steam Games List", "", "", false));
+        assert!(window_matches(
+            ".friendsui-container",
+            "Friends",
+            "",
+            "friendsui-container",
+            false
+        ));
+        assert!(window_matches(".*", "", "", "", false));
+        assert!(!window_matches("^Account", "Steam", "", "", false));
+        assert!(window_matches("^Account", "Account Menu", "", "", false));
+    }
+
+    #[test]
+    fn accent_css_contains_core_vars() {
+        let css = accent_css();
+        assert!(css.contains("--SystemAccentColorAccent: #66c0ff"));
+        assert!(css.contains("--SystemAccentColorLight1: #8fd1ff"));
+        assert!(css.contains("--SystemAccentColor-RGB: 102, 192, 255"));
+    }
 }

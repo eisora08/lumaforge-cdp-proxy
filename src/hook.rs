@@ -376,7 +376,7 @@ fn start_cdp_watch_loop(port: u16) {
                 }
 
                 crate::log_to_temp("[steamcdp] Watching for new targets...");
-                let (theme_dir, theme_patches) = crate::injector::load_theme_patches();
+                let theme_bundle = crate::injector::load_theme_patches();
                 let mut recheck_counter = 0u32;
                 let mut known_urls: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
@@ -475,8 +475,7 @@ fn start_cdp_watch_loop(port: u16) {
                                         &mut client,
                                         t,
                                         &plugins,
-                                        &theme_dir,
-                                        &theme_patches,
+                                        &theme_bundle,
                                         checked as usize,
                                     ) {
                                         crate::log_to_temp(&format!(
@@ -514,8 +513,7 @@ fn start_cdp_watch_loop(port: u16) {
                                         &mut client,
                                         t,
                                         &plugins,
-                                        &theme_dir,
-                                        &theme_patches,
+                                        &theme_bundle,
                                         injected_targets.len() + 1,
                                     ) {
                                         crate::log_to_temp(&format!(
@@ -546,8 +544,7 @@ fn start_cdp_watch_loop(port: u16) {
                                                     &mut client,
                                                     t,
                                                     &plugins,
-                                                    &theme_dir,
-                                                    &theme_patches,
+                                                    &theme_bundle,
                                                     1,
                                                 ) {
                                                     crate::log_to_temp(&format!(

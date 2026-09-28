@@ -33,9 +33,11 @@ fn runtime_dir() -> Option<PathBuf> {
 
 // ─── Export theme data for cef_hook ─────────────────────────────────────────
 
-/// Write the active theme's resolved data to disk so cef_hook can consume it.
+/// Write the active theme's resolved data to disk so the CDP injection path
+/// (injector.rs, used by the Linux hook) can consume it.
 /// Produces: theme-manifest.json (patches, webkit, root_colors, conditions)
-/// The cef_hook reads this file instead of trying to parse skin.json itself.
+/// NOTE: cef_hook (Windows) does NOT read this file — it parses skin.json and
+/// active.json directly from the themes dir.
 pub fn export_theme_for_cef_hook() -> Result<(), String> {
     let theme = load_active_theme().ok_or("No active theme found")?;
     let runtime = runtime_dir().ok_or("No LOCALAPPDATA")?;
@@ -73,24 +75,42 @@ pub fn export_theme_for_cef_hook() -> Result<(), String> {
         })
         .collect();
 
-    // Auto-generate default patches for Millennium-compatible themes
+    // Auto-generate default patches — same list as Millennium's ThemeParser.ts
+    // (mirrors cef_hook get_default_patches; elements/*.css enter through
+    // @import inside libraryroot.custom.css, so no per-element entries here)
     if use_defaults && patches.is_empty() {
+        let lib = ("libraryroot.custom.css", Some("libraryroot.custom.js"));
         let defaults: Vec<(&str, Option<&str>, Option<&str>)> = vec![
-            (".*", Some("elements/config.css"), None),
-            ("^Steam$", Some("libraryroot.custom.css"), None),
-            ("^Steam$", Some("elements/sidebar.css"), None),
-            ("^Steam$", Some("elements/library.css"), None),
-            ("^Steam$", Some("elements/gamepage.css"), None),
-            ("^Steam$", Some("elements/downloads.css"), None),
-            (".friendsui-container", Some("friends.custom.css"), None),
+            ("^Steam$", Some(lib.0), lib.1),
+            ("^OverlayBrowser_Browser$", Some(lib.0), lib.1),
+            ("^SP Overlay:", Some(lib.0), lib.1),
+            ("Menu$", Some(lib.0), lib.1),
+            ("Supernav$", Some(lib.0), lib.1),
+            ("^notificationtoasts_", Some(lib.0), lib.1),
+            ("^SteamBrowser_Find$", Some(lib.0), lib.1),
+            ("^OverlayTab\\d+_Find$", Some(lib.0), lib.1),
             (
-                "^notificationtoasts_",
-                Some("elements/notifications.css"),
-                None,
+                "^Steam Big Picture Mode$",
+                Some("bigpicture.custom.css"),
+                Some("bigpicture.custom.js"),
             ),
-            (".*", Some("elements/scrollbar.css"), None),
-            (".*", Some("elements/overlay.css"), None),
-            (".*", Some("elements/miniprofile.css"), None),
+            (
+                "^QuickAccess_",
+                Some("bigpicture.custom.css"),
+                Some("bigpicture.custom.js"),
+            ),
+            (
+                "^MainMenu_",
+                Some("bigpicture.custom.css"),
+                Some("bigpicture.custom.js"),
+            ),
+            (
+                ".friendsui-container",
+                Some("friends.custom.css"),
+                Some("friends.custom.js"),
+            ),
+            (".ModalDialogPopup", Some(lib.0), lib.1),
+            (".FullModalOverlay", Some(lib.0), lib.1),
         ];
 
         for (regex, css_opt, js_opt) in defaults {
@@ -666,11 +686,26 @@ impl ThemeConditionConfig {
         let base = themes_base_dir().ok_or("No themes base dir")?;
         let active_path = base.join("active.json");
 
-        let raw =
-            fs::read_to_string(&active_path).map_err(|e| format!("read active.json: {}", e))?;
-        let content = raw.trim_start_matches('\u{FEFF}');
-        let mut parsed: Value =
-            serde_json::from_str(&content).map_err(|e| format!("parse active.json: {}", e))?;
+        // Create active.json when it doesn't exist yet (fresh install): seed it
+        // with the first installed theme so conditions have somewhere to land.
+        let mut parsed: Value = match fs::read_to_string(&active_path) {
+            Ok(raw) => {
+                let content = raw.trim_start_matches('\u{FEFF}');
+                serde_json::from_str(content).map_err(|e| format!("parse active.json: {}", e))?
+            }
+            Err(_) => {
+                let first = list_available_themes().into_iter().next();
+                let mut themes = serde_json::Map::new();
+                if let Some(name) = first {
+                    themes.insert("activeTheme".into(), Value::String(name));
+                }
+                themes.insert("conditions".into(), Value::Object(serde_json::Map::new()));
+                Value::Object(serde_json::Map::from_iter([("themes".into(), Value::Object(themes))]))
+            }
+        };
+        if !parsed.is_object() {
+            parsed = Value::Object(serde_json::Map::new());
+        }
 
         // Build the conditions object from our selections
         let mut conditions_obj = serde_json::Map::new();
@@ -682,7 +717,10 @@ impl ThemeConditionConfig {
             conditions_obj.insert(theme.clone(), Value::Object(conds));
         }
 
-        // Insert into themes.conditions
+        // Insert into themes.conditions (create the "themes" object if missing)
+        if parsed.get("themes").and_then(|t| t.as_object()).is_none() {
+            parsed["themes"] = Value::Object(serde_json::Map::new());
+        }
         if let Some(themes) = parsed.get_mut("themes") {
             themes["conditions"] = Value::Object(conditions_obj);
         }
