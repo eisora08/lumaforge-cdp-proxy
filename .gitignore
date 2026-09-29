@@ -116,3 +116,11 @@ crash-logs/
 hook/target/
 hook/Cargo.lock
 pvs_shim/pvs_shim
+
+# ============================================================================
+# Local session notes (never committed)
+# ============================================================================
+
+agents.md
+AGENTS.md
+PLAN.md
