@@ -12,19 +12,42 @@ Access-Control-Max-Age: 86400\r\n";
 
 pub fn start_bridge_server() {
     std::thread::spawn(|| {
-        // Try primary port first, fall back to 21776
-        let listener = match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT)) {
-            Ok(l) => {
-                crate::log_to_temp(&format!(
-                    "[bridge] Mini-bridge listening on port {}",
-                    BRIDGE_PORT
-                ));
-                l
+        // Try primary port first, fall back to 21776. Retry the primary a few
+        // times: on Windows a flood of short-lived connections leaves the port
+        // in TIME_WAIT after a Steam restart, which makes a single bind() fail
+        // even though no listener exists (the sockets expire within ~2min).
+        let mut listener = None;
+        let mut primary_err = String::new();
+        for attempt in 0..5 {
+            match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT)) {
+                Ok(l) => {
+                    crate::log_to_temp(&format!(
+                        "[bridge] Mini-bridge listening on port {} (attempt {})",
+                        BRIDGE_PORT,
+                        attempt + 1
+                    ));
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) => {
+                    primary_err = e.to_string();
+                    crate::log_to_temp(&format!(
+                        "[bridge] Port {} bind failed (attempt {}): {}",
+                        BRIDGE_PORT,
+                        attempt + 1,
+                        e
+                    ));
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
             }
-            Err(e) => {
+        }
+
+        let listener = match listener {
+            Some(l) => l,
+            None => {
                 crate::log_to_temp(&format!(
-                    "[bridge] Port {} in use, trying fallback port {}: {}",
-                    BRIDGE_PORT, BRIDGE_PORT_FALLBACK, e
+                    "[bridge] Port {} still in use after retries ({}), trying fallback port {}",
+                    BRIDGE_PORT, primary_err, BRIDGE_PORT_FALLBACK
                 ));
                 match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT_FALLBACK)) {
                     Ok(l) => {
@@ -37,7 +60,7 @@ pub fn start_bridge_server() {
                     Err(e2) => {
                         crate::log_to_temp(&format!(
                             "[bridge] Failed to bind both ports {} and {}: {}, {}",
-                            BRIDGE_PORT, BRIDGE_PORT_FALLBACK, e, e2
+                            BRIDGE_PORT, BRIDGE_PORT_FALLBACK, primary_err, e2
                         ));
                         return;
                     }
@@ -242,6 +265,14 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return handle_open_url(body);
     }
 
+    // Downloads queue routes — cross-platform: the queue/history CRUD lives in
+    // depot_downloader without platform gates, and the sidebar's Downloads tab
+    // (history included) must not 404 on Windows where handle_depot_route is
+    // compiled out.
+    if let Some(resp) = handle_downloads_queue_route(method, &clean_path, body) {
+        return resp;
+    }
+
     // Depot download routes (Linux only)
     #[cfg(target_os = "linux")]
     {
@@ -406,6 +437,77 @@ fn handle_providers() -> (u16, String) {
 }
 
 // ---------------------------------------------------------------------------
+// Downloads queue routes (cross-platform: queue CRUD + history, no platform
+// gates — used by the sidebar Downloads tab on every OS)
+// ---------------------------------------------------------------------------
+
+fn handle_downloads_queue_route(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
+    use crate::depot_downloader;
+
+    if path == "/api/downloads-queue" && method == "GET" {
+        let qf = depot_downloader::get_queue();
+        Some((
+            200,
+            json!({"ok": true, "queue": qf.queue, "history": qf.history}).to_string(),
+        ))
+    } else if path == "/api/downloads-queue/add" && method == "POST" {
+        let parsed: Result<crate::depot_downloader::QueueItem, _> = serde_json::from_str(body);
+        match parsed {
+            Ok(item) => {
+                let id = depot_downloader::add_to_queue(item);
+                Some((200, json!({"ok": true, "id": id}).to_string()))
+            }
+            Err(e) => Some((
+                400,
+                json!({"ok": false, "message": format!("Invalid: {e}")}).to_string(),
+            )),
+        }
+    } else if path.starts_with("/api/downloads-queue/remove/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/remove/");
+        let ok = depot_downloader::remove_from_queue(id);
+        Some((200, json!({"ok": ok}).to_string()))
+    } else if path.starts_with("/api/downloads-queue/pause/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/pause/");
+        match depot_downloader::pause_queue_item(id) {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path.starts_with("/api/downloads-queue/resume/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/resume/");
+        match depot_downloader::resume_queue_item(id) {
+            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
+            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
+        }
+    } else if path == "/api/downloads-queue/start-next" && method == "POST" {
+        depot_downloader::start_next();
+        Some((200, json!({"ok": true}).to_string()))
+    } else if path == "/api/downloads-queue/clear-history" && method == "POST" {
+        depot_downloader::clear_history();
+        Some((200, json!({"ok": true}).to_string()))
+    } else if path.starts_with("/api/downloads-queue/remove-history/") && method == "POST" {
+        let id = path.trim_start_matches("/api/downloads-queue/remove-history/");
+        let ok = depot_downloader::remove_history_item(id);
+        Some((200, json!({"ok": ok}).to_string()))
+    } else if path == "/api/downloads-queue/history" && method == "POST" {
+        // Sidebar pushes its local (store-origin) history here so every
+        // surface — including the library window — can render it.
+        let parsed: Result<Vec<crate::depot_downloader::HistoryItem>, _> = serde_json::from_str(body);
+        match parsed {
+            Ok(items) => {
+                let added = depot_downloader::add_history_items(items);
+                Some((200, json!({"ok": true, "added": added}).to_string()))
+            }
+            Err(e) => Some((
+                400,
+                json!({"ok": false, "message": format!("Invalid history: {e}")}).to_string(),
+            )),
+        }
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Depot download routes (Linux only)
 // ---------------------------------------------------------------------------
 
@@ -483,44 +585,6 @@ fn handle_depot_route(method: &str, path: &str, body: &str) -> Option<(u16, Stri
         } else {
             Some((400, json!({"ok": false, "message": "Invalid appId"}).to_string()))
         }
-    } else if path == "/api/downloads-queue" && method == "GET" {
-        let qf = depot_downloader::get_queue();
-        Some((200, json!({"ok": true, "queue": qf.queue, "history": qf.history}).to_string()))
-    } else if path == "/api/downloads-queue/add" && method == "POST" {
-        let parsed: Result<crate::depot_downloader::QueueItem, _> = serde_json::from_str(body);
-        match parsed {
-            Ok(item) => {
-                let id = depot_downloader::add_to_queue(item);
-                Some((200, json!({"ok": true, "id": id}).to_string()))
-            }
-            Err(e) => Some((400, json!({"ok": false, "message": format!("Invalid: {e}")}).to_string()))
-        }
-    } else if path.starts_with("/api/downloads-queue/remove/") && method == "POST" {
-        let id = path.trim_start_matches("/api/downloads-queue/remove/");
-        let ok = depot_downloader::remove_from_queue(id);
-        Some((200, json!({"ok": ok}).to_string()))
-    } else if path.starts_with("/api/downloads-queue/pause/") && method == "POST" {
-        let id = path.trim_start_matches("/api/downloads-queue/pause/");
-        match depot_downloader::pause_queue_item(id) {
-            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
-            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
-        }
-    } else if path.starts_with("/api/downloads-queue/resume/") && method == "POST" {
-        let id = path.trim_start_matches("/api/downloads-queue/resume/");
-        match depot_downloader::resume_queue_item(id) {
-            Ok(ok) => Some((200, json!({"ok": ok}).to_string())),
-            Err(e) => Some((200, json!({"ok": false, "message": e}).to_string())),
-        }
-    } else if path == "/api/downloads-queue/start-next" && method == "POST" {
-        depot_downloader::start_next();
-        Some((200, json!({"ok": true}).to_string()))
-    } else if path == "/api/downloads-queue/clear-history" && method == "POST" {
-        depot_downloader::clear_history();
-        Some((200, json!({"ok": true}).to_string()))
-    } else if path.starts_with("/api/downloads-queue/remove-history/") && method == "POST" {
-        let id = path.trim_start_matches("/api/downloads-queue/remove-history/");
-        let ok = depot_downloader::remove_history_item(id);
-        Some((200, json!({"ok": ok}).to_string()))
     } else {
         None
     }

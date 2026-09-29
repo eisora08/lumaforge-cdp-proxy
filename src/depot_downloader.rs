@@ -380,6 +380,9 @@ pub struct QueueFile {
     pub history: Vec<HistoryItem>,
 }
 
+/// Cap for merged history (depot completions + sidebar-pushed local entries).
+const HISTORY_CAP: usize = 30;
+
 #[derive(Debug, Clone)]
 struct JobState {
     job_id: String,
@@ -1638,11 +1641,9 @@ pub fn on_download_complete(queue_id: &str, error: &str) {
         error: if is_error { Some(error.to_string()) } else { None },
     };
 
-    // Keep only last 20 history items
+    // Keep only last HISTORY_CAP history items
     qf.history.insert(0, history_item);
-    if qf.history.len() > 20 {
-        qf.history.truncate(20);
-    }
+    qf.history.truncate(HISTORY_CAP);
 
     save_queue(&qf);
 
@@ -1699,4 +1700,30 @@ pub fn remove_history_item(id: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Merge sidebar-pushed local history entries (store-origin localStorage) into
+/// the queue file so every surface (library window too) can show them.
+/// Add-only by id: existing entries are never overwritten, then the merged
+/// list is sorted newest-first and capped.
+pub fn add_history_items(items: Vec<HistoryItem>) -> usize {
+    let mut qf = load_queue();
+    let mut added = 0usize;
+    for mut it in items {
+        if it.game_name.is_empty() {
+            it.game_name = format!("App {}", it.app_id);
+        }
+        if qf.history.iter().any(|h| h.id == it.id) {
+            continue;
+        }
+        qf.history.push(it);
+        added += 1;
+    }
+    if added == 0 {
+        return 0;
+    }
+    qf.history.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+    qf.history.truncate(HISTORY_CAP);
+    save_queue(&qf);
+    added
 }
