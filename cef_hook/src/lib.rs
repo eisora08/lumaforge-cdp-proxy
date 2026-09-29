@@ -286,8 +286,28 @@ struct SkinCondition {
     values: Option<Value>,
     #[serde(default)]
     slider: Option<SkinSlider>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_or_number")]
     default: Option<String>,
+}
+
+/// Millennium accepts `default` as either a JSON string or number
+/// (see theme_cfg.cc setup_conditionals: is_string / is_number branches).
+fn de_string_or_number<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "condition default must be string or number, got {}",
+                other
+            )))
+        }
+    })
 }
 
 // ─── Default patches (same as Millennium ThemeParser.ts) ────────────────────
@@ -588,25 +608,43 @@ fn load_theme_manifest(state: &mut ThemeState) {
                 let saved_val = saved_conditions
                     .and_then(|sc| sc.get(cond_name))
                     .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok())));
-                if let (Some(ref var_name), Some(val)) = (&slider.css_variable, saved_val)
-                {
+                // Millennium seed order (theme_cfg.cc setup_conditionals):
+                // saved -> condition-level default (string|number) -> slider.min -> 0
+                let fallback_val = cond
+                    .default
+                    .as_deref()
+                    .and_then(|d| d.parse::<f64>().ok())
+                    .or(slider.min)
+                    .unwrap_or(0.0);
+                if let Some(ref var_name) = &slider.css_variable {
+                    let val = saved_val.unwrap_or(fallback_val);
                     let unit = slider.unit.as_deref().unwrap_or("");
                     slider_vars.push((var_name.clone(), format!("{}{}", val, unit)));
-                } else if let (Some(ref var_name), Some(default_val)) = (&slider.css_variable, slider.default_value) {
-                    let unit = slider.unit.as_deref().unwrap_or("");
-                    slider_vars.push((var_name.clone(), format!("{}{}", default_val, unit)));
                 }
                 continue;
             }
 
             // Dropdown condition — resolve selected value → TargetCss/TargetJs with affects
-            if !selected.is_empty() {
-                if let Some(values) = cond.values.as_ref().and_then(|v| v.as_object()) {
-                    if let Some(val_obj) = values.get(selected) {
-                        let entry: ConditionValue = match serde_json::from_value(val_obj.clone()) {
-                            Ok(e) => e,
-                            Err(_) => continue,
-                        };
+            if let Some(values) = cond.values.as_ref().and_then(|v| v.as_object()) {
+                // Millennium validates: selected must exist in values, otherwise
+                // fall back to condition default, otherwise the first value key.
+                let mut selected_owned = selected.to_string();
+                if !values.contains_key(&selected_owned) {
+                    selected_owned = cond
+                        .default
+                        .clone()
+                        .filter(|d| values.contains_key(d))
+                        .or_else(|| values.keys().next().cloned())
+                        .unwrap_or_default();
+                }
+                if selected_owned.is_empty() {
+                    continue;
+                }
+                if let Some(val_obj) = values.get(&selected_owned) {
+                    let entry: ConditionValue = match serde_json::from_value(val_obj.clone()) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
 
                         if let Some(ref target_css) = entry.target_css {
                             let affects = target_css.affects.clone().unwrap_or_default();
@@ -626,7 +664,6 @@ fn load_theme_manifest(state: &mut ThemeState) {
                                 }
                             }
                         }
-                    }
                 }
             }
         }
@@ -3496,5 +3533,58 @@ mod import_expand_tests {
             out
         );
         assert!(!out.contains("lumaforge.local"), "{}", out);
+    }
+}
+
+#[cfg(test)]
+mod condition_default_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_condition_default_parses_to_string() {
+        let v: Value = serde_json::json!({
+            "default": 8,
+            "slider": { "cssVariable": "--st-border-radius", "min": 0, "max": 16, "step": 1, "unit": "px" }
+        });
+        let cond: SkinCondition = serde_json::from_value(v).expect("numeric default must parse");
+        assert_eq!(cond.default.as_deref(), Some("8"));
+        assert!(cond.slider.is_some());
+    }
+
+    #[test]
+    fn string_condition_default_parses() {
+        let v: Value = serde_json::json!({ "default": "yes", "values": { "no": {}, "yes": {} } });
+        let cond: SkinCondition = serde_json::from_value(v).expect("string default must parse");
+        assert_eq!(cond.default.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn spacetheme_skin_json_parses_all_conditions() {
+        let path = std::path::PathBuf::from(
+            r"C:\Users\einey.J4F\AppData\Local\LumaForge\themes\Steam\skin.json",
+        );
+        if !path.exists() {
+            eprintln!("Skipping test: Steam skin.json not installed");
+            return;
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let manifest: SkinJson = serde_json::from_str(&content).unwrap();
+        assert_eq!(manifest.patches.len(), 14);
+        assert!(manifest.root_colors.is_some());
+        assert!(manifest.steam_webkit.is_some());
+        // Every condition must parse (numeric slider defaults used to drop the
+        // whole condition via Option<String>).
+        let conds = manifest.conditions.as_ref().and_then(|c| c.as_object()).unwrap();
+        assert!(conds.len() > 40, "expected full Conditions block, got {}", conds.len());
+        let mut sliders = 0;
+        for (name, c) in conds {
+            let cond: SkinCondition = serde_json::from_value(c.clone())
+                .unwrap_or_else(|e| panic!("condition '{}' failed to parse: {}", name, e));
+            if cond.slider.is_some() {
+                sliders += 1;
+                assert!(cond.default.is_some(), "slider '{}' missing numeric default", name);
+            }
+        }
+        assert_eq!(sliders, 3, "Border radius / Mica Transparency / Max Width");
     }
 }
