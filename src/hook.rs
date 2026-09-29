@@ -393,8 +393,23 @@ fn start_cdp_watch_loop(port: u16) {
                     recheck_counter += 1;
 
                     // Drain bridge proxy queue every cycle (~1s) so extension fetch
-                    // requests are fulfilled within the 15s JS timeout
-                    drain_bridge_queue(&mut client, &injected_targets);
+                    // requests are fulfilled within the JS timeout. Only real Steam
+                    // pages carry BRIDGE_PROXY_JS — context menus/supernavs/shared
+                    // contexts always return an empty queue, and evaluating them
+                    // every second used to dominate the cycle time.
+                    let drain_ids: std::collections::HashSet<String> = match client.get_targets() {
+                        Ok(ts) => ts
+                            .iter()
+                            .filter(|t| {
+                                t.target_type == "page"
+                                    && injected_targets.contains(&t.id)
+                                    && crate::injector::is_real_steam_page(&t.url)
+                            })
+                            .map(|t| t.id.clone())
+                            .collect(),
+                        Err(_) => std::collections::HashSet::new(),
+                    };
+                    drain_bridge_queue(&mut client, &drain_ids);
 
                     // Every 30s, re-evaluate diagnostic on ALL injected targets to
                     // catch SPA navigations. Store pages are checked first.

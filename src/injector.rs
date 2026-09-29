@@ -440,17 +440,32 @@ pub const BRIDGE_PROXY_JS: &str = r#"
       window.__lumaBridgeQueue.push({id:id, url:urlStr, method:method, body:body, headers:headers});
       return new Promise(function(resolve, reject) {
         var elapsed = 0;
+        var signal = opts && opts.signal;
+        if (signal && signal.aborted) {
+          var ab0 = new Error('Aborted'); ab0.name = 'AbortError'; reject(ab0); return;
+        }
+        var onAbort = function() {
+          clearInterval(iv);
+          if (signal && signal.removeEventListener) signal.removeEventListener('abort', onAbort);
+          var ab = new Error('Aborted'); ab.name = 'AbortError'; reject(ab);
+        };
+        if (signal) {
+          if (signal.addEventListener) signal.addEventListener('abort', onAbort);
+          else signal.onabort = onAbort;
+        }
         var iv = setInterval(function() {
           elapsed += 100;
           if (window.__lumaBridgeResults[id]) {
             clearInterval(iv);
+            if (signal && signal.removeEventListener) signal.removeEventListener('abort', onAbort);
             var r = window.__lumaBridgeResults[id];
             delete window.__lumaBridgeResults[id];
             var h = new Headers();
             if (r.headers) { for (var k in r.headers) h.set(k, r.headers[k]); }
             resolve(new Response(r.body || '', {status: r.status || 200, statusText: r.statusText || 'OK', headers: h}));
-          } else if (elapsed > 15000) {
+          } else if (elapsed > 8000) {
             clearInterval(iv);
+            if (signal && signal.removeEventListener) signal.removeEventListener('abort', onAbort);
             reject(new Error('Bridge proxy timeout'));
           }
         }, 100);

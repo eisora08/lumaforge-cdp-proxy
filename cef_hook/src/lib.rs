@@ -152,6 +152,12 @@ struct LoadedPlugin {
     name: String,
     code: String,
     target_url: Option<String>,
+    /// Relative path (under LumaForge/plugins) of the inject script, used to
+    /// build the VFS URL for runtime injection into steamloopback documents.
+    vfs_rel: Option<String>,
+    /// If set, the plugin is also injected at runtime (fetch via VFS) into
+    /// documents whose location.href contains this substring (library window).
+    runtime_target_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -793,15 +799,38 @@ fn load_plugins(state: &mut ThemeState) {
                     .map(|s| s.to_string())
             });
 
+        let runtime_target_url = cef_config
+            .and_then(|c| {
+                c.get("runtimeTargetUrl")
+                    .or_else(|| c.get("runtime_target_url"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
+        let inject_script_rel = cef_config
+            .and_then(|c| {
+                c.get("injectScript")
+                    .or_else(|| c.get("inject_script"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
         let code = match fs::read_to_string(&inject_path) {
             Ok(s) => s,
             Err(_) => continue,
+        };
+
+        let vfs_rel = match (entry.file_name().to_str(), inject_script_rel.as_deref()) {
+            (Some(dir_name), Some(rel)) => Some(format!("{}/{}", dir_name, rel.replace('\\', "/"))),
+            _ => None,
         };
 
         state.plugins.push(LoadedPlugin {
             name: plugin_id.to_string(),
             code,
             target_url,
+            vfs_rel,
+            runtime_target_url,
         });
     }
 }
@@ -828,6 +857,32 @@ fn guess_mime_type(path: &str) -> &str {
 fn handle_vfs_request(url: &str, theme_state: &ThemeState) -> Result<Vec<u8>, ()> {
     // URL format: https://lumaforge.local/themes/<relative_path>
     // or: https://lumaforge.local/<relative_path> (with theme_dir as base)
+    // or: https://lumaforge.local/plugins/<dir>/<file> (plugin scripts)
+
+    // Plugin scripts (checked before the theme fallback prefix, which would
+    // otherwise swallow "plugins/..." as a theme-relative path).
+    let plugins_prefix = format!("https://{}/plugins/", VFS_HOST);
+    if let Some(rest) = url.strip_prefix(&plugins_prefix) {
+        let cut = rest.find(|c| c == '?' || c == '#').unwrap_or(rest.len());
+        let decoded = percent_decode(&rest[..cut]);
+        if decoded.contains("..") {
+            return Err(());
+        }
+        let base = match std::env::var("LOCALAPPDATA") {
+            Ok(s) => PathBuf::from(s).join("LumaForge").join("plugins"),
+            Err(_) => return Ok(Vec::new()),
+        };
+        let file_path = base.join(&decoded);
+        log_to_temp(&format!("[cef_hook] VFS plugins: {} -> {}", url, file_path.display()));
+        return match fs::read(&file_path) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                log_to_temp(&format!("[cef_hook] VFS plugins read error: {} -> {}", file_path.display(), e));
+                Ok(Vec::new())
+            }
+        };
+    }
+
     let prefix = format!("https://{}/themes/", VFS_HOST);
     let fallback_prefix = format!("https://{}/", VFS_HOST);
 
@@ -940,6 +995,21 @@ fn window_matches(pattern: &str, title: &str, html_class: &str, body_class: &str
 
 // ─── Theme injection ────────────────────────────────────────────────────────
 
+/// ssh-bridge: maps theme CSS vars to the steam-store-helper plugin's
+/// --luma-ssh-* family. Emitted twice: inline by the HTML interceptor (store
+/// pages) and as a runtime style by build_theme_js -> injectDoc (internal
+/// windows: library, popups). Color-format fallbacks only; RGB triplet vars
+/// (e.g. SpaceTheme --st-accent-1) are handled by the extension's runtime
+/// resolveThemeColors() which sets inline overrides (inline wins the cascade
+/// over both this block and the plugin's own :root defaults).
+const SSH_BRIDGE_CSS: &str = ":root {\n  \
+     --luma-ssh-accent: var(--accent-color, var(--fill-color-accent-secondary, var(--SystemAccentColor, #66c0ff)));\n  \
+     --luma-ssh-bg-panel: var(--background-fill-color-mica-background-base, #1b2838);\n  \
+     --luma-ssh-text-primary: var(--fill-color-text-primary, #fff);\n  \
+     --luma-ssh-text: var(--fill-color-text-secondary, #c7d5e0);\n  \
+     --luma-ssh-text-muted: var(--fill-color-subtle-secondary, #8f98a0);\n\
+     }";
+
 fn build_vfs_css_url(theme_dir: &str, file_path: &str) -> String {
     // Extract the path relative to the theme dir
     let theme_dir_path = PathBuf::from(theme_dir);
@@ -982,17 +1052,13 @@ fn inject_theme_html(
 
     // 1b. Bridge: map theme-specific CSS vars to --luma-ssh-* plugin vars
     //     Uses var() with fallbacks so themes that don't define these still work.
-    head_inject.push_str(
-        "<style data-lumaforge=\"ssh-bridge\">\n\
-         :root {\n\
-           --luma-ssh-accent: var(--fill-color-accent-secondary, var(--st-accent-1, #66c0ff));\n\
-           --luma-ssh-bg-panel: var(--background-fill-color-mica-background-base, #1b2838);\n\
-           --luma-ssh-text-primary: var(--fill-color-text-primary, #fff);\n\
-           --luma-ssh-text: var(--fill-color-text-secondary, #c7d5e0);\n\
-           --luma-ssh-text-muted: var(--fill-color-subtle-secondary, #8f98a0);\n\
-         }\n\
-         </style>\n"
-    );
+    //     Note: color-format vars only here (RGB triplets like --st-accent-1
+    //     can't be wrapped by var() chains — the extension's runtime
+    //     resolveThemeColors() handles those with inline overrides).
+    head_inject.push_str(&format!(
+        "<style id=\"LumaSshBridge\" data-lumaforge=\"ssh-bridge\">\n{}\n</style>\n",
+        SSH_BRIDGE_CSS
+    ));
 
     // 2. Webkit CSS (global - injected into ALL documents)
     if let Some(ref webkit_css) = theme_state.webkit_css_path {
@@ -1264,6 +1330,7 @@ fn recv_cdp_response(
 // ─── Bridge (unchanged) ─────────────────────────────────────────────────────
 
 const BRIDGE_SHIM_JS: &str = r#"(function(){
+  if (window.__luma_bridge_call) return;
   var _cid=0,_p={};
   window.__luma_bridge_resolve=function(id,json){
     var p=_p[id];if(p){delete _p[id];
@@ -1271,7 +1338,7 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
         json:function(){return Promise.resolve(typeof json==='string'?JSON.parse(json):json)},
         text:function(){return Promise.resolve(typeof json==='string'?json:JSON.stringify(json))},
         clone:function(){return resp}};
-      p(resp);}
+      p.resolve(resp);}
   };
   window.__luma_bridge_reject=function(id,err){
     var p=_p[id];if(p){delete _p[id];p.reject(new Error(err))}
@@ -1279,7 +1346,15 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
   window.__luma_bridge_call=function(path,opts){
     var id=++_cid;
     return new Promise(function(resolve,reject){
-      _p[id]={resolve:resolve,reject:reject};
+      // Safety net: if the native side never resolves (CDP error, detach),
+      // fail instead of hanging the page's fetch forever.
+      var t=setTimeout(function(){
+        if(_p[id]){delete _p[id];reject(new Error('bridge timeout'));}
+      },10000);
+      _p[id]={
+        resolve:function(r){clearTimeout(t);resolve(r);},
+        reject:function(e){clearTimeout(t);reject(e instanceof Error?e:new Error(e));}
+      };
       var body=(opts&&opts.body)?(typeof opts.body==='string'?opts.body:JSON.stringify(opts.body)):null;
       var payload=JSON.stringify({id:id,path:path,method:(opts&&opts.method)||'GET',body:body});
       window.__lumaNativeBridge(payload);
@@ -1298,21 +1373,41 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
 })();"#;
 
 fn proxy_bridge_request(path: &str, method: &str, body: Option<&str>) -> Result<String, String> {
-    let mut stream = TcpStream::connect("127.0.0.1:21775").map_err(|e| format!("connect: {}", e))?;
+    let mut last_err = String::new();
+    // Bridge may bind the primary port or fall back (e.g. TIME_WAIT after a
+    // flood of connections leaves 21775 unbindable) — try both.
+    for port in [21775u16, 21776] {
+        match proxy_bridge_request_on(path, method, body, port) {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+fn proxy_bridge_request_on(
+    path: &str,
+    method: &str,
+    body: Option<&str>,
+    port: u16,
+) -> Result<String, String> {
+    let addr = format!("127.0.0.1:{}", port);
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect({}): {}", addr, e))?;
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
     let method_upper = method.to_uppercase();
     let req = match body {
         Some(body_str) => format!(
-            "{} {} HTTP/1.1\r\nHost: 127.0.0.1:21775\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             method_upper,
             path,
+            addr,
             body_str.as_bytes().len(),
             body_str
         ),
         None => format!(
-            "{} {} HTTP/1.1\r\nHost: 127.0.0.1:21775\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-            method_upper, path
+            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            method_upper, path, addr
         ),
     };
 
@@ -1341,6 +1436,8 @@ fn handle_bridge_binding(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
     payload: &str,
+    sid: Option<&str>,
+    ecid: Option<i64>,
 ) {
     let req: Value = match serde_json::from_str(payload) {
         Ok(v) => v,
@@ -1351,65 +1448,118 @@ fn handle_bridge_binding(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
     let body = req.get("body").and_then(|b| b.as_str());
 
+    // callFunctionOn requires an explicit target: use the execution context the
+    // binding fired from (also correct when the shim runs inside an iframe).
+    let mut call_fn_on = |func: &str, args: Value| {
+        let mut params = json!({ "functionDeclaration": func, "arguments": args });
+        if let Some(e) = ecid {
+            params["executionContextId"] = json!(e);
+        }
+        let mut msg = json!({
+            "id": *msg_id,
+            "method": "Runtime.callFunctionOn",
+            "params": params
+        });
+        if let Some(s) = sid {
+            msg["sessionId"] = json!(s);
+        }
+        *msg_id += 1;
+        send_cdp(socket, &msg);
+    };
+
     let result_json = match proxy_bridge_request(path, method, body) {
         Ok(body) => body,
         Err(e) => {
-            let reject_fn = json!({
-                "id": *msg_id,
-                "method": "Runtime.callFunctionOn",
-                "params": {
-                    "functionDeclaration": "(function(id, err) { window.__luma_bridge_reject(id, err); })",
-                    "arguments": [
-                        {"type": "number", "value": call_id},
-                        {"type": "string", "value": &e}
-                    ]
-                }
-            });
-            *msg_id += 1;
-            send_cdp(socket, &reject_fn);
+            call_fn_on(
+                "(function(id, err) { window.__luma_bridge_reject(id, err); })",
+                json!([
+                    {"type": "number", "value": call_id},
+                    {"type": "string", "value": &e}
+                ]),
+            );
             return;
         }
     };
 
-    let resolve_fn = json!({
-        "id": *msg_id,
-        "method": "Runtime.callFunctionOn",
-        "params": {
-            "functionDeclaration": "(function(id, json) { window.__luma_bridge_resolve(id, json); })",
-            "arguments": [
-                {"type": "number", "value": call_id},
-                {"type": "string", "value": &result_json}
-            ]
-        }
-    });
-    *msg_id += 1;
-    send_cdp(socket, &resolve_fn);
+    call_fn_on(
+        "(function(id, json) { window.__luma_bridge_resolve(id, json); })",
+        json!([
+            {"type": "number", "value": call_id},
+            {"type": "string", "value": &result_json}
+        ]),
+    );
 }
 
-fn install_bridge_shim(
+/// Install the native bridge shim into ONE target session.
+///
+/// Browser-level (sessionId-less) `Page.*`/`Runtime.*` commands are rejected by
+/// this CEF build ("wasn't found" — see register_session_theme), so every
+/// command here must carry the target's sessionId. Without this the shim never
+/// ran: `__luma_bridge_call` stayed undefined and every extension fetch fell
+/// back to the 1s CDP drain queue (slow "Loading..." tabs in the store).
+///
+/// * `register_for_new_docs` — also register addScriptToEvaluateOnNewDocument
+///   so future documents in this session start with the shim (attach-time).
+///   Re-sending it on every navigation would accumulate duplicate scripts, so
+///   frameNav re-ensure calls pass `false` and only evaluate into the fresh
+///   document (BRIDGE_SHIM_JS is idempotent).
+fn install_bridge_shim_session(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
+    sid: &str,
+    register_for_new_docs: bool,
 ) {
+    // bindingCalled events are only delivered when Runtime is enabled on the session.
+    let runtime_enable = json!({
+        "id": *msg_id,
+        "method": "Runtime.enable",
+        "params": {},
+        "sessionId": sid
+    });
+    *msg_id += 1;
+    if !send_cdp(socket, &runtime_enable) {
+        return;
+    }
+
     let add_binding = json!({
         "id": *msg_id,
         "method": "Runtime.addBinding",
-        "params": {"name": "__lumaNativeBridge"}
+        "params": {"name": "__lumaNativeBridge"},
+        "sessionId": sid
     });
     *msg_id += 1;
     if !send_cdp(socket, &add_binding) {
         return;
     }
 
-    let add_script = json!({
+    if register_for_new_docs {
+        let add_script = json!({
+            "id": *msg_id,
+            "method": "Page.addScriptToEvaluateOnNewDocument",
+            "params": {
+                "source": BRIDGE_SHIM_JS,
+                "runImmediately": true
+            },
+            "sessionId": sid
+        });
+        *msg_id += 1;
+        send_cdp(socket, &add_script);
+    }
+
+    // Cover the document that is already loaded right now.
+    let eval = json!({
         "id": *msg_id,
-        "method": "Page.addScriptToEvaluateOnNewDocument",
-        "params": {
-            "source": BRIDGE_SHIM_JS,
-            "runImmediately": true
-        }
+        "method": "Runtime.evaluate",
+        "params": {"expression": BRIDGE_SHIM_JS, "returnByValue": true},
+        "sessionId": sid
     });
     *msg_id += 1;
-    send_cdp(socket, &add_script);
+    send_cdp(socket, &eval);
+
+    log_to_temp(&format!(
+        "[cef_hook] Bridge shim installed (sid={}, new_docs={})",
+        sid, register_for_new_docs
+    ));
 }
 
 // ─── Theme injection via addScriptToEvaluateOnNewDocument ───────────────────
@@ -1748,7 +1898,12 @@ fn push_css_payload(
     sid: &str,
 ) {
     let payload = theme_css_payload_json(state);
-    let expr = format!("try{{window.__lumaCSS={};}}catch(e){{}}", payload);
+    // Dispatch lumaforge:theme-reload after the new payload lands so page
+    // scripts (steam-store-helper themeColor) can re-resolve theme colors.
+    let expr = format!(
+        "try{{window.__lumaCSS={};document.dispatchEvent(new CustomEvent('lumaforge:theme-reload'));}}catch(e){{}}",
+        payload
+    );
     log_to_temp(&format!("[cef_hook] pushCSS: sid={} expr_len={}", sid, expr.len()));
     let eval = json!({
         "id": *msg_id,
@@ -1767,6 +1922,8 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     js.push_str(r#"(function(){
   if(window.__lumaforge_theme_injected) return;
   window.__lumaforge_theme_injected=true;
+  // Plugins eligible for runtime injection: [{i: id, u: vfsRelPath, t: [hrefSubstrings]}]
+  var _lumaPlugins=PLUGINS_MANIFEST_PLACEHOLDER;
   // ── Millennium compat shims (themes expect these globals) ──
   // renderer.js polls window.opener.__ROUTER_HOOK_INSTANCE.registerForRouterSetup
   // (Millennium's RouterHook lives on SharedJSContext) to know when Steam's
@@ -1908,11 +2065,34 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     var P=window.__lumaCSS||null;
     addStyle(doc,'ACCENT_PLACEHOLDER','SystemAccentColorInject');
     addStyle(doc,'ROOTCOLORS_PLACEHOLDER','RootColors');
+    addStyle(doc,'SSH_BRIDGE_PLACEHOLDER','LumaSshBridge');
     if(P&&P.webkit){ addStyle(doc,P.webkit,'LmfWebkit'); }
     else{ addCSS(doc,'WEBKITCSS_PLACEHOLDER'); }
     if(P&&P.webkitjs)addJS(doc,P.webkitjs);
     addStyle(doc,'SLIDER_PLACEHOLDER','MillenniumSliderConditions');
     applyWindow(doc);
+    // Runtime plugin injection (library window). Store pages already receive
+    // plugins via the HTML intercept; here we load via <script src> from the
+    // VFS (no CORS concerns) when location.href matches the plugin's
+    // runtimeTargetUrl (e.g. "steamloopback.host").
+    try{
+      var _href=''; try{_href=location.href||'';}catch(e){}
+      for(var _pi=0;_pi<_lumaPlugins.length;_pi++){(function(pl){
+        if(!pl||!pl.u||!pl.t||!pl.t.length)return;
+        var m=false;
+        for(var _z=0;_z<pl.t.length;_z++){ if(_href.indexOf(pl.t[_z])>-1){m=true;break;} }
+        if(!m)return;
+        var sid='LumaPlugin_'+pl.i;
+        if(doc.getElementById(sid))return;
+        var h=headOf(doc);
+        if(!h)return;
+        var s=doc.createElement('script');
+        s.id=sid;
+        s.src='https://lumaforge.local/plugins/'+pl.u;
+        s.setAttribute('data-lmf',sid);
+        h.appendChild(s);
+      })(_lumaPlugins[_pi]);}
+    }catch(e){}
   }
   function watchDoc(doc){
     try{
@@ -2068,6 +2248,28 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     // 1. Root colors
     let root_colors_inline = theme_state.root_colors_content.as_deref().unwrap_or("");
     js = js.replace("ROOTCOLORS_PLACEHOLDER", &js_escape_str(root_colors_inline));
+
+    // 1b. ssh-bridge (theme var -> --luma-ssh-* plugin vars)
+    js = js.replace("SSH_BRIDGE_PLACEHOLDER", &js_escape_str(SSH_BRIDGE_CSS));
+
+    // 1c. runtime plugin manifest (library-window injection via VFS)
+    let mut plugins_json = String::from("[");
+    for p in &theme_state.plugins {
+        let (Some(vfs), Some(rt)) = (p.vfs_rel.as_ref(), p.runtime_target_url.as_ref()) else {
+            continue;
+        };
+        let safe_id: String = p.name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        if safe_id.is_empty() || vfs.is_empty() || rt.is_empty() {
+            continue;
+        }
+        let entry = json!({ "i": safe_id, "u": vfs.as_str(), "t": [rt.as_str()] });
+        plugins_json.push_str(&entry.to_string());
+        plugins_json.push(',');
+    }
+    plugins_json.push(']');
+    js = js.replace("PLUGINS_MANIFEST_PLACEHOLDER", &plugins_json);
 
     // 2. Webkit CSS
     let webkit_url = theme_state.webkit_css_path.as_ref()
@@ -2718,7 +2920,12 @@ fn dispatch_cdp_message(
             let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
             let payload = msg.get("params").and_then(|p| p.get("payload")).and_then(|p| p.as_str()).unwrap_or("");
             if name == "__lumaNativeBridge" {
-                handle_bridge_binding(socket, msg_id, payload);
+                let sid = msg.get("sessionId").and_then(|s| s.as_str());
+                let ecid = msg
+                    .get("params")
+                    .and_then(|p| p.get("executionContextId"))
+                    .and_then(|v| v.as_i64());
+                handle_bridge_binding(socket, msg_id, payload, sid, ecid);
             }
         }
         "Runtime.consoleAPICalled" => {
@@ -2746,7 +2953,15 @@ fn dispatch_cdp_message(
                 // on all targets, causing an infinite reload loop (frameNavigated
                 // → reload → frameNavigated → ...).
                 register_theme_injection_script(socket, msg_id, theme_state, pending, false);
-                install_bridge_shim(socket, msg_id);
+                // Re-ensure the bridge shim in the session's fresh document.
+                // New documents would already be covered by the attach-time
+                // registration; evaluate-only here (idempotent) to avoid
+                // stacking duplicate addScriptToEvaluateOnNewDocument entries.
+                if let Some(sid) = msg.get("sessionId").and_then(|s| s.as_str()) {
+                    if !sid.is_empty() {
+                        install_bridge_shim_session(socket, msg_id, sid, false);
+                    }
+                }
                 // New document in a payload-carrying session: the window realm
                 // is fresh (window.__lumaCSS gone) — re-push the payload. The
                 // patcher's delayed re-applies pick it up.
@@ -2861,6 +3076,12 @@ fn dispatch_cdp_message(
                 }
             }
             if ttype == "page" && !turl.is_empty() {
+                // Native bridge shim for this session. Attach happens at target
+                // creation — before the document starts — so register the
+                // binding + fetch wrapper now and cover the current document.
+                if !turl.contains("devtools://") {
+                    install_bridge_shim_session(socket, msg_id, sid, true);
+                }
                 let js = build_theme_js(theme_state);
                 let eval = json!({
                     "id": *msg_id,
@@ -3141,7 +3362,8 @@ fn handle_cdp_connection(port: u16) {
         // Register persistent theme injection for ALL documents (including internal Steam windows)
         register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, &mut pending, true);
 
-        install_bridge_shim(&mut socket, &mut msg_id);
+        // Bridge shim is installed per-session in Target.attachedToTarget —
+        // browser-level Page.* commands are rejected by this CEF build.
 
         reset_conn_stats();
         let mut lost = false;
