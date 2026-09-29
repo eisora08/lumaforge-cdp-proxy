@@ -1381,6 +1381,143 @@ fn js_escape_str(s: &str) -> String {
      .replace('\r', "\\r")
 }
 
+/// Regex covering the CSS `@import` forms: `url('…')`, `url("…")`, `url(…)`,
+/// `'…'`, `"…"`. Captures the URL in group 1..=6 depending on the variant.
+fn import_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)@import\s+(?:url\(\s*(?:'([^']+)'|"([^"]+)"|([^'")\s]+))\s*\)|'([^']+)'|"([^"]+)"|([^\s';]+))\s*;"#,
+        )
+        .expect("import regex")
+    })
+}
+
+fn is_inlineable_import(url: &str) -> bool {
+    let u = url.trim();
+    !(u.starts_with("http:")
+        || u.starts_with("https:")
+        || u.starts_with("//")
+        || u.starts_with("data:")
+        || u.starts_with("about:")
+        || u.starts_with('/'))
+}
+
+/// Recursively inline relative `@import` rules so the CSS is self-contained.
+///
+/// Payload-mode styles are injected as text, so `@import url('./elements/x.css')`
+/// resolves against the document origin (steamloopback.host serves Steam's HTML
+/// with zero CSS rules) instead of the theme dir — the entire Library/sidebar
+/// theming lives in those imports and was silently dropped. Absolute URLs
+/// (CDN fonts) are left for the browser. `skip` holds files emitted separately
+/// elsewhere in the payload (webkit.css → its own LmfWebkit style); `stack`
+/// guards against import cycles and preserves import order/duplicates so the
+/// cascade matches link mode.
+fn expand_css_imports(
+    css: &str,
+    base_dir: &std::path::Path,
+    skip: &[PathBuf],
+    stack: &mut Vec<PathBuf>,
+) -> String {
+    let re = import_re();
+    let mut out = String::with_capacity(css.len() + 8192);
+    let mut last = 0;
+    for caps in re.captures_iter(css) {
+        let m = caps.get(0).unwrap();
+        out.push_str(&css[last..m.start()]);
+        last = m.end();
+        let url = match (1..=6).find_map(|i| caps.get(i)) {
+            Some(u) => u.as_str().trim(),
+            None => {
+                out.push_str(m.as_str());
+                continue;
+            }
+        };
+        if !is_inlineable_import(url) {
+            out.push_str(m.as_str());
+            continue;
+        }
+        let resolved = base_dir.join(url);
+        let canon = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+        if skip.contains(&canon) {
+            continue;
+        }
+        if stack.contains(&canon) {
+            log_to_temp(&format!("[cef_hook] @import cycle dropped: {}", url));
+            continue;
+        }
+        let content = match fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(e) => {
+                log_to_temp(&format!(
+                    "[cef_hook] @import not readable ({}): {:?}",
+                    e, resolved
+                ));
+                continue;
+            }
+        };
+        stack.push(canon);
+        let sub = resolved
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| base_dir.to_path_buf());
+        out.push_str(&expand_css_imports(&content, &sub, skip, stack));
+        stack.pop();
+    }
+    out.push_str(&css[last..]);
+    out
+}
+
+/// Builds the payload's shared CSS `files` table: several patch entries
+/// (Menu$, ^Steam$, .ModalDialogPopup, …) point at the same file, so each
+/// unique file is read+expanded once and referenced by index (`f`).
+struct PayloadBuilder {
+    skip: Vec<PathBuf>,
+    files: Vec<String>,
+    file_index: std::collections::HashMap<PathBuf, usize>,
+    raw_total: usize,
+    expanded_total: usize,
+}
+
+impl PayloadBuilder {
+    fn new(skip: Vec<PathBuf>) -> Self {
+        Self {
+            skip,
+            files: Vec::new(),
+            file_index: std::collections::HashMap::new(),
+            raw_total: 0,
+            expanded_total: 0,
+        }
+    }
+
+    /// Read `path` and inline its relative @imports. Returns the expanded CSS
+    /// plus the raw byte count (for the build log).
+    fn expand_path(&self, path: &str) -> Option<(String, usize)> {
+        let p = PathBuf::from(path);
+        let raw = fs::read_to_string(&p).ok()?;
+        let base = p.parent().map(|x| x.to_path_buf()).unwrap_or_default();
+        let mut stack: Vec<PathBuf> = fs::canonicalize(&p).into_iter().collect();
+        let expanded = expand_css_imports(&raw, &base, &self.skip, &mut stack);
+        let raw_len = raw.len();
+        Some((expanded, raw_len))
+    }
+
+    /// Like `expand_path`, but dedupes into `files` and returns the index.
+    fn add(&mut self, path: &str) -> Option<usize> {
+        let canon = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        if let Some(&idx) = self.file_index.get(&canon) {
+            return Some(idx);
+        }
+        let (expanded, raw_len) = self.expand_path(path)?;
+        self.raw_total += raw_len;
+        self.expanded_total += expanded.len();
+        self.files.push(expanded);
+        let idx = self.files.len() - 1;
+        self.file_index.insert(canon, idx);
+        Some(idx)
+    }
+}
+
 /// Build (and cache) the serialized CSS payload pushed into steamloopback
 /// sessions as `window.__lumaCSS`. Link tags to `lumaforge.local` are only
 /// intercepted by Fetch for store-origin documents — requests from
@@ -1390,10 +1527,21 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
     if let Some(p) = &state.css_payload {
         return p.clone();
     }
+    // webkit.css ships as its own LmfWebkit style (added before any patch in
+    // injectDoc), so patch-level imports of it are dropped — inlining it again
+    // would double the payload. Its rules land first instead of at their
+    // import position; ties with equal specificity go to the importing sheet.
+    let skip: Vec<PathBuf> = state
+        .webkit_css_path
+        .as_deref()
+        .and_then(|p| fs::canonicalize(p).ok())
+        .into_iter()
+        .collect();
+    let builder = PayloadBuilder::new(skip);
     let webkit = state
         .webkit_css_path
         .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|p| builder.expand_path(p).map(|(css, _)| css))
         .unwrap_or_default();
     let conds: Vec<Value> = state
         .condition_css
@@ -1401,7 +1549,7 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
         .map(|c| {
             json!({
                 "affects": c.affects,
-                "css": fs::read_to_string(&c.src).unwrap_or_default(),
+                "css": builder.expand_path(&c.src).map(|(css, _)| css).unwrap_or_default(),
             })
         })
         .collect();
@@ -1415,27 +1563,35 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
             })
         })
         .collect();
+    let mut builder = builder;
     let patches: Vec<Value> = state
         .patches
         .iter()
         .map(|p| {
             json!({
                 "r": p.match_regex,
-                "css": p.target_css.as_ref().and_then(|f| fs::read_to_string(f).ok()),
+                "f": p.target_css.as_ref().and_then(|f| builder.add(f)),
                 "js": p.target_js.as_ref().and_then(|f| fs::read_to_string(f).ok()),
             })
         })
         .collect();
+    let raw_total = builder.raw_total;
+    let expanded_total = builder.expanded_total;
+    let files = std::mem::take(&mut builder.files);
     let payload = json!({
         "webkit": webkit,
+        "files": files,
         "conds": conds,
         "cjs": cjs,
         "patches": patches,
     });
     let s = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     log_to_temp(&format!(
-        "[cef_hook] CSS payload built: {} bytes ({} conditions, {} patches)",
+        "[cef_hook] CSS payload built: {} bytes ({} raw + @import expansion to {} across {} files, {} conditions, {} patches)",
         s.len(),
+        raw_total,
+        expanded_total,
+        builder.file_index.len(),
         state.condition_css.len(),
         state.patches.len()
     ));
@@ -1543,7 +1699,7 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     for(var i=0;i<_p.length;i++){
       var p=_p[i];
       if(matchWin(p.r,t,cl,true)){
-        if(P){ if(p.css)addStyle(doc,p.css,'LmfP'+i); if(p.js)addInlineJS(doc,p.js,'LmfPJ'+i); }
+        if(P){ var pc=p.css||(P.files&&p.f!=null?P.files[p.f]:null); if(pc)addStyle(doc,pc,'LmfP'+i); if(p.js)addInlineJS(doc,p.js,'LmfPJ'+i); }
         else{ if(p.c)addCSS(doc,p.c); if(p.j)addJS(doc,p.j); }
       }
     }
@@ -2942,5 +3098,115 @@ mod accent_tests {
         ] {
             assert!(css.contains(var), "missing {} in {}", var, css);
         }
+    }
+}
+
+#[cfg(test)]
+mod import_expand_tests {
+    use super::*;
+
+    struct TmpTheme(PathBuf);
+
+    impl TmpTheme {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "lmf_import_test_{}_{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("elements")).unwrap();
+            TmpTheme(dir)
+        }
+
+        fn write(&self, rel: &str, content: &str) {
+            fs::write(self.0.join(rel), content).unwrap();
+        }
+    }
+
+    impl Drop for TmpTheme {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn expand(path: &PathBuf, skip: &[PathBuf]) -> String {
+        let raw = fs::read_to_string(path).unwrap();
+        let base = path.parent().unwrap().to_path_buf();
+        let mut stack: Vec<PathBuf> = fs::canonicalize(path).into_iter().collect();
+        expand_css_imports(&raw, &base, skip, &mut stack)
+    }
+
+    #[test]
+    fn inlines_relative_import_tree() {
+        let t = TmpTheme::new("tree");
+        t.write(
+            "main.css",
+            "@import url('./elements/sidebar.css');\n.main{color:red}",
+        );
+        t.write("elements/sidebar.css", ".sidebar{background:blue}");
+        let out = expand(&t.0.join("main.css"), &[]);
+        assert!(out.contains(".sidebar{background:blue}"), "child not inlined: {}", out);
+        assert!(out.contains(".main{color:red}"), "parent rules lost: {}", out);
+        assert!(!out.contains("@import"), "import not removed: {}", out);
+    }
+
+    #[test]
+    fn keeps_absolute_and_root_relative_imports() {
+        let t = TmpTheme::new("abs");
+        t.write(
+            "main.css",
+            "@import url('https://fonts.cdnfonts.com/css/x');\n@import \"/public/a.css\";",
+        );
+        let out = expand(&t.0.join("main.css"), &[]);
+        assert!(out.contains("https://fonts.cdnfonts.com/css/x"));
+        assert!(out.contains("/public/a.css"));
+        assert!(out.contains("@import"), "absolute imports must stay: {}", out);
+    }
+
+    #[test]
+    fn skip_drops_import_but_keeps_rest() {
+        let t = TmpTheme::new("skip");
+        t.write("main.css", "@import url('webkit.css');\n.main{}");
+        t.write("webkit.css", ".wk{}");
+        let skip = vec![fs::canonicalize(t.0.join("webkit.css")).unwrap()];
+        let out = expand(&t.0.join("main.css"), &skip);
+        assert!(!out.contains(".wk{}"), "skipped file leaked: {}", out);
+        assert!(out.contains(".main{}"));
+        assert!(!out.contains("@import"));
+    }
+
+    #[test]
+    fn cycle_terminates_and_drops_import() {
+        let t = TmpTheme::new("cycle");
+        t.write("a.css", "@import url('b.css');\n.a{}");
+        t.write("b.css", "@import url('a.css');\n.b{}");
+        let out = expand(&t.0.join("a.css"), &[]);
+        assert!(out.contains(".a{}"));
+        assert!(out.contains(".b{}"));
+        assert!(!out.contains("@import"), "cycle import must be dropped: {}", out);
+    }
+
+    #[test]
+    fn missing_import_dropped_without_panic() {
+        let t = TmpTheme::new("missing");
+        t.write("main.css", "@import url('./nope.css');\n.main{}");
+        let out = expand(&t.0.join("main.css"), &[]);
+        assert!(out.contains(".main{}"));
+        assert!(!out.contains("@import"));
+    }
+
+    #[test]
+    fn builder_dedupes_shared_files() {
+        let t = TmpTheme::new("dedup");
+        t.write("lib.css", "@import url('elements/sidebar.css');\n.lib{}");
+        t.write("elements/sidebar.css", ".sidebar{}");
+        let mut b = PayloadBuilder::new(Vec::new());
+        let i1 = b.add(&t.0.join("lib.css").to_string_lossy()).unwrap();
+        let i2 = b.add(&t.0.join("lib.css").to_string_lossy()).unwrap();
+        assert_eq!(i1, i2, "same file must map to one index");
+        assert_eq!(b.files.len(), 1);
+        assert!(b.files[0].contains(".sidebar{}"));
+        assert!(b.files[0].contains(".lib{}"));
     }
 }
