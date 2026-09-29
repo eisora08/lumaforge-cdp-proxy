@@ -495,10 +495,19 @@ fn load_theme_manifest(state: &mut ThemeState) {
         theme_dir.join(rel).to_string_lossy().into_owned()
     });
 
-    // 4. RootColors — read the :root CSS inline
+    // 4. RootColors — read the :root CSS inline (relative url()s → VFS)
     state.root_colors_content = skin.root_colors.as_ref().and_then(|rel| {
         let path = theme_dir.join(rel);
-        fs::read_to_string(&path).ok().filter(|s| !s.is_empty())
+        fs::read_to_string(&path)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|css| {
+                let dir = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| theme_dir.clone());
+                rewrite_css_urls(&css, &dir, &theme_dir)
+            })
     });
 
     // 5. Build patches — explicit + UseDefaultPatches defaults
@@ -1403,6 +1412,86 @@ fn is_inlineable_import(url: &str) -> bool {
         || u.starts_with('/'))
 }
 
+/// Regex for CSS `url(...)` references (single/double-quoted or bare).
+fn url_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)url\(\s*(?:'([^']*)'|"([^"]*)"|([^'")\s]+))\s*\)"#)
+            .expect("url regex")
+    })
+}
+
+/// Rewrite relative `url(...)` references to absolute VFS URLs.
+///
+/// Payload styles are inlined as text into steamloopback documents, where a
+/// relative `url('../fonts/x.woff2')` resolves against the page origin and
+/// 404s — @font-face glyphs then render as tofu boxes. Point them at the VFS
+/// (the same base link mode already uses). Absolute, root-relative, `data:`
+/// and fragment refs are left untouched, as are refs that would escape the
+/// theme root. `file_dir` is the directory of the file being processed so
+/// each recursion level resolves against its own location.
+fn rewrite_css_urls(
+    css: &str,
+    file_dir: &std::path::Path,
+    theme_dir: &std::path::Path,
+) -> String {
+    let rel_dir = match file_dir.strip_prefix(theme_dir) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return css.to_string(),
+    };
+    let re = url_re();
+    let mut out = String::with_capacity(css.len() + 256);
+    let mut last = 0;
+    for caps in re.captures_iter(css) {
+        let m = caps.get(0).unwrap();
+        out.push_str(&css[last..m.start()]);
+        last = m.end();
+        let url = match (1..=3).find_map(|i| caps.get(i)) {
+            Some(u) => u.as_str().trim(),
+            None => {
+                out.push_str(m.as_str());
+                continue;
+            }
+        };
+        if !is_inlineable_import(url) || url.starts_with('#') {
+            out.push_str(m.as_str());
+            continue;
+        }
+        let mut parts: Vec<String> = rel_dir
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let mut ok = true;
+        for comp in std::path::Path::new(url).components() {
+            match comp {
+                std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if parts.pop().is_none() {
+                        ok = false;
+                        break;
+                    }
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok || parts.is_empty() {
+            out.push_str(m.as_str());
+            continue;
+        }
+        out.push_str(&format!(
+            "url(\"https://{}/themes/{}\")",
+            VFS_HOST,
+            parts.join("/")
+        ));
+    }
+    out.push_str(&css[last..]);
+    out
+}
+
 /// Recursively inline relative `@import` rules so the CSS is self-contained.
 ///
 /// Payload-mode styles are injected as text, so `@import url('./elements/x.css')`
@@ -1412,10 +1501,15 @@ fn is_inlineable_import(url: &str) -> bool {
 /// (CDN fonts) are left for the browser. `skip` holds files emitted separately
 /// elsewhere in the payload (webkit.css → its own LmfWebkit style); `stack`
 /// guards against import cycles and preserves import order/duplicates so the
-/// cascade matches link mode.
+/// cascade matches link mode. Text between `@import` statements is run through
+/// [`rewrite_css_urls`] with the owning file's directory, so relative `url()`
+/// refs (fonts/images) also survive the steamloopback origin; the `@import`
+/// statements themselves are never rewritten (they are either inlined by path
+/// or already absolute).
 fn expand_css_imports(
     css: &str,
     base_dir: &std::path::Path,
+    theme_dir: &std::path::Path,
     skip: &[PathBuf],
     stack: &mut Vec<PathBuf>,
 ) -> String {
@@ -1424,7 +1518,7 @@ fn expand_css_imports(
     let mut last = 0;
     for caps in re.captures_iter(css) {
         let m = caps.get(0).unwrap();
-        out.push_str(&css[last..m.start()]);
+        out.push_str(&rewrite_css_urls(&css[last..m.start()], base_dir, theme_dir));
         last = m.end();
         let url = match (1..=6).find_map(|i| caps.get(i)) {
             Some(u) => u.as_str().trim(),
@@ -1461,10 +1555,10 @@ fn expand_css_imports(
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| base_dir.to_path_buf());
-        out.push_str(&expand_css_imports(&content, &sub, skip, stack));
+        out.push_str(&expand_css_imports(&content, &sub, theme_dir, skip, stack));
         stack.pop();
     }
-    out.push_str(&css[last..]);
+    out.push_str(&rewrite_css_urls(&css[last..], base_dir, theme_dir));
     out
 }
 
@@ -1473,6 +1567,7 @@ fn expand_css_imports(
 /// unique file is read+expanded once and referenced by index (`f`).
 struct PayloadBuilder {
     skip: Vec<PathBuf>,
+    theme_dir: PathBuf,
     files: Vec<String>,
     file_index: std::collections::HashMap<PathBuf, usize>,
     raw_total: usize,
@@ -1480,9 +1575,10 @@ struct PayloadBuilder {
 }
 
 impl PayloadBuilder {
-    fn new(skip: Vec<PathBuf>) -> Self {
+    fn new(skip: Vec<PathBuf>, theme_dir: PathBuf) -> Self {
         Self {
             skip,
+            theme_dir,
             files: Vec::new(),
             file_index: std::collections::HashMap::new(),
             raw_total: 0,
@@ -1497,7 +1593,7 @@ impl PayloadBuilder {
         let raw = fs::read_to_string(&p).ok()?;
         let base = p.parent().map(|x| x.to_path_buf()).unwrap_or_default();
         let mut stack: Vec<PathBuf> = fs::canonicalize(&p).into_iter().collect();
-        let expanded = expand_css_imports(&raw, &base, &self.skip, &mut stack);
+        let expanded = expand_css_imports(&raw, &base, &self.theme_dir, &self.skip, &mut stack);
         let raw_len = raw.len();
         Some((expanded, raw_len))
     }
@@ -1537,7 +1633,8 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
         .and_then(|p| fs::canonicalize(p).ok())
         .into_iter()
         .collect();
-    let builder = PayloadBuilder::new(skip);
+    let theme_dir_str = state.theme_dir_str();
+    let builder = PayloadBuilder::new(skip, state.theme_dir.clone().unwrap_or_default());
     let webkit = state
         .webkit_css_path
         .as_ref()
@@ -1553,12 +1650,17 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
             })
         })
         .collect();
+    // `ju` points the script at its VFS copy as a real <script type=module>:
+    // an inline classic <script> would SyntaxError on ESM (import/export) and
+    // take the whole Library root JS down with it. `js` stays as fallback for
+    // classic scripts when the VFS fetch is unavailable.
     let cjs: Vec<Value> = state
         .condition_js
         .iter()
         .map(|c| {
             json!({
                 "affects": c.affects,
+                "ju": build_vfs_css_url(&theme_dir_str, &c.src),
                 "js": fs::read_to_string(&c.src).unwrap_or_default(),
             })
         })
@@ -1571,6 +1673,7 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
             json!({
                 "r": p.match_regex,
                 "f": p.target_css.as_ref().and_then(|f| builder.add(f)),
+                "ju": p.target_js.as_ref().map(|f| build_vfs_css_url(&theme_dir_str, f)),
                 "js": p.target_js.as_ref().and_then(|f| fs::read_to_string(f).ok()),
             })
         })
@@ -1580,6 +1683,7 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
     let files = std::mem::take(&mut builder.files);
     let payload = json!({
         "webkit": webkit,
+        "webkitjs": state.webkit_js_path.as_ref().map(|p| build_vfs_css_url(&theme_dir_str, p)),
         "files": files,
         "conds": conds,
         "cjs": cjs,
@@ -1626,6 +1730,44 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     js.push_str(r#"(function(){
   if(window.__lumaforge_theme_injected) return;
   window.__lumaforge_theme_injected=true;
+  // ── Millennium compat shims (themes expect these globals) ──
+  // renderer.js polls window.opener.__ROUTER_HOOK_INSTANCE.registerForRouterSetup
+  // (Millennium's RouterHook lives on SharedJSContext) to know when Steam's
+  // React router rendered; without it the sidebar never initializes. The real
+  // hook delays the callback until router render, but every fluenty callback
+  // starts with waitForElement (MutationObserver), so an immediate async call
+  // is safe and resolves once the elements exist.
+  try{
+    if(!window.__ROUTER_HOOK_INSTANCE){
+      window.__ROUTER_HOOK_INSTANCE={
+        registerForRouterSetup:function(cb){
+          if(typeof cb!=='function')return;
+          setTimeout(function(){ try{cb();}catch(e){console.warn('[luma] routerSetup cb',e);} },0);
+        }
+      };
+      window.__ROUTER_HOOK_INSTANCE__=window.__ROUTER_HOOK_INSTANCE;
+    }
+  }catch(e){}
+  // Millennium.findElement(doc, selector, timeout) -> Promise<NodeList>
+  try{
+    if(!window.Millennium){
+      window.Millennium={
+        findElement:function(doc,selector,timeout){
+          return new Promise(function(resolve,reject){
+            var d=doc||document;
+            var found=d.querySelectorAll(selector);
+            if(found.length){resolve(found);return;}
+            var obs=new MutationObserver(function(){
+              var m=d.querySelectorAll(selector);
+              if(m.length){obs.disconnect();if(timer)clearTimeout(timer);resolve(m);}
+            });
+            obs.observe(d.body||d.documentElement,{childList:true,subtree:true});
+            var timer=timeout?setTimeout(function(){obs.disconnect();reject();},timeout):null;
+          });
+        }
+      };
+    }
+  }catch(e){}
   // SharedJSContext is headless — Steam mirrors its <head> links into popups
   // (login window, toasts). Theme links there block Steam's renderWhenReady
   // gate and the popup never becomes visible (WasHidden stays 1). Detect it
@@ -1698,10 +1840,10 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     var _p=(P&&P.patches)?P.patches:PATCHES_PLACEHOLDER;
     for(var i=0;i<_p.length;i++){
       var p=_p[i];
-      if(matchWin(p.r,t,cl,true)){
-        if(P){ var pc=p.css||(P.files&&p.f!=null?P.files[p.f]:null); if(pc)addStyle(doc,pc,'LmfP'+i); if(p.js)addInlineJS(doc,p.js,'LmfPJ'+i); }
-        else{ if(p.c)addCSS(doc,p.c); if(p.j)addJS(doc,p.j); }
-      }
+        if(matchWin(p.r,t,cl,true)){
+          if(P){ var pc=p.css||(P.files&&p.f!=null?P.files[p.f]:null); if(pc)addStyle(doc,pc,'LmfP'+i); if(p.ju)addJS(doc,p.ju); else if(p.js)addInlineJS(doc,p.js,'LmfPJ'+i); }
+          else{ if(p.c)addCSS(doc,p.c); if(p.j)addJS(doc,p.j); }
+        }
     }
     var _c=(P&&P.conds)?P.conds:CONDITION_CSS_PLACEHOLDER;
     for(var j=0;j<_c.length;j++){
@@ -1719,7 +1861,8 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
       var ok2=false;
       for(var n=0;n<d.affects.length;n++){ if(matchWin(d.affects[n],t,cl,false)){ ok2=true; break; } }
       if(ok2){
-        if(d.js)addInlineJS(doc,d.js,'LmfJ'+m);
+        if(d.ju)addJS(doc,d.ju);
+        else if(d.js)addInlineJS(doc,d.js,'LmfJ'+m);
         else if(d.url)addJS(doc,d.url);
       }
     }
@@ -1730,6 +1873,7 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     addStyle(doc,'ROOTCOLORS_PLACEHOLDER','RootColors');
     if(P&&P.webkit){ addStyle(doc,P.webkit,'LmfWebkit'); }
     else{ addCSS(doc,'WEBKITCSS_PLACEHOLDER'); }
+    if(P&&P.webkitjs)addJS(doc,P.webkitjs);
     addStyle(doc,'SLIDER_PLACEHOLDER','MillenniumSliderConditions');
     applyWindow(doc);
   }
@@ -2128,13 +2272,22 @@ fn register_webkit_js(
 ) {
     // Register webkit JS as persistent script if available
     if let Some(ref webkit_js_path) = theme_state.webkit_js_path {
-        let code = match fs::read_to_string(webkit_js_path) {
-            Ok(c) => c,
-            Err(e) => {
-                log_to_temp(&format!("[cef_hook] Failed to read webkit JS: {}", e));
-                return;
-            }
-        };
+        if fs::metadata(webkit_js_path).map(|m| !m.is_file()).unwrap_or(true) {
+            log_to_temp(&format!(
+                "[cef_hook] Webkit JS not readable: {}",
+                webkit_js_path
+            ));
+            return;
+        }
+        // The source is injected as a classic script, so load the theme file
+        // as an ES module via dynamic import — themes ship ESM (top-level
+        // await / import / export) which SyntaxErrors as inline classic JS.
+        let url = build_vfs_css_url(&theme_state.theme_dir_str(), webkit_js_path);
+        let url_lit = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string());
+        let code = format!(
+            "import({}).catch(function(e){{ try {{ console.log('[LUMA] webkit js error', e); }} catch (_) {{}} }});",
+            url_lit
+        );
         let add_script = json!({
             "id": *msg_id,
             "method": "Page.addScriptToEvaluateOnNewDocument",
@@ -2145,11 +2298,31 @@ fn register_webkit_js(
         });
         *msg_id += 1;
         send_cdp(socket, &add_script);
-        log_to_temp("[cef_hook] Webkit JS registered for all documents");
+        log_to_temp(&format!("[cef_hook] Webkit JS registered for all documents ({})", url));
     }
 }
 
 // ─── Fetch handler ──────────────────────────────────────────────────────────
+
+/// Send a Fetch command, echoing the pause event's `sessionId` when it came
+/// from a session-scoped interception — interception IDs are only valid in
+/// the session that reported them (root-scope fulfill → InvalidInterceptionId).
+fn fetch_cmd(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg_id: &mut u64,
+    method: &str,
+    params: Value,
+    sid: Option<&str>,
+) -> u64 {
+    let id = *msg_id;
+    let mut m = json!({ "id": id, "method": method, "params": params });
+    if let Some(s) = sid {
+        m["sessionId"] = Value::String(s.to_string());
+    }
+    *msg_id += 1;
+    send_cdp(socket, &m);
+    id
+}
 
 fn handle_fetch_paused(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
@@ -2157,6 +2330,7 @@ fn handle_fetch_paused(
     msg_id: &mut u64,
     theme_state: &mut ThemeState,
     pending: &mut Vec<Value>,
+    sid: Option<&str>,
 ) {
     let params = match msg.get("params") {
         Some(p) => p,
@@ -2172,6 +2346,9 @@ fn handle_fetch_paused(
         .get("responseStatusCode")
         .and_then(|s| s.as_u64());
     let is_request_stage = status.is_none();
+    if is_request_stage && url.contains(VFS_HOST) {
+        log_to_temp(&format!("[cef_hook] FETCH-REQ: {}", url));
+    }
     let status_code = status.unwrap_or(200);
     let response_headers = params.get("responseHeaders").cloned();
 
@@ -2190,13 +2367,13 @@ fn handle_fetch_paused(
         let body = match proxy_bridge_request(path, method, post_data) {
             Ok(b) => b,
             Err(_e) => {
-                let fail_msg = json!({
-                    "id": *msg_id,
-                    "method": "Fetch.failRequest",
-                    "params": {"requestId": request_id_str, "errorReason": "Failed"}
-                });
-                *msg_id += 1;
-                send_cdp(socket, &fail_msg);
+                fetch_cmd(
+                    socket,
+                    msg_id,
+                    "Fetch.failRequest",
+                    json!({"requestId": request_id_str, "errorReason": "Failed"}),
+                    sid,
+                );
                 return;
             }
         };
@@ -2208,18 +2385,18 @@ fn handle_fetch_paused(
             {"name": "Access-Control-Allow-Origin", "value": "*"},
             {"name": "Content-Length", "value": content_length.to_string()}
         ]);
-        let fulfill = json!({
-            "id": *msg_id,
-            "method": "Fetch.fulfillRequest",
-            "params": {
+        fetch_cmd(
+            socket,
+            msg_id,
+            "Fetch.fulfillRequest",
+            json!({
                 "requestId": request_id_str,
                 "responseCode": 200,
                 "responseHeaders": resp_headers,
                 "body": body_b64
-            }
-        });
-        *msg_id += 1;
-        send_cdp(socket, &fulfill);
+            }),
+            sid,
+        );
         return;
     }
 
@@ -2236,29 +2413,29 @@ fn handle_fetch_paused(
                     {"name": "Cache-Control", "value": "no-cache"},
                     {"name": "Content-Length", "value": content_length.to_string()}
                 ]);
-                let fulfill = json!({
-                    "id": *msg_id,
-                    "method": "Fetch.fulfillRequest",
-                    "params": {
+                fetch_cmd(
+                    socket,
+                    msg_id,
+                    "Fetch.fulfillRequest",
+                    json!({
                         "requestId": request_id_str,
                         "responseCode": 200,
                         "responseHeaders": resp_headers,
                         "body": body_b64
-                    }
-                });
-                *msg_id += 1;
-                send_cdp(socket, &fulfill);
+                    }),
+                    sid,
+                );
                 return;
             }
             Err(()) => {
                 // Not a VFS request or file not found, fail it
-                let fail_msg = json!({
-                    "id": *msg_id,
-                    "method": "Fetch.failRequest",
-                    "params": {"requestId": request_id_str, "errorReason": "NameNotResolved"}
-                });
-                *msg_id += 1;
-                send_cdp(socket, &fail_msg);
+                fetch_cmd(
+                    socket,
+                    msg_id,
+                    "Fetch.failRequest",
+                    json!({"requestId": request_id_str, "errorReason": "NameNotResolved"}),
+                    sid,
+                );
                 return;
             }
         }
@@ -2266,13 +2443,13 @@ fn handle_fetch_paused(
 
     // ── Non-HTML request stage: continue ──
     if is_request_stage {
-        let continue_msg = json!({
-            "id": *msg_id,
-            "method": "Fetch.continueRequest",
-            "params": {"requestId": request_id_str}
-        });
-        *msg_id += 1;
-        send_cdp(socket, &continue_msg);
+        fetch_cmd(
+            socket,
+            msg_id,
+            "Fetch.continueRequest",
+            json!({"requestId": request_id_str}),
+            sid,
+        );
         return;
     }
 
@@ -2302,13 +2479,13 @@ fn handle_fetch_paused(
     let is_html = is_html_content_type || is_html_url;
 
     if !is_html {
-        let continue_msg = json!({
-            "id": *msg_id,
-            "method": "Fetch.continueResponse",
-            "params": {"requestId": request_id_str}
-        });
-        *msg_id += 1;
-        send_cdp(socket, &continue_msg);
+        fetch_cmd(
+            socket,
+            msg_id,
+            "Fetch.continueResponse",
+            json!({"requestId": request_id_str}),
+            sid,
+        );
         return;
     }
 
@@ -2345,30 +2522,24 @@ fn handle_fetch_paused(
     // ── HTML interception: inject theme ──
     log_to_temp(&format!("[cef_hook] Intercepting HTML: {}", &url[..url.len().min(120)]));
 
-    let get_body = json!({
-        "id": *msg_id,
-        "method": "Fetch.getResponseBody",
-        "params": {"requestId": request_id_str}
-    });
-    let current_id = *msg_id;
-    *msg_id += 1;
+    let current_id = fetch_cmd(
+        socket,
+        msg_id,
+        "Fetch.getResponseBody",
+        json!({"requestId": request_id_str}),
+        sid,
+    );
 
     // Helper: always continueResponse on failure so the page doesn't hang
     let do_continue = |socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, msg_id: &mut u64| {
-        let continue_msg = json!({
-            "id": *msg_id,
-            "method": "Fetch.continueResponse",
-            "params": {"requestId": request_id_str}
-        });
-        *msg_id += 1;
-        send_cdp(socket, &continue_msg);
+        fetch_cmd(
+            socket,
+            msg_id,
+            "Fetch.continueResponse",
+            json!({"requestId": request_id_str}),
+            sid,
+        );
     };
-
-    if !send_cdp(socket, &get_body) {
-        log_to_temp(&format!("[cef_hook] Failed to send getResponseBody, continuing response"));
-        do_continue(socket, msg_id);
-        return;
-    }
 
     let body_response = recv_cdp_response(socket, pending, current_id);
     let body_msg = match body_response {
@@ -2442,16 +2613,7 @@ fn handle_fetch_paused(
         }
     }
 
-    let fulfill = json!({
-        "id": *msg_id,
-        "method": "Fetch.fulfillRequest",
-        "params": fulfill_params
-    });
-    *msg_id += 1;
-    if !send_cdp(socket, &fulfill) {
-        log_to_temp(&format!("[cef_hook] fulfillRequest failed, continuing response"));
-        do_continue(socket, msg_id);
-    }
+    fetch_cmd(socket, msg_id, "Fetch.fulfillRequest", fulfill_params, sid);
 }
 
 /// Extract window identity hints from raw HTML: <title> text plus the class
@@ -2509,7 +2671,11 @@ fn dispatch_cdp_message(
 
     match method {
         "Fetch.requestPaused" => {
-            handle_fetch_paused(socket, msg, msg_id, theme_state, pending);
+            let sid = msg
+                .get("sessionId")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            handle_fetch_paused(socket, msg, msg_id, theme_state, pending, sid.as_deref());
         }
         "Runtime.bindingCalled" => {
             let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
@@ -2624,6 +2790,27 @@ fn dispatch_cdp_message(
                 && !turl.contains("devtools://")
                 && !turl.contains("store.steampowered.com")
             {
+                // Request-stage interception must also be enabled per session:
+                // the browser-level Fetch.enable above only pauses requests
+                // from store-origin documents — steamloopback docs (Shared, main
+                // window, popups) never pause, so their module scripts, fonts
+                // and images to lumaforge.local fell into DNS and failed. The
+                // response-stage "*" pattern stays browser-level only so this
+                // session's HTML responses are never rewritten (inject_theme_html
+                // must not touch the Steam shell).
+                let fetch_enable = json!({
+                    "id": *msg_id,
+                    "method": "Fetch.enable",
+                    "params": {
+                        "patterns": [
+                            {"urlPattern": format!("*{}*", VFS_HOST), "requestStage": "Request"},
+                            {"urlPattern": "*/luma-bridge/*", "requestStage": "Request"}
+                        ]
+                    },
+                    "sessionId": sid
+                });
+                *msg_id += 1;
+                send_cdp(socket, &fetch_enable);
                 push_css_payload(socket, msg_id, theme_state, sid);
                 if let Ok(mut urls) = SESSION_URLS.lock() {
                     urls.retain(|(s, _)| s != sid);
@@ -3133,8 +3320,27 @@ mod import_expand_tests {
     fn expand(path: &PathBuf, skip: &[PathBuf]) -> String {
         let raw = fs::read_to_string(path).unwrap();
         let base = path.parent().unwrap().to_path_buf();
+        // Tests build paths directly under the temp theme root, so the root
+        // is the first ancestor named lmf_import_test_*.
+        let mut theme_dir = base.clone();
+        loop {
+            if theme_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("lmf_import_test_"))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            match theme_dir.parent() {
+                Some(p) => theme_dir = p.to_path_buf(),
+                None => {
+                    theme_dir = base.clone();
+                    break;
+                }
+            }
+        }
         let mut stack: Vec<PathBuf> = fs::canonicalize(path).into_iter().collect();
-        expand_css_imports(&raw, &base, skip, &mut stack)
+        expand_css_imports(&raw, &base, &theme_dir, skip, &mut stack)
     }
 
     #[test]
@@ -3201,12 +3407,94 @@ mod import_expand_tests {
         let t = TmpTheme::new("dedup");
         t.write("lib.css", "@import url('elements/sidebar.css');\n.lib{}");
         t.write("elements/sidebar.css", ".sidebar{}");
-        let mut b = PayloadBuilder::new(Vec::new());
+        let mut b = PayloadBuilder::new(Vec::new(), t.0.clone());
         let i1 = b.add(&t.0.join("lib.css").to_string_lossy()).unwrap();
         let i2 = b.add(&t.0.join("lib.css").to_string_lossy()).unwrap();
         assert_eq!(i1, i2, "same file must map to one index");
         assert_eq!(b.files.len(), 1);
         assert!(b.files[0].contains(".sidebar{}"));
         assert!(b.files[0].contains(".lib{}"));
+    }
+
+    #[test]
+    fn rewrites_relative_urls_to_vfs() {
+        let t = TmpTheme::new("url");
+        t.write(
+            "main.css",
+            "@font-face{font-family:X;src:url(fonts/x.woff2)}\
+             \n.icon{background:url('./images/icon.png')}",
+        );
+        let out = expand(&t.0.join("main.css"), &[]);
+        assert!(
+            out.contains("url(\"https://lumaforge.local/themes/fonts/x.woff2\")"),
+            "relative url not rewritten: {}",
+            out
+        );
+        assert!(
+            out.contains("url(\"https://lumaforge.local/themes/images/icon.png\")"),
+            "dot-relative url not rewritten: {}",
+            out
+        );
+        assert!(!out.contains("url(fonts"), "raw url left: {}", out);
+        assert!(!out.contains("url('./images"), "raw url left: {}", out);
+    }
+
+    #[test]
+    fn rewrites_urls_inside_imported_files_with_their_own_dir() {
+        let t = TmpTheme::new("urlimport");
+        t.write("main.css", "@import url('elements/sub.css');\n.main{}");
+        t.write(
+            "elements/sub.css",
+            ".a{background:url(../img/bg.png)}\n.b{background:url(icon.svg)}",
+        );
+        let out = expand(&t.0.join("main.css"), &[]);
+        assert!(
+            out.contains("url(\"https://lumaforge.local/themes/img/bg.png\")"),
+            "imported relative url not rewritten: {}",
+            out
+        );
+        assert!(
+            out.contains("url(\"https://lumaforge.local/themes/elements/icon.svg\")"),
+            "imported sibling url not rewritten: {}",
+            out
+        );
+        assert!(!out.contains("@import"));
+    }
+
+    #[test]
+    fn keeps_data_absolute_root_and_fragment_urls() {
+        let t = TmpTheme::new("urlabs");
+        t.write(
+            "main.css",
+            "a{background:url(data:font/woff2;base64,AAAA)}\
+             \nb{background:url(https://cdn.example.com/x.png)}\
+             \nc{background:url(/shared/y.png)}\
+             \nd{mask:url(#m)}\
+             \ne{background:url('//cdn.example.com/z.png')}",
+        );
+        let out = expand(&t.0.join("main.css"), &[]);
+        assert!(out.contains("url(data:font/woff2;base64,AAAA)"), "{}", out);
+        assert!(out.contains("url(https://cdn.example.com/x.png)"), "{}", out);
+        assert!(out.contains("url(/shared/y.png)"), "{}", out);
+        assert!(out.contains("url(#m)"), "{}", out);
+        assert!(out.contains("url('//cdn.example.com/z.png')"), "{}", out);
+        assert!(
+            !out.contains("lumaforge.local"),
+            "absolute url was rewritten: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn keeps_urls_escaping_theme_root() {
+        let t = TmpTheme::new("urlesc");
+        t.write("main.css", "a{background:url('../../../../etc/passwd')}");
+        let out = expand(&t.0.join("main.css"), &[]);
+        assert!(
+            out.contains("url('../../../../etc/passwd')"),
+            "escaping url must stay untouched: {}",
+            out
+        );
+        assert!(!out.contains("lumaforge.local"), "{}", out);
     }
 }
