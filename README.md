@@ -9,7 +9,7 @@ Chromium Embedded Framework (CEF) integration.
 
 ## Latest release
 
-Current release: **v0.4.0**
+Current release: **v0.4.1**
 
 Download published builds from the [GitHub Releases](https://github.com/eisora08/lumaforge-cdp-proxy/releases) page.
 Every release publishes two archives:
