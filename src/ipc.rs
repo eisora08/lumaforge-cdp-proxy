@@ -21,7 +21,10 @@ pub fn start_ipc_server() -> Result<(), String> {
     const PIPE_TYPE_MESSAGE: u32 = 0x00000004;
     const PIPE_READMODE_MESSAGE: u32 = 0x00000002;
     const PIPE_WAIT: u32 = 0x00000000;
-    const PIPE_NAME: &str = r"\\.\pipe\lumalite_core\0";
+    // Explicit NUL terminator: without it CreateNamedPipeA reads past the end
+    // of the &str and the pipe ends up with garbage appended to its name
+    // (clients could not connect to the expected `\\.\pipe\lumalite_core`).
+    const PIPE_NAME: &[u8] = b"\\\\.\\pipe\\lumalite_core\0";
 
     static STARTED: Once = Once::new();
     let result = Ok(());
@@ -164,6 +167,23 @@ fn handle_command(command: &str) -> String {
             match write_theme_reload_signal() {
                 Ok(()) => r#"{"status":"ok","message":"Theme reload signal sent"}"#.to_string(),
                 Err(e) => format!(r#"{{"status":"error","message":"{}"}}"#, e),
+            }
+        }
+        // Re-export the theme manifest and signal cef_hook. Used by
+        // lumaforge-panel after it writes active.json directly (activate,
+        // deactivate, condition changes): the panel owns the file format and
+        // the proxy owns the export + reload signal.
+        "sync-theme" => {
+            crate::log_to_temp("[steamcdp] IPC: sync-theme command received");
+            let export_err = crate::theme::export_theme_for_cef_hook().err();
+            let signal_err = write_theme_reload_signal().err();
+            match (export_err, signal_err) {
+                (None, None) => {
+                    r#"{"status":"ok","message":"Theme synced"}"#.to_string()
+                }
+                (Some(e), _) | (_, Some(e)) => {
+                    format!(r#"{{"status":"ok","message":"Theme synced with warning: {}"}}"#, e)
+                }
             }
         }
         "status" => match load_plugins() {

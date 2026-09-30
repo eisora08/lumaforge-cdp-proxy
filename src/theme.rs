@@ -39,9 +39,34 @@ fn runtime_dir() -> Option<PathBuf> {
 /// NOTE: cef_hook (Windows) does NOT read this file — it parses skin.json and
 /// active.json directly from the themes dir.
 pub fn export_theme_for_cef_hook() -> Result<(), String> {
-    let theme = load_active_theme().ok_or("No active theme found")?;
     let runtime = runtime_dir().ok_or("No LOCALAPPDATA")?;
     let _ = fs::create_dir_all(&runtime);
+
+    // activeTheme present but empty → theming explicitly disabled (panel
+    // deactivation). Write an empty manifest so the CDP injection path drops
+    // every theme patch instead of keeping the previous theme's stale ones.
+    if let Some(name) = read_active_theme_name() {
+        if name.trim().is_empty() {
+            let manifest = serde_json::json!({
+                "name": "",
+                "dir": "",
+                "patches": [],
+                "conditions": {},
+                "useDefaultPatches": false,
+            });
+            let manifest_path = runtime.join("theme-manifest.json");
+            let json_str = serde_json::to_string_pretty(&manifest)
+                .map_err(|e| format!("serialize: {}", e))?;
+            fs::write(&manifest_path, &json_str)
+                .map_err(|e| format!("write {}: {}", manifest_path.display(), e))?;
+            fs::write(runtime.join("theme-active-dir.txt"), "")
+                .map_err(|e| format!("write theme-active-dir.txt: {}", e))?;
+            log_to_temp("[theme] Theming disabled — wrote empty manifest");
+            return Ok(());
+        }
+    }
+
+    let theme = load_active_theme().ok_or("No active theme found")?;
 
     // Build the manifest JSON for cef_hook
     let mut manifest = serde_json::Map::new();

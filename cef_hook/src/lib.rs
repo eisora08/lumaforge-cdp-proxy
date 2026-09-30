@@ -381,6 +381,25 @@ fn auto_select_theme(themes_dir: &PathBuf) -> Option<String> {
     None
 }
 
+/// Drop every theme-derived piece of state so the next payload push carries
+/// empty CSS and the live re-apply listener strips theme styles from every
+/// open document (deactivation). `theme_dir` is parked at the themes root as
+/// a sentinel so the active.json mtime gate above keeps short-circuiting
+/// while disabled instead of re-reading the file every check.
+fn clear_theme_state(state: &mut ThemeState, themes_dir: &PathBuf) {
+    state.theme_name = None;
+    state.theme_dir = Some(themes_dir.clone());
+    state.patches.clear();
+    state.webkit_css_path = None;
+    state.webkit_js_path = None;
+    state.root_colors_content = None;
+    state.condition_css.clear();
+    state.condition_js.clear();
+    state.slider_css.clear();
+    state.skin_json_mtime = None;
+    state.css_payload = None;
+}
+
 fn load_theme_manifest(state: &mut ThemeState) {
     let themes_dir = match themes_base_dir() {
         Some(d) => d,
@@ -458,14 +477,22 @@ fn load_theme_manifest(state: &mut ThemeState) {
         }
     };
 
-    let theme_name = active_json
+    // Millennium writes the key always; an EMPTY activeTheme means the user
+    // explicitly disabled theming (panel deactivation). Only a *missing* key
+    // falls through to auto-select (fresh install: theme copied, nothing
+    // configured yet — Millennium activates on import).
+    let active_theme_value = active_json
         .get("themes").and_then(|t| t.get("activeTheme"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty());
+        .map(|s| s.to_string());
 
-    let theme_name = match theme_name {
-        Some(n) => n,
+    let theme_name = match active_theme_value {
+        Some(n) if !n.is_empty() => n,
+        Some(_) => {
+            log_to_temp("[cef_hook] activeTheme is empty — theming disabled");
+            clear_theme_state(state, &themes_dir);
+            return;
+        }
         None => match auto_select_theme(&themes_dir) {
             Some(n) => {
                 log_to_temp(&format!(
@@ -1871,6 +1898,11 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
     let payload = json!({
         "webkit": webkit,
         "webkitjs": state.webkit_js_path.as_ref().map(|p| build_vfs_css_url(&theme_dir_str, p)),
+        // Dynamic so the live re-apply listener can rebuild RootColors and the
+        // slider variables from the CURRENT theme instead of the values baked
+        // into the script at registration time (empty when theming is off).
+        "rootColors": state.root_colors_content.clone().unwrap_or_default(),
+        "slider": state.slider_css.clone(),
         "files": files,
         "conds": conds,
         "cjs": cjs,
@@ -2063,13 +2095,17 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
   }
   function injectDoc(doc){
     var P=window.__lumaCSS||null;
+    // RootColors/slider come from the live payload when available; the baked
+    // placeholders only cover the window before the first push lands.
+    var rc=(P&&('rootColors' in P))?P.rootColors:'ROOTCOLORS_PLACEHOLDER';
+    var sl=(P&&('slider' in P))?P.slider:'SLIDER_PLACEHOLDER';
     addStyle(doc,'ACCENT_PLACEHOLDER','SystemAccentColorInject');
-    addStyle(doc,'ROOTCOLORS_PLACEHOLDER','RootColors');
+    addStyle(doc,rc,'RootColors');
     addStyle(doc,'SSH_BRIDGE_PLACEHOLDER','LumaSshBridge');
     if(P&&P.webkit){ addStyle(doc,P.webkit,'LmfWebkit'); }
-    else{ addCSS(doc,'WEBKITCSS_PLACEHOLDER'); }
+    else if(!P){ addCSS(doc,'WEBKITCSS_PLACEHOLDER'); }
     if(P&&P.webkitjs)addJS(doc,P.webkitjs);
-    addStyle(doc,'SLIDER_PLACEHOLDER','MillenniumSliderConditions');
+    addStyle(doc,sl,'MillenniumSliderConditions');
     applyWindow(doc);
     // Runtime plugin injection (library window). Store pages already receive
     // plugins via the HTML intercept; here we load via <script src> from the
@@ -2195,6 +2231,24 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     setInterval(function(){ ensureCreatedHook(); sweepPopups(); },1000);
     console.log('[LUMA] popup patcher started');
   }
+  // Live re-apply: push_css_payload dispatches this after swapping
+  // window.__lumaCSS (theme activate / deactivate / condition change).
+  // Strip only owned STYLES — never scripts (plugin and patch JS must not
+  // re-run mid-session) — then rebuild from the fresh payload so existing
+  // documents update without restarting Steam. addJS/addInlineJS guards
+  // keep scripts already in the DOM from being added twice.
+  document.addEventListener('lumaforge:theme-reload',function(){
+    try{
+      var h=document.head;if(!h)return;
+      // Only re-apply to documents we already themed: a popup mid-document
+      // .write() must keep waiting for its renderWhenReady gate, and docs
+      // that have not injected yet will read the fresh payload themselves.
+      if(!document.__lumaWatch)return;
+      var ls=h.querySelectorAll('style[data-lmf],link[data-lmf]');
+      for(var i=0;i<ls.length;i++){ ls[i].parentNode.removeChild(ls[i]); }
+      injectDoc(document);
+    }catch(e){}
+  });
   if(isSharedCtx()){
     // Never theme Shared's own head — Steam mirrors it into popups and a
     // dirty head blocks renderWhenReady. Strip anything present, then patch

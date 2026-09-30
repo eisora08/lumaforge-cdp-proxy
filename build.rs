@@ -41,7 +41,9 @@ fn main() {
                 std::fs::copy(&cef_hook_dll, &dest).expect("Failed to copy cef_hook DLL");
             }
 
-            println!("cargo:rerun-if-changed={}", cef_hook_dll.display());
+            println!("cargo:rerun-if-changed={}", cef_hook_dir.join("src").display());
+            println!("cargo:rerun-if-changed={}", cef_hook_dir.join("Cargo.toml").display());
+            println!("cargo:rerun-if-changed={}", cef_hook_dir.join("Cargo.lock").display());
         }
     } else {
         // Build libXtst proxy (.so) on Linux
@@ -80,7 +82,8 @@ fn main() {
                 std::fs::copy(&hook_so, &dest).expect("Failed to copy libXtst proxy");
             }
 
-            println!("cargo:rerun-if-changed={}", hook_so.display());
+            println!("cargo:rerun-if-changed={}", hook_dir.join("src").display());
+            println!("cargo:rerun-if-changed={}", hook_dir.join("Cargo.toml").display());
         }
 
         // Build pvs_shim (64-bit C binary)
