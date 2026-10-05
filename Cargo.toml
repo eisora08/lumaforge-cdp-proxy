@@ -26,6 +26,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_Memory",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_Security_Cryptography",
 ] }
 minhook = "0.8"
@@ -48,6 +49,7 @@ regex = "1"
 zip = "0.6"
 sevenz-rust = "0.6"
 sha2 = "0.10"
+sha1 = "0.10"
 goblin = "0.8"
 open = "5"
 dirs = "5"

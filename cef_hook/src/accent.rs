@@ -28,12 +28,7 @@ const ACCENT_NAMES: [&str; 7] = [
 // uxtheme APIs fail: [accent, light1..3, dark1..3].
 const FALLBACK: [u32; 7] = [
     0xFFC066, // accent (#66c0ff, BGR)
-    0xFFD18F,
-    0xFFDFAB,
-    0xFFECCC,
-    0xE8A64D,
-    0xC98B3B,
-    0xAA702A,
+    0xFFD18F, 0xFFDFAB, 0xFFECCC, 0xE8A64D, 0xC98B3B, 0xAA702A,
 ];
 
 fn wide_null(s: &str) -> Vec<u16> {
@@ -42,11 +37,21 @@ fn wide_null(s: &str) -> Vec<u16> {
 
 /// DWORD → "#rrggbb" (color is 0xBBGGRR / AABBGGRR).
 fn to_hex(color: u32) -> String {
-    format!("#{:02x}{:02x}{:02x}", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF)
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        color & 0xFF,
+        (color >> 8) & 0xFF,
+        (color >> 16) & 0xFF
+    )
 }
 
 fn to_rgb(color: u32) -> String {
-    format!("{}, {}, {}", color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF)
+    format!(
+        "{}, {}, {}",
+        color & 0xFF,
+        (color >> 8) & 0xFF,
+        (color >> 16) & 0xFF
+    )
 }
 
 /// Mix toward white (pct > 0) or black (pct < 0), like Millennium's
@@ -74,14 +79,12 @@ fn read_accent_colors() -> [u32; 7] {
             return derive_fallback(0);
         }
 
-        let get_set: Option<GetImmersiveUserColorSetPreferenceFn> = std::mem::transmute(GetProcAddress(
-            uxtheme,
-            b"GetImmersiveUserColorSetPreference\0".as_ptr(),
-        ));
-        let get_color: Option<GetImmersiveColorFromColorSetExFn> = std::mem::transmute(GetProcAddress(
-            uxtheme,
-            b"GetImmersiveColorFromColorSetEx\0".as_ptr(),
-        ));
+        let get_set: Option<GetImmersiveUserColorSetPreferenceFn> = std::mem::transmute(
+            GetProcAddress(uxtheme, b"GetImmersiveUserColorSetPreference\0".as_ptr()),
+        );
+        let get_color: Option<GetImmersiveColorFromColorSetExFn> = std::mem::transmute(
+            GetProcAddress(uxtheme, b"GetImmersiveColorFromColorSetEx\0".as_ptr()),
+        );
         // GetImmersiveColorTypeFromName is exported without a name —
         // consistently ordinal 96 on Windows 10/11 (same as Millennium).
         let get_type: Option<GetImmersiveColorTypeFromNameFn> =
@@ -143,9 +146,16 @@ pub fn system_accent_css() -> &'static str {
         let push = |css: &mut String, name: &str, color: u32| {
             if name.is_empty() {
                 css.push_str(&format!("    --SystemAccentColor: {};\n", to_hex(color)));
-                css.push_str(&format!("    --SystemAccentColor-RGB: {};\n", to_rgb(color)));
+                css.push_str(&format!(
+                    "    --SystemAccentColor-RGB: {};\n",
+                    to_rgb(color)
+                ));
             } else {
-                css.push_str(&format!("    --SystemAccentColor{}: {};\n", name, to_hex(color)));
+                css.push_str(&format!(
+                    "    --SystemAccentColor{}: {};\n",
+                    name,
+                    to_hex(color)
+                ));
                 css.push_str(&format!(
                     "    --SystemAccentColor{}-RGB: {};\n",
                     name,

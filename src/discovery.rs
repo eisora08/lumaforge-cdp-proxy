@@ -6,9 +6,14 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 
-const DEFAULT_DEBUG_PORT: u16 = 9222;
+/// Fixed fallback port: Steam's own `.cef-enable-debugging` port (8080).
+const DEFAULT_DEBUG_PORT: u16 = 8080;
 const PORT_MIN: u16 = 1024;
 const PORT_MAX: u16 = 65535;
+
+/// Steam's fixed `.cef-enable-debugging` port — probed as fallback when the
+/// resolved (dynamic or adopted) port never comes up.
+pub const STEAM_FIXED_DEBUG_PORT: u16 = 8080;
 
 static PUBLISHED: Mutex<Option<(u16, u32)>> = Mutex::new(None);
 static CACHED_PORT: OnceLock<u16> = OnceLock::new();
@@ -54,9 +59,21 @@ pub fn resolve_debug_port() -> u16 {
             return port;
         }
 
-        crate::log_to_temp("[steamcdp] Dynamic port selection failed; falling back to 9222");
+        crate::log_to_temp(
+            "[steamcdp] Dynamic port selection failed; falling back to fixed port 8080",
+        );
         DEFAULT_DEBUG_PORT
     })
+}
+
+/// Ports to probe for CDP, in order: the resolved port first, then Steam's
+/// fixed `.cef-enable-debugging` port as fallback. Deduplicated.
+pub fn debug_port_candidates(port: u16) -> Vec<u16> {
+    let mut ports = vec![port];
+    if STEAM_FIXED_DEBUG_PORT != port {
+        ports.push(STEAM_FIXED_DEBUG_PORT);
+    }
+    ports
 }
 
 fn discovery_runtime_dir() -> Result<PathBuf, String> {
@@ -292,6 +309,19 @@ mod tests {
     fn dynamic_port_is_valid() {
         let port = find_available_dynamic_port().expect("should find a port");
         assert!(port >= PORT_MIN && port <= PORT_MAX);
+    }
+
+    #[test]
+    fn debug_port_candidates_append_fixed_fallback() {
+        assert_eq!(
+            debug_port_candidates(58127),
+            vec![58127, STEAM_FIXED_DEBUG_PORT]
+        );
+    }
+
+    #[test]
+    fn debug_port_candidates_dedupe_fixed_port() {
+        assert_eq!(debug_port_candidates(8080), vec![8080]);
     }
 
     #[test]

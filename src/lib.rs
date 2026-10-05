@@ -1,6 +1,6 @@
 mod bridge;
-mod cdp;
 mod catalog;
+mod cdp;
 mod cloudsave;
 mod depot_downloader;
 mod discovery;
@@ -25,11 +25,17 @@ mod package_installer;
 mod plugin_loader;
 
 #[cfg(target_os = "linux")]
+mod cdp_pipe;
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+mod cdp_pipe_win;
+#[cfg(target_os = "linux")]
 mod hook_linux;
 #[cfg(target_os = "linux")]
 mod plugin_loader_linux;
-#[cfg(target_os = "linux")]
-mod cdp_pipe;
+#[cfg(target_os = "windows")]
+mod relay;
+mod transport;
 
 use std::sync::Mutex;
 
@@ -38,6 +44,39 @@ use std::sync::Mutex;
 // ---------------------------------------------------------------------------
 
 static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Local wall-clock prefix `[HH:MM:SS.mmm]` so log lines can be correlated
+/// with file mtimes, netstat snapshots, and other per-machine evidence.
+#[cfg(target_os = "windows")]
+fn log_timestamp() -> String {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        format!(
+            "[{:02}:{:02}:{:02}.{:03}]",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_timestamp() -> String {
+    unsafe {
+        let mut tv: libc::timeval = std::mem::zeroed();
+        libc::gettimeofday(&mut tv, std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&tv.tv_sec, &mut tm);
+        format!(
+            "[{:02}:{:02}:{:02}.{:03}]",
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            (tv.tv_usec / 1000) as u32
+        )
+    }
+}
 
 fn flush_log_buffer() {
     let Ok(mut buf) = LOG_BUFFER.lock() else {
@@ -62,7 +101,7 @@ fn flush_log_buffer() {
 }
 
 pub(crate) fn log_to_temp(msg: &str) {
-    let line = format!("{}\n", msg);
+    let line = format!("{} {}\n", log_timestamp(), msg);
     let should_flush = {
         let Ok(mut buf) = LOG_BUFFER.lock() else {
             return;
@@ -76,11 +115,12 @@ pub(crate) fn log_to_temp(msg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Stealth kill — polls for webhelpers, then kills all at once
+// Stealth kill — kills webhelpers left over from previous sessions only
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
 unsafe fn stealth_kill_all_webhelpers() {
+    use std::collections::HashSet;
     use std::mem;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -89,6 +129,11 @@ unsafe fn stealth_kill_all_webhelpers() {
     };
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
+    // Retry only while the snapshot itself fails. A scan that succeeds and
+    // sees no webhelpers means none are stale — anything Steam spawns from
+    // now on is fresh, so return immediately instead of re-polling. That
+    // re-poll raced with the new session's spawn and killed its helpers
+    // before the CDP pipes were registered (lost1 pipe failure).
     for _ in 0..120 {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
@@ -105,7 +150,8 @@ unsafe fn stealth_kill_all_webhelpers() {
             continue;
         }
 
-        let mut pids: Vec<u32> = Vec::new();
+        // (pid, parent pid) of every steamwebhelper visible right now.
+        let mut helpers: Vec<(u32, u32)> = Vec::new();
         loop {
             let len = entry
                 .szExeFile
@@ -114,7 +160,7 @@ unsafe fn stealth_kill_all_webhelpers() {
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
             if name.eq_ignore_ascii_case("steamwebhelper.exe") {
-                pids.push(entry.th32ProcessID);
+                helpers.push((entry.th32ProcessID, entry.th32ParentProcessID));
             }
             if Process32NextW(snapshot, &mut entry) == 0 {
                 break;
@@ -122,24 +168,71 @@ unsafe fn stealth_kill_all_webhelpers() {
         }
         CloseHandle(snapshot);
 
-        if pids.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            continue;
+        if helpers.is_empty() {
+            crate::log_to_temp("[steamcdp] No stale steamwebhelper processes found");
+            return;
         }
 
-        for pid in &pids {
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, *pid);
-            if !handle.is_null() {
-                TerminateProcess(handle, 0);
-                CloseHandle(handle);
-            } else {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .output();
+        // Fresh = helpers our hook spawned this session (noted at spawn or
+        // registered as pipe pairs) plus their descendants — renderer children
+        // share the exe name and must not be orphaned.
+        let mut fresh: HashSet<u32> = crate::hook::session_webhelper_pids().into_iter().collect();
+        loop {
+            let mut grew = false;
+            for &(pid, ppid) in &helpers {
+                if !fresh.contains(&pid) && fresh.contains(&ppid) {
+                    fresh.insert(pid);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
             }
         }
+
+        let targets: Vec<u32> = helpers
+            .iter()
+            .map(|&(pid, _)| pid)
+            .filter(|pid| !fresh.contains(pid))
+            .collect();
+        if targets.is_empty() {
+            crate::log_to_temp(
+                "[steamcdp] All steamwebhelper processes belong to this session; nothing stale to kill",
+            );
+            return;
+        }
+
+        let mut killed = 0usize;
+        for pid in &targets {
+            // The spawn hook may have noted this pid between snapshot and kill.
+            if crate::hook::is_session_webhelper(*pid) {
+                continue;
+            }
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, *pid);
+            if !handle.is_null() {
+                if TerminateProcess(handle, 0) != 0 {
+                    killed += 1;
+                }
+                CloseHandle(handle);
+            } else {
+                let ok = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if ok {
+                    killed += 1;
+                }
+            }
+        }
+        crate::log_to_temp(&format!(
+            "[steamcdp] Killed {}/{} stale steamwebhelper process(es)",
+            killed,
+            targets.len()
+        ));
         return;
     }
+    crate::log_to_temp("[steamcdp] No stale steamwebhelper processes found");
 }
 
 #[cfg(target_os = "linux")]
@@ -148,9 +241,11 @@ fn stealth_kill_all_webhelpers() {
 
     for _ in 0..120 {
         let mut pids: Vec<u32> = Vec::new();
+        let mut scanned = false;
 
         // Scan /proc for steamwebhelper processes
         if let Ok(entries) = std::fs::read_dir("/proc") {
+            scanned = true;
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
@@ -167,18 +262,38 @@ fn stealth_kill_all_webhelpers() {
             }
         }
 
-        if pids.is_empty() {
+        // Retry only when /proc could not be read. An empty successful scan
+        // means nothing is stale — re-polling here raced with Steam's own
+        // spawn and killed the fresh helpers.
+        if !scanned {
             std::thread::sleep(std::time::Duration::from_millis(500));
             continue;
         }
 
-        for pid in &pids {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
+        if pids.is_empty() {
+            crate::log_to_temp("[steamcdp] No stale steamwebhelper processes found");
+            return;
         }
+
+        let mut killed = 0usize;
+        for pid in &pids {
+            let ok = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if ok {
+                killed += 1;
+            }
+        }
+        crate::log_to_temp(&format!(
+            "[steamcdp] Killed {}/{} stale steamwebhelper process(es)",
+            killed,
+            pids.len()
+        ));
         return;
     }
+    crate::log_to_temp("[steamcdp] No stale steamwebhelper processes found");
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +320,10 @@ fn patch_steamwebhelper_script(port: u16) {
     let content = match std::fs::read_to_string(&script_path) {
         Ok(c) => c,
         Err(e) => {
-            log_to_temp(&format!("[steamcdp] patch: failed to read {}: {}", script_path, e));
+            log_to_temp(&format!(
+                "[steamcdp] patch: failed to read {}: {}",
+                script_path, e
+            ));
             return;
         }
     };
@@ -230,10 +348,7 @@ fn patch_steamwebhelper_script(port: u16) {
         .join("\n");
 
     if new_content == content {
-        log_to_temp(&format!(
-            "[steamcdp] patch: already correct with {}",
-            flag
-        ));
+        log_to_temp(&format!("[steamcdp] patch: already correct with {}", flag));
         return;
     }
 
@@ -347,10 +462,19 @@ fn init() {
     // Install panic hook to log panics before they kill the process
     std::panic::set_hook(Box::new(|info| {
         let thread = std::thread::current();
-        let msg = format!("[steamcdp] PANIC in thread '{}': {}", thread.name().unwrap_or("?"), info);
+        let msg = format!(
+            "[steamcdp] PANIC in thread '{}': {}",
+            thread.name().unwrap_or("?"),
+            info
+        );
+        let path = crate::platform::log_file_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("/tmp/steamcdp_proxy.log")
+            .create(true)
+            .append(true)
+            .open(&path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
     }));
 
@@ -371,8 +495,12 @@ fn init() {
     let args: Vec<String> = cmdline.split('\0').map(|s| s.to_string()).collect();
     let exe_base = exe_name.rsplit('/').next().unwrap_or(exe_name);
     let is_main_steam = exe_base == "steam"
-        && args.iter().any(|a| a.contains("ubuntu12_32") || a.contains("ubuntu12_64") || a.contains("/steam"))
-        && !args.iter().any(|a| a == "-child-update-ui" || a == "-steam-update-ui" || a.starts_with("--type="));
+        && args.iter().any(|a| {
+            a.contains("ubuntu12_32") || a.contains("ubuntu12_64") || a.contains("/steam")
+        })
+        && !args.iter().any(|a| {
+            a == "-child-update-ui" || a == "-steam-update-ui" || a.starts_with("--type=")
+        });
 
     if !is_main_steam {
         log_to_temp(&format!(
@@ -403,27 +531,25 @@ fn init() {
     });
 
     // 3. Lua backends
-    std::thread::spawn(|| {
-        match crate::plugin_loader_linux::load_all_plugins() {
-            Ok(plugins) => {
-                log_to_temp(&format!(
-                    "[steamcdp] Linux: loaded {} plugins",
-                    plugins.len()
-                ));
-                for p in &plugins {
-                    if let Some(ref bc) = p.backend_config {
-                        if let Err(e) = lua_backend::load_lua_backend(&p._id, &p._dir, bc) {
-                            log_to_temp(&format!(
-                                "[steamcdp] Lua backend error for {}: {}",
-                                p._id, e
-                            ));
-                        }
+    std::thread::spawn(|| match crate::plugin_loader_linux::load_all_plugins() {
+        Ok(plugins) => {
+            log_to_temp(&format!(
+                "[steamcdp] Linux: loaded {} plugins",
+                plugins.len()
+            ));
+            for p in &plugins {
+                if let Some(ref bc) = p.backend_config {
+                    if let Err(e) = lua_backend::load_lua_backend(&p._id, &p._dir, bc) {
+                        log_to_temp(&format!(
+                            "[steamcdp] Lua backend error for {}: {}",
+                            p._id, e
+                        ));
                     }
                 }
             }
-            Err(e) => {
-                log_to_temp(&format!("[steamcdp] Plugin load error: {}", e));
-            }
+        }
+        Err(e) => {
+            log_to_temp(&format!("[steamcdp] Plugin load error: {}", e));
         }
     });
 

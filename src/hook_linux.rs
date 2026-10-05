@@ -19,7 +19,10 @@ pub fn build_webhelper_args(argv: &[String], port: u16) -> Option<Vec<String>> {
         return None;
     }
     // Don't add if already present
-    if argv.iter().any(|a| a.starts_with("--remote-debugging-port")) {
+    if argv
+        .iter()
+        .any(|a| a.starts_with("--remote-debugging-port"))
+    {
         return None;
     }
 
@@ -35,7 +38,10 @@ pub fn build_webhelper_args(argv: &[String], port: u16) -> Option<Vec<String>> {
 
 /// Drain the bridge proxy queue from all injected targets and fulfill
 /// pending HTTP requests from Rust (bypasses mixed-content blocking).
-fn drain_bridge_queue(client: &mut crate::cdp::CdpClient, injected: &std::collections::HashSet<String>) {
+fn drain_bridge_queue(
+    client: &mut crate::transport::Transport<'_>,
+    injected: &std::collections::HashSet<String>,
+) {
     for target_id in injected {
         if target_id.is_empty() {
             continue;
@@ -58,7 +64,8 @@ fn drain_bridge_queue(client: &mut crate::cdp::CdpClient, injected: &std::collec
             Ok(r) => r,
             Err(_) => continue,
         };
-        let queue_str = resp.get("result")
+        let queue_str = resp
+            .get("result")
             .and_then(|r| r.get("result"))
             .and_then(|r| r.get("value"))
             .and_then(|v| v.as_str())
@@ -93,16 +100,17 @@ fn drain_bridge_queue(client: &mut crate::cdp::CdpClient, injected: &std::collec
 }
 
 /// Make an HTTP request to the local bridge (called from Rust, not CEF).
-/// Tries the proxy's own ports only — no luma-lite dependency.
+/// Tries the proxy's own ports only â€” no luma-lite dependency.
 fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_json::Value {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
-        .build() {
-            Ok(c) => c,
-            Err(e) => {
-                return serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": format!("Client build error: {}", e)});
-            }
-        };
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::json!({"status": 0, "body": "", "headers": {}, "statusText": format!("Client build error: {}", e)});
+        }
+    };
 
     // Our own bridge ports: primary 21775, fallback 21776
     let ports = [21775u16, 21776];
@@ -126,19 +134,28 @@ fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_jso
             url.to_string()
         };
 
-        let http_method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let http_method =
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         let mut req = client.request(http_method, &target_url);
         if let Some(b) = body {
-            req = req.body(b.to_string()).header("content-type", "application/json");
+            req = req
+                .body(b.to_string())
+                .header("content-type", "application/json");
         }
 
         match req.send() {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 // If we got a response, use this port for future requests
-                let headers: serde_json::Map<String, serde_json::Value> = resp.headers()
+                let headers: serde_json::Map<String, serde_json::Value> = resp
+                    .headers()
                     .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), serde_json::Value::String(v.to_str().unwrap_or("").to_string())))
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            serde_json::Value::String(v.to_str().unwrap_or("").to_string()),
+                        )
+                    })
                     .collect();
                 let body = resp.text().unwrap_or_default();
                 return serde_json::json!({
@@ -160,7 +177,7 @@ fn make_bridge_request(method: &str, url: &str, body: Option<&str>) -> serde_jso
 }
 
 pub fn start_cdp_injection_loop() {
-    let port = get_debug_port();
+    let mut port = get_debug_port();
 
     // Publish discovery
     if let Err(e) = crate::discovery::publish_if_needed(port) {
@@ -175,19 +192,51 @@ pub fn start_cdp_injection_loop() {
         port
     ));
 
-    // Wait for CDP to become available — exponential backoff: 100ms → 200ms → 400ms → 500ms
-    let max_attempts = 30;
-    for attempt in 1..=max_attempts {
-        let delay_ms = std::cmp::min(100 * (1u64 << ((attempt - 1).min(2))), 500);
+    // Wait for CDP to become available â€” infinite retry with capped backoff:
+    // 100ms â†’ 200ms â†’ 400ms â†’ 800ms â†’ 1600ms â†’ 2s (cap). Never give up for
+    // good: the port may come up after the client stopped probing.
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
+        let delay_ms = std::cmp::min(100u64 << ((attempt - 1).min(5)), 2000);
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 
-        match crate::cdp::CdpClient::connect(port) {
-            Ok(mut client) => {
+        // Probe the resolved port first, then Steam's fixed 8080 fallback.
+        // On a switch, republish discovery so external consumers follow.
+        let mut connected: Option<crate::cdp::CdpClient> = None;
+        let mut errs: Vec<String> = Vec::new();
+        for &cand in &crate::discovery::debug_port_candidates(port) {
+            match crate::cdp::CdpClient::connect(cand) {
+                Ok(client) => {
+                    if cand != port {
+                        crate::log_to_temp(&format!(
+                            "[steamcdp] Switching to debug port {} (was {})",
+                            cand, port
+                        ));
+                        if let Err(e) = crate::discovery::publish_if_needed(cand) {
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] Failed to publish CDP discovery: {}",
+                                e
+                            ));
+                        }
+                        port = cand;
+                    }
+                    connected = Some(client);
+                    break;
+                }
+                Err(e) => errs.push(format!("{}: {}", cand, e)),
+            }
+        }
+
+        match connected {
+            Some(mut client) => {
                 crate::log_to_temp(&format!(
                     "[steamcdp] Connected to CDP (attempt {})",
                     attempt
                 ));
-                match crate::injector::inject_all(&mut client) {
+                match crate::injector::inject_all(&mut crate::transport::Transport::Tcp(
+                    &mut client,
+                )) {
                     Ok(()) => {
                         crate::log_to_temp("[steamcdp] Injection complete");
                     }
@@ -215,7 +264,8 @@ pub fn start_cdp_injection_loop() {
                 let theme_bundle = crate::injector::load_theme_patches();
                 let mut recheck_counter = 0u32;
                 // Track last-known URLs to detect store page navigations immediately
-                let mut known_urls: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut known_urls: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
                 if let Ok(targets) = client.get_targets() {
                     for t in &targets {
                         if t.target_type == "page" && injected_targets.contains(&t.id) {
@@ -229,19 +279,33 @@ pub fn start_cdp_injection_loop() {
 
                     // Drain bridge proxy queue every cycle (~1s) so extension fetch
                     // requests are fulfilled within the 15s JS timeout
-                    drain_bridge_queue(&mut client, &injected_targets);
+                    drain_bridge_queue(
+                        &mut crate::transport::Transport::Tcp(&mut client),
+                        &injected_targets,
+                    );
 
                     // Every 30s, re-evaluate diagnostic on ALL injected targets to catch SPA navigations.
                     // Store pages are checked first since they're where the button appears.
                     if recheck_counter % 30 == 0 {
                         match client.get_targets() {
                             Ok(all_targets) => {
-                                let page_count = all_targets.iter().filter(|t| t.target_type == "page").count();
-                                crate::log_to_temp(&format!("[steamcdp] Recheck: {} total targets ({} pages), {} injected", all_targets.len(), page_count, injected_targets.len()));
+                                let page_count = all_targets
+                                    .iter()
+                                    .filter(|t| t.target_type == "page")
+                                    .count();
+                                crate::log_to_temp(&format!(
+                                    "[steamcdp] Recheck: {} total targets ({} pages), {} injected",
+                                    all_targets.len(),
+                                    page_count,
+                                    injected_targets.len()
+                                ));
 
                                 // Collect injected page targets, sort store pages first
-                                let mut pages: Vec<_> = all_targets.iter()
-                                    .filter(|t| t.target_type == "page" && injected_targets.contains(&t.id))
+                                let mut pages: Vec<_> = all_targets
+                                    .iter()
+                                    .filter(|t| {
+                                        t.target_type == "page" && injected_targets.contains(&t.id)
+                                    })
                                     .collect();
                                 pages.sort_by(|a, b| {
                                     let a_store = a.url.contains("store.steampowered.com");
@@ -286,11 +350,20 @@ pub fn start_cdp_injection_loop() {
                                             "[steamcdp] Re-injecting target (hasLuma=false): id={}, title=\"{}\", url={}",
                                             t.id, t.title, &t.url[..t.url.len().min(100)]
                                         ));
-                                        let plugins = crate::plugin_loader_linux::load_all_plugins().unwrap_or_default();
+                                        let plugins =
+                                            crate::plugin_loader_linux::load_all_plugins()
+                                                .unwrap_or_default();
                                         if let Err(e) = crate::injector::inject_into_target(
-                                            &mut client, t, &plugins, &theme_bundle, checked as usize,
+                                            &mut crate::transport::Transport::Tcp(&mut client),
+                                            t,
+                                            &plugins,
+                                            &theme_bundle,
+                                            checked as usize,
                                         ) {
-                                            crate::log_to_temp(&format!("[steamcdp] Re-inject failed: {}", e));
+                                            crate::log_to_temp(&format!(
+                                                "[steamcdp] Re-inject failed: {}",
+                                                e
+                                            ));
                                         }
                                     }
                                 }
@@ -302,10 +375,11 @@ pub fn start_cdp_injection_loop() {
                     match client.get_targets() {
                         Ok(new_targets) => {
                             for t in &new_targets {
-                                if t.target_type == "page" && !injected_targets.contains(&t.id)
+                                if t.target_type == "page"
+                                    && !injected_targets.contains(&t.id)
                                     && crate::injector::is_real_steam_page(&t.url)
                                 {
-                                    // Skip shutdown/close targets — injecting into these can destabilize Steam
+                                    // Skip shutdown/close targets â€” injecting into these can destabilize Steam
                                     if t.title == "Shutdown" || t.url.contains("createflags=2") {
                                         injected_targets.insert(t.id.clone());
                                         continue;
@@ -319,7 +393,7 @@ pub fn start_cdp_injection_loop() {
                                     let plugins = crate::plugin_loader_linux::load_all_plugins()
                                         .unwrap_or_default();
                                     if let Err(e) = crate::injector::inject_into_target(
-                                        &mut client,
+                                        &mut crate::transport::Transport::Tcp(&mut client),
                                         t,
                                         &plugins,
                                         &theme_bundle,
@@ -333,8 +407,10 @@ pub fn start_cdp_injection_loop() {
                                         injected_targets.insert(t.id.clone());
                                         known_urls.insert(t.id.clone(), t.url.clone());
                                     }
-                                } else if t.target_type == "page" && injected_targets.contains(&t.id) {
-                                    // Detect URL change on existing store target → re-inject immediately
+                                } else if t.target_type == "page"
+                                    && injected_targets.contains(&t.id)
+                                {
+                                    // Detect URL change on existing store target â†’ re-inject immediately
                                     if t.url.contains("store.steampowered.com") {
                                         if let Some(prev_url) = known_urls.get(&t.id) {
                                             if prev_url != &t.url {
@@ -344,10 +420,13 @@ pub fn start_cdp_injection_loop() {
                                                     &prev_url[..prev_url.len().min(80)],
                                                     &t.url[..t.url.len().min(80)]
                                                 ));
-                                                let plugins = crate::plugin_loader_linux::load_all_plugins()
-                                                    .unwrap_or_default();
+                                                let plugins =
+                                                    crate::plugin_loader_linux::load_all_plugins()
+                                                        .unwrap_or_default();
                                                 if let Err(e) = crate::injector::inject_into_target(
-                                                    &mut client,
+                                                    &mut crate::transport::Transport::Tcp(
+                                                        &mut client,
+                                                    ),
                                                     t,
                                                     &plugins,
                                                     &theme_bundle,
@@ -363,7 +442,10 @@ pub fn start_cdp_injection_loop() {
                             }
                         }
                         Err(e) => {
-                            crate::log_to_temp(&format!("[steamcdp] get_targets error: {}, trying reconnect...", e));
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] get_targets error: {}, trying reconnect...",
+                                e
+                            ));
                             match crate::cdp::CdpClient::connect(port) {
                                 Ok(mut new_client) => {
                                     crate::log_to_temp("[steamcdp] Reconnected to CDP");
@@ -380,7 +462,10 @@ pub fn start_cdp_injection_loop() {
                                     }
                                 }
                                 Err(e2) => {
-                                    crate::log_to_temp(&format!("[steamcdp] Reconnect failed: {}", e2));
+                                    crate::log_to_temp(&format!(
+                                        "[steamcdp] Reconnect failed: {}",
+                                        e2
+                                    ));
                                 }
                             }
                         }
@@ -388,15 +473,19 @@ pub fn start_cdp_injection_loop() {
                 }
                 crate::log_to_temp("[steamcdp] CDP connection lost, reconnecting...");
             }
-            Err(e) => {
-                crate::log_to_temp(&format!(
-                    "[steamcdp] CDP connect attempt {} failed: {}",
-                    attempt, e
-                ));
+            None => {
+                // Throttle: first 10 failures, then one every 30 attempts
+                // (~1 min at the 2s cap) so the log stays readable.
+                if attempt <= 10 || attempt % 30 == 0 {
+                    crate::log_to_temp(&format!(
+                        "[steamcdp] CDP connect attempt {} failed: {}",
+                        attempt,
+                        errs.join("; ")
+                    ));
+                }
             }
         }
     }
-    crate::log_to_temp("[steamcdp] Max attempts reached, giving up");
 }
 
 /// Inject --remote-debugging-port into execve arguments.
@@ -413,31 +502,24 @@ mod tests {
 
     #[test]
     fn test_inject_debug_port() {
-        let argv = vec![
-            "steamwebhelper".to_string(),
-            "--some-arg".to_string(),
-        ];
+        let argv = vec!["steamwebhelper".to_string(), "--some-arg".to_string()];
         let result = maybe_inject_debug_port(&argv);
         assert!(result.is_some());
         let new_argv = result.unwrap();
-        assert!(new_argv.iter().any(|a| a.contains("--remote-debugging-port")));
+        assert!(new_argv
+            .iter()
+            .any(|a| a.contains("--remote-debugging-port")));
     }
 
     #[test]
     fn test_skip_type_flag() {
-        let argv = vec![
-            "steamwebhelper".to_string(),
-            "--type=renderer".to_string(),
-        ];
+        let argv = vec!["steamwebhelper".to_string(), "--type=renderer".to_string()];
         assert!(maybe_inject_debug_port(&argv).is_none());
     }
 
     #[test]
     fn test_skip_non_webhelper() {
-        let argv = vec![
-            "steam".to_string(),
-            "--some-arg".to_string(),
-        ];
+        let argv = vec!["steam".to_string(), "--some-arg".to_string()];
         assert!(maybe_inject_debug_port(&argv).is_none());
     }
 

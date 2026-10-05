@@ -1,4 +1,5 @@
-use crate::cdp::{CdpClient, Target};
+use crate::cdp::Target;
+use crate::transport::Transport;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::fs;
@@ -13,7 +14,7 @@ fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
     crate::plugin_loader_linux::load_enabled_plugins()
 }
 
-// ─── Theme data (parsed from theme-manifest.json) ───────────────────────────
+// â”€â”€â”€ Theme data (parsed from theme-manifest.json) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub struct ThemePatchEntry {
     pub match_regex: String,
@@ -52,8 +53,7 @@ impl ThemeBundle {
 
 /// Load theme data from theme-manifest.json written by theme.rs
 pub fn load_theme_patches() -> ThemeBundle {
-    let manifest_path = crate::platform::runtime_dir()
-        .join("theme-manifest.json");
+    let manifest_path = crate::platform::runtime_dir().join("theme-manifest.json");
 
     let content = match fs::read_to_string(&manifest_path) {
         Ok(c) => c,
@@ -137,7 +137,7 @@ pub fn load_theme_patches() -> ThemeBundle {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Conditions: resolve selectedValue → values[targetCss/targetJs] with affects
+    // Conditions: resolve selectedValue â†’ values[targetCss/targetJs] with affects
     let mut condition_css = Vec::new();
     let mut condition_js = Vec::new();
     let mut slider_css = String::new();
@@ -145,7 +145,7 @@ pub fn load_theme_patches() -> ThemeBundle {
 
     if let Some(conds) = manifest.get("conditions").and_then(|c| c.as_object()) {
         for (name, cond) in conds {
-            // Slider conditions → :root variables
+            // Slider conditions â†’ :root variables
             if let Some(slider) = cond.get("slider") {
                 if let (Some(var_name), Some(current)) = (
                     slider.get("cssVariable").and_then(|v| v.as_str()),
@@ -245,7 +245,7 @@ fn path_to_vfs_url(theme_dir: &str, absolute_path: &str) -> String {
     format!("https://lumaforge.local/themes/{}", relative_fwd)
 }
 
-// ─── Regex matching ─────────────────────────────────────────────────────────
+// â”€â”€â”€ Regex matching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 fn regex_matches(pattern: &str, text: &str) -> bool {
     if pattern == ".*" {
@@ -259,16 +259,25 @@ fn regex_matches(pattern: &str, text: &str) -> bool {
 
 /// Millennium-compatible window matching (same semantics as cef_hook):
 /// regex on the window title, substring on ".<class token>" entries from
-/// <html>/<body> classes, plus the `^Steam$` → `^Steam Games List$` alias for
+/// <html>/<body> classes, plus the `^Steam$` â†’ `^Steam Games List$` alias for
 /// patches (Millennium patcher/index.ts EvaluatePatches).
-fn window_matches(pattern: &str, title: &str, html_class: &str, body_class: &str, use_alias: bool) -> bool {
+fn window_matches(
+    pattern: &str,
+    title: &str,
+    html_class: &str,
+    body_class: &str,
+    use_alias: bool,
+) -> bool {
     if pattern == ".*" {
         return true;
     }
     if regex_matches(pattern, title) {
         return true;
     }
-    for token in html_class.split_whitespace().chain(body_class.split_whitespace()) {
+    for token in html_class
+        .split_whitespace()
+        .chain(body_class.split_whitespace())
+    {
         if format!(".{}", token).contains(pattern) {
             return true;
         }
@@ -279,7 +288,7 @@ fn window_matches(pattern: &str, title: &str, html_class: &str, body_class: &str
     false
 }
 
-/// Fallback accent palette (Steam blue) — the injector path can't call the
+/// Fallback accent palette (Steam blue) â€” the injector path can't call the
 /// Windows uxtheme APIs (cef_hook does that on Windows); Linux gets this.
 const ACCENT_FALLBACK: [&str; 7] = [
     "#66c0ff", "#8fd1ff", "#abdfff", "#ccefff", "#4da6e8", "#3b8bc9", "#2a70aa",
@@ -300,7 +309,11 @@ fn accent_css() -> String {
             css.push_str(&format!("    --SystemAccentColor-RGB: {};\n", rgb(hex)));
         } else {
             css.push_str(&format!("    --SystemAccentColor{}: {};\n", name, hex));
-            css.push_str(&format!("    --SystemAccentColor{}-RGB: {};\n", name, rgb(hex)));
+            css.push_str(&format!(
+                "    --SystemAccentColor{}-RGB: {};\n",
+                name,
+                rgb(hex)
+            ));
         }
     };
     push("", ACCENT_FALLBACK[0]);
@@ -323,7 +336,7 @@ fn js_escape_str(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
-fn eval_js(client: &mut CdpClient, msg_id: &mut u64, expression: String) -> Result<(), String> {
+fn eval_js(client: &mut Transport<'_>, msg_id: &mut u64, expression: String) -> Result<(), String> {
     let id = *msg_id;
     let resp = client.send_cdp_wait(
         &json!({
@@ -341,7 +354,11 @@ fn eval_js(client: &mut CdpClient, msg_id: &mut u64, expression: String) -> Resu
 }
 
 /// Add a <link rel=stylesheet> to the page, deduped via a data-lmf attribute.
-fn inject_stylesheet(client: &mut CdpClient, msg_id: &mut u64, vfs_url: &str) -> Result<(), String> {
+fn inject_stylesheet(
+    client: &mut Transport<'_>,
+    msg_id: &mut u64,
+    vfs_url: &str,
+) -> Result<(), String> {
     let script = format!(
         "(function(){{\
             var u='{}';\
@@ -356,7 +373,11 @@ fn inject_stylesheet(client: &mut CdpClient, msg_id: &mut u64, vfs_url: &str) ->
 }
 
 /// Add a <script type=module> to the page, deduped via a data-lmf attribute.
-fn inject_module_script(client: &mut CdpClient, msg_id: &mut u64, vfs_url: &str) -> Result<(), String> {
+fn inject_module_script(
+    client: &mut Transport<'_>,
+    msg_id: &mut u64,
+    vfs_url: &str,
+) -> Result<(), String> {
     let script = format!(
         "(function(){{\
             var u='{}';\
@@ -372,7 +393,7 @@ fn inject_module_script(client: &mut CdpClient, msg_id: &mut u64, vfs_url: &str)
 
 /// Add an inline <style> with the given id, deduped by id.
 fn inject_inline_style(
-    client: &mut CdpClient,
+    client: &mut Transport<'_>,
     msg_id: &mut u64,
     style_id: &str,
     css: &str,
@@ -392,7 +413,7 @@ fn inject_inline_style(
     eval_js(client, msg_id, script)
 }
 
-// ─── Main injection entry point ─────────────────────────────────────────────
+// â”€â”€â”€ Main injection entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Check if a target URL belongs to a real Steam page (not a context menu, footer, or internal UI).
 pub(crate) fn is_real_steam_page(url: &str) -> bool {
@@ -403,11 +424,11 @@ pub(crate) fn is_real_steam_page(url: &str) -> bool {
         || url.contains("library.steampowered.com")
 }
 
-/// Bridge proxy JS — intercepts fetch() to the CDP proxy bridge and routes
+/// Bridge proxy JS â€” intercepts fetch() to the CDP proxy bridge and routes
 /// it through a global queue so the Rust watcher loop can fulfill requests
-/// without mixed-content issues (HTTPS page → HTTP bridge).
+/// without mixed-content issues (HTTPS page â†’ HTTP bridge).
 /// If the cef_hook native bridge (`__luma_bridge_call`) is present, that is
-/// preferred — it fulfills immediately without waiting for the Rust drain.
+/// preferred â€” it fulfills immediately without waiting for the Rust drain.
 pub const BRIDGE_PROXY_JS: &str = r#"
 (function(){
   if (window.__lumaBridgeProxyInstalled) return;
@@ -420,7 +441,7 @@ pub const BRIDGE_PROXY_JS: &str = r#"
     var isBridge = (urlStr.indexOf('127.0.0.1:21775') !== -1 || urlStr.indexOf('localhost:21775') !== -1 ||
                     urlStr.indexOf('127.0.0.1:21776') !== -1 || urlStr.indexOf('localhost:21776') !== -1);
     if (isBridge) {
-      // Prefer native bridge (cef_hook) when available — no drain latency
+      // Prefer native bridge (cef_hook) when available â€” no drain latency
       if (typeof window.__luma_bridge_call === 'function') {
         var nativePath = urlStr.replace(/^https?:\/\/[^\/]+/, '');
         if (!nativePath) nativePath = '/';
@@ -481,11 +502,11 @@ pub const BRIDGE_PROXY_JS: &str = r#"
 })();
 "#;
 
-pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
+pub fn inject_all(client: &mut Transport<'_>) -> Result<(), String> {
     let plugins = load_enabled_plugins().unwrap_or_default();
     let bundle = load_theme_patches();
 
-    // Skip injection entirely when there's nothing to inject — avoids unnecessary
+    // Skip injection entirely when there's nothing to inject â€” avoids unnecessary
     // CDP connections, Page.enable, and Page.setBypassCSP that can break page
     // functionality (e.g., Steam agecheck pages).
     if plugins.is_empty() && bundle.is_empty() {
@@ -494,7 +515,8 @@ pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     }
 
     let targets = client.get_targets()?;
-    let pages: Vec<&Target> = targets.iter()
+    let pages: Vec<&Target> = targets
+        .iter()
         .filter(|t| t.target_type == "page" && is_real_steam_page(&t.url))
         .collect();
 
@@ -518,10 +540,10 @@ pub fn inject_all(client: &mut CdpClient) -> Result<(), String> {
     Ok(())
 }
 
-// ─── Per-target injection ───────────────────────────────────────────────────
+// â”€â”€â”€ Per-target injection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub fn inject_into_target(
-    client: &mut CdpClient,
+    client: &mut Transport<'_>,
     target: &Target,
     plugins: &[crate::plugin::LoadedPlugin],
     bundle: &ThemeBundle,
@@ -564,7 +586,7 @@ pub fn inject_into_target(
     }
     msg_id += 1;
 
-    // ─── Theme: window identity (title + <html>/<body> classes) ────────────
+    // â”€â”€â”€ Theme: window identity (title + <html>/<body> classes) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let identity_expr = r#"JSON.stringify({t:document.title||'',h:(document.documentElement&&document.documentElement.className)||'',b:(document.body&&document.body.className)||''})"#;
     let (win_title, html_class, body_class) = match client.send_cdp_wait(
         &json!({
@@ -574,49 +596,71 @@ pub fn inject_into_target(
         }),
         msg_id,
     ) {
-        Ok(resp) => {
-            resp.get("result")
-                .and_then(|r| r.get("result"))
-                .and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str())
-                .and_then(|v| serde_json::from_str::<Value>(v).ok())
-                .map(|v| {
-                    (
-                        v.get("t").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                        v.get("h").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                        v.get("b").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    )
-                })
-                .unwrap_or_else(|| (target.title.clone(), String::new(), String::new()))
-        }
+        Ok(resp) => resp
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .and_then(|v| serde_json::from_str::<Value>(v).ok())
+            .map(|v| {
+                (
+                    v.get("t")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("h")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("b")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .unwrap_or_else(|| (target.title.clone(), String::new(), String::new())),
         Err(_) => (target.title.clone(), String::new(), String::new()),
     };
     msg_id += 1;
 
-    // ─── Theme: accent colors, root colors, webkit, slider vars ────────────
+    // â”€â”€â”€ Theme: accent colors, root colors, webkit, slider vars â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if !bundle.is_empty() {
-        inject_inline_style(client, &mut msg_id, "SystemAccentColorInject", &accent_css())?;
+        inject_inline_style(
+            client,
+            &mut msg_id,
+            "SystemAccentColorInject",
+            &accent_css(),
+        )?;
         if let Some(ref rc) = bundle.root_colors {
             match fs::read_to_string(rc) {
                 Ok(css) => inject_inline_style(client, &mut msg_id, "RootColors", &css)?,
-                Err(e) => crate::log_to_temp(&format!(
-                    "[steamcdp] rootColors read error ({}): {}",
-                    rc, e
-                )),
+                Err(e) => {
+                    crate::log_to_temp(&format!("[steamcdp] rootColors read error ({}): {}", rc, e))
+                }
             }
         }
         if let Some(ref css) = bundle.webkit_css {
             inject_stylesheet(client, &mut msg_id, css)?;
         }
         if !bundle.slider_css.is_empty() {
-            inject_inline_style(client, &mut msg_id, "MillenniumSliderConditions", &bundle.slider_css)?;
+            inject_inline_style(
+                client,
+                &mut msg_id,
+                "MillenniumSliderConditions",
+                &bundle.slider_css,
+            )?;
         }
     }
 
-    // ─── Theme patches: inject <link>/<script type="module"> via VFS URLs ─
+    // â”€â”€â”€ Theme patches: inject <link>/<script type="module"> via VFS URLs â”€
     for patch in &bundle.patches {
-        let matches = window_matches(&patch.match_regex, &win_title, &html_class, &body_class, true)
-            || regex_matches(&patch.match_regex, &target.url);
+        let matches = window_matches(
+            &patch.match_regex,
+            &win_title,
+            &html_class,
+            &body_class,
+            true,
+        ) || regex_matches(&patch.match_regex, &target.url);
 
         if !matches {
             continue;
@@ -643,9 +687,12 @@ pub fn inject_into_target(
         }
     }
 
-    // ─── Conditions: selected value → targetCss/targetJs with affects ──────
+    // â”€â”€â”€ Conditions: selected value â†’ targetCss/targetJs with affects â”€â”€â”€â”€â”€â”€
     for cond in &bundle.condition_css {
-        let matched = cond.affects.iter().any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
+        let matched = cond
+            .affects
+            .iter()
+            .any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
         if matched {
             let vfs_url = path_to_vfs_url(&bundle.dir, &cond.src);
             inject_stylesheet(client, &mut msg_id, &vfs_url)?;
@@ -657,7 +704,10 @@ pub fn inject_into_target(
     }
     if !bundle.condition_js.is_empty() {
         for cond in &bundle.condition_js {
-            let matched = cond.affects.iter().any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
+            let matched = cond
+                .affects
+                .iter()
+                .any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
             if matched {
                 let vfs_url = path_to_vfs_url(&bundle.dir, &cond.src);
                 inject_module_script(client, &mut msg_id, &vfs_url)?;
@@ -665,7 +715,7 @@ pub fn inject_into_target(
         }
     }
 
-    // ─── Bridge proxy: intercept fetch() for HTTPS→HTTP mixed content ───
+    // â”€â”€â”€ Bridge proxy: intercept fetch() for HTTPSâ†’HTTP mixed content â”€â”€â”€
     // Register for future navigations
     let resp = client.send_cdp_wait(
         &json!({
@@ -704,9 +754,9 @@ pub fn inject_into_target(
     }
     msg_id += 1;
 
-    // ─── Plugins ──────────────────────────────────────────────────────
+    // â”€â”€â”€ Plugins â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for plugin in plugins {
-        // Respect activation.targetUrl — only inject into matching pages
+        // Respect activation.targetUrl â€” only inject into matching pages
         if let Some(ref pattern) = plugin.target_url {
             if !pattern.is_empty() && !target.url.contains(pattern.as_str()) {
                 crate::log_to_temp(&format!(
@@ -770,8 +820,12 @@ pub fn inject_into_target(
             ));
         } else if let Some(result) = resp.get("result") {
             if let Some(exc) = result.get("exceptionDetails") {
-                let text = exc.get("text").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let desc = exc.get("exception")
+                let text = exc
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let desc = exc
+                    .get("exception")
                     .and_then(|e| e.get("description"))
                     .and_then(|d| d.as_str())
                     .unwrap_or("");
@@ -824,7 +878,8 @@ pub fn inject_into_target(
         }),
         msg_id,
     )?;
-    let result_str = test_resp.get("result")
+    let result_str = test_resp
+        .get("result")
         .and_then(|r| r.get("result"))
         .and_then(|r| r.get("value"))
         .and_then(|v| v.as_str())
@@ -846,7 +901,13 @@ mod tests {
     fn window_matches_millennium_semantics() {
         assert!(window_matches("^Steam$", "Steam", "", "", true));
         assert!(window_matches("^Steam$", "Steam Games List", "", "", true));
-        assert!(!window_matches("^Steam$", "Steam Games List", "", "", false));
+        assert!(!window_matches(
+            "^Steam$",
+            "Steam Games List",
+            "",
+            "",
+            false
+        ));
         assert!(window_matches(
             ".friendsui-container",
             "Friends",

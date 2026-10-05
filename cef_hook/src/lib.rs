@@ -1,3 +1,7 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -5,9 +9,6 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::{connect, Message};
-use serde_json::{json, Value};
-use serde::Deserialize;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 // Flattened CDP sessions for targets we auto-attached to (targetId → sessionId),
 // plus targets that already got the theme script registered/evaluated.
@@ -16,6 +17,14 @@ static REGISTERED_TARGETS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new
 // (sessionId, target url) — used to re-push the CSS payload to steamloopback
 // sessions after a theme reload.
 static SESSION_URLS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+// Sessions that got a session-scoped Fetch.enable (VFS/bridge request-stage
+// patterns). Store sessions are NOT in this set: their request pauses come
+// from the browser-level enable, so their interception ids are root ids even
+// though the pause event carries the store session's sid.
+static SESSION_FETCH: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The last `socket.send` hit a transient write error: the frame is retained
+/// in tungstenite's out_buffer and the main loop must retry with `flush()`.
+static WS_WRITE_STALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 mod accent;
 
@@ -69,7 +78,10 @@ thread_local! {
 /// Record every received CDP message so the log of a dead connection shows
 /// exactly what arrived last before the reset.
 fn note_rx(msg: &Value) {
-    let method = msg.get("method").and_then(|m| m.as_str()).map(|s| s.to_string());
+    let method = msg
+        .get("method")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
     let summary = match &method {
         Some(m) => m.clone(),
         None => format!(
@@ -110,7 +122,9 @@ fn resolve_debug_port() -> Option<u16> {
     if let Some(pos) = cmd_line.to_lowercase().find("--remote-debugging-port=") {
         let start = pos + "--remote-debugging-port=".len();
         let remaining = &cmd_line[start..];
-        let end = remaining.find(|c: char| !c.is_ascii_digit()).unwrap_or(remaining.len());
+        let end = remaining
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(remaining.len());
         if let Ok(port) = remaining[..end].parse::<u16>() {
             log_to_temp(&format!("[cef_hook] Using port from args: {}", port));
             return Some(port);
@@ -216,7 +230,10 @@ impl ThemeState {
     }
 
     fn theme_dir_str(&self) -> String {
-        self.theme_dir.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+        self.theme_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -326,20 +343,76 @@ struct DefaultPatch {
 
 fn get_default_patches() -> Vec<DefaultPatch> {
     vec![
-        DefaultPatch { match_regex: "^Steam$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "^OverlayBrowser_Browser$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "^SP Overlay:", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "Menu$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "Supernav$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "^notificationtoasts_", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "^SteamBrowser_Find$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "^OverlayTab\\d+_Find$", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: "^Steam Big Picture Mode$", target_css: "bigpicture.custom.css", target_js: Some("bigpicture.custom.js") },
-        DefaultPatch { match_regex: "^QuickAccess_", target_css: "bigpicture.custom.css", target_js: Some("bigpicture.custom.js") },
-        DefaultPatch { match_regex: "^MainMenu_", target_css: "bigpicture.custom.css", target_js: Some("bigpicture.custom.js") },
-        DefaultPatch { match_regex: ".friendsui-container", target_css: "friends.custom.css", target_js: Some("friends.custom.js") },
-        DefaultPatch { match_regex: ".ModalDialogPopup", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
-        DefaultPatch { match_regex: ".FullModalOverlay", target_css: "libraryroot.custom.css", target_js: Some("libraryroot.custom.js") },
+        DefaultPatch {
+            match_regex: "^Steam$",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^OverlayBrowser_Browser$",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^SP Overlay:",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "Menu$",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "Supernav$",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^notificationtoasts_",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^SteamBrowser_Find$",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^OverlayTab\\d+_Find$",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^Steam Big Picture Mode$",
+            target_css: "bigpicture.custom.css",
+            target_js: Some("bigpicture.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^QuickAccess_",
+            target_css: "bigpicture.custom.css",
+            target_js: Some("bigpicture.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: "^MainMenu_",
+            target_css: "bigpicture.custom.css",
+            target_js: Some("bigpicture.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: ".friendsui-container",
+            target_css: "friends.custom.css",
+            target_js: Some("friends.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: ".ModalDialogPopup",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
+        DefaultPatch {
+            match_regex: ".FullModalOverlay",
+            target_css: "libraryroot.custom.css",
+            target_js: Some("libraryroot.custom.js"),
+        },
     ]
 }
 
@@ -353,12 +426,20 @@ fn file_mtime_secs(path: &PathBuf) -> Option<u64> {
 
 fn runtime_dir() -> Option<PathBuf> {
     let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
-    Some(PathBuf::from(local_appdata).join("LumaForge").join("runtime"))
+    Some(
+        PathBuf::from(local_appdata)
+            .join("LumaForge")
+            .join("runtime"),
+    )
 }
 
 fn themes_base_dir() -> Option<PathBuf> {
     let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
-    Some(PathBuf::from(local_appdata).join("LumaForge").join("themes"))
+    Some(
+        PathBuf::from(local_appdata)
+            .join("LumaForge")
+            .join("themes"),
+    )
 }
 
 /// No active.json (or no activeTheme in it): pick the first theme dir that has
@@ -447,30 +528,49 @@ fn load_theme_manifest(state: &mut ThemeState) {
     let active_json: Value = match serde_json::from_str(active_json_content) {
         Ok(v) => v,
         Err(e) => {
-            log_to_temp(&format!("[cef_hook] Failed to parse active.json: {} (len={}), retrying...", e, active_json_content.len()));
+            log_to_temp(&format!(
+                "[cef_hook] Failed to parse active.json: {} (len={}), retrying...",
+                e,
+                active_json_content.len()
+            ));
             let mut last_err = e.to_string();
             let mut parsed_value = None;
             for delay_ms in [50, 150, 300, 500, 1000] {
                 std::thread::sleep(Duration::from_millis(delay_ms));
                 let retry_content = match fs::read_to_string(&active_json_path) {
                     Ok(c) => c,
-                    Err(_) => { last_err = "file not found".to_string(); continue; }
+                    Err(_) => {
+                        last_err = "file not found".to_string();
+                        continue;
+                    }
                 };
                 let retry_content = retry_content.trim_start_matches('\u{FEFF}').trim();
-                log_to_temp(&format!("[cef_hook] Retry at {}ms: len={}", delay_ms, retry_content.len()));
+                log_to_temp(&format!(
+                    "[cef_hook] Retry at {}ms: len={}",
+                    delay_ms,
+                    retry_content.len()
+                ));
                 if retry_content.is_empty() {
                     last_err = "empty file".to_string();
                     continue;
                 }
                 match serde_json::from_str::<Value>(retry_content) {
-                    Ok(v) => { parsed_value = Some(v); break; }
-                    Err(e2) => { last_err = e2.to_string(); }
+                    Ok(v) => {
+                        parsed_value = Some(v);
+                        break;
+                    }
+                    Err(e2) => {
+                        last_err = e2.to_string();
+                    }
                 }
             }
             match parsed_value {
                 Some(v) => v,
                 None => {
-                    log_to_temp(&format!("[cef_hook] All retries failed ({}), keeping previous state", last_err));
+                    log_to_temp(&format!(
+                        "[cef_hook] All retries failed ({}), keeping previous state",
+                        last_err
+                    ));
                     return;
                 }
             }
@@ -482,7 +582,8 @@ fn load_theme_manifest(state: &mut ThemeState) {
     // falls through to auto-select (fresh install: theme copied, nothing
     // configured yet — Millennium activates on import).
     let active_theme_value = active_json
-        .get("themes").and_then(|t| t.get("activeTheme"))
+        .get("themes")
+        .and_then(|t| t.get("activeTheme"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -513,7 +614,8 @@ fn load_theme_manifest(state: &mut ThemeState) {
     let skin_json_path = theme_dir.join("skin.json");
 
     let skin_json_mtime = file_mtime_secs(&skin_json_path);
-    if skin_json_mtime == state.skin_json_mtime && state.theme_name.as_deref() == Some(&theme_name) {
+    if skin_json_mtime == state.skin_json_mtime && state.theme_name.as_deref() == Some(&theme_name)
+    {
         return;
     }
     state.skin_json_mtime = skin_json_mtime;
@@ -523,7 +625,10 @@ fn load_theme_manifest(state: &mut ThemeState) {
     let skin_content = match fs::read_to_string(&skin_json_path) {
         Ok(c) => c,
         Err(_) => {
-            log_to_temp(&format!("[cef_hook] No skin.json at {:?}, loading legacy", skin_json_path));
+            log_to_temp(&format!(
+                "[cef_hook] No skin.json at {:?}, loading legacy",
+                skin_json_path
+            ));
             load_legacy_theme(state);
             return;
         }
@@ -541,12 +646,14 @@ fn load_theme_manifest(state: &mut ThemeState) {
     state.theme_dir = Some(theme_dir.clone());
 
     // 3. Webkit CSS (global — injected into ALL documents)
-    state.webkit_css_path = skin.steam_webkit.as_ref().map(|rel| {
-        theme_dir.join(rel).to_string_lossy().into_owned()
-    });
-    state.webkit_js_path = skin.webkit_js.as_ref().map(|rel| {
-        theme_dir.join(rel).to_string_lossy().into_owned()
-    });
+    state.webkit_css_path = skin
+        .steam_webkit
+        .as_ref()
+        .map(|rel| theme_dir.join(rel).to_string_lossy().into_owned());
+    state.webkit_js_path = skin
+        .webkit_js
+        .as_ref()
+        .map(|rel| theme_dir.join(rel).to_string_lossy().into_owned());
 
     // 4. RootColors — read the :root CSS inline (relative url()s → VFS)
     state.root_colors_content = skin.root_colors.as_ref().and_then(|rel| {
@@ -565,20 +672,33 @@ fn load_theme_manifest(state: &mut ThemeState) {
 
     // 5. Build patches — explicit + UseDefaultPatches defaults
     let use_defaults = skin.use_default_patches.unwrap_or(true);
-    let mut patches: Vec<PatchEntry> = skin.patches.iter().filter_map(|sp| {
-        let regex = sp.match_regex_string.clone().unwrap_or_else(|| ".*".to_string());
-        let target_css = sp.target_css.as_ref().map(|rel| {
-            theme_dir.join(rel).to_string_lossy().into_owned()
-        });
-        let target_js = sp.target_js.as_ref().map(|rel| {
-            theme_dir.join(rel).to_string_lossy().into_owned()
-        });
-        if target_css.is_some() || target_js.is_some() {
-            Some(PatchEntry { match_regex: regex, target_css, target_js })
-        } else {
-            None
-        }
-    }).collect();
+    let mut patches: Vec<PatchEntry> = skin
+        .patches
+        .iter()
+        .filter_map(|sp| {
+            let regex = sp
+                .match_regex_string
+                .clone()
+                .unwrap_or_else(|| ".*".to_string());
+            let target_css = sp
+                .target_css
+                .as_ref()
+                .map(|rel| theme_dir.join(rel).to_string_lossy().into_owned());
+            let target_js = sp
+                .target_js
+                .as_ref()
+                .map(|rel| theme_dir.join(rel).to_string_lossy().into_owned());
+            if target_css.is_some() || target_js.is_some() {
+                Some(PatchEntry {
+                    match_regex: regex,
+                    target_css,
+                    target_js,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
 
     // When UseDefaultPatches is true, merge defaults like Millennium
     if use_defaults && patches.is_empty() {
@@ -615,7 +735,8 @@ fn load_theme_manifest(state: &mut ThemeState) {
     state.slider_css.clear();
 
     let saved_conditions = active_json
-        .get("themes").and_then(|t| t.get("conditions"))
+        .get("themes")
+        .and_then(|t| t.get("conditions"))
         .and_then(|c| c.get(&theme_name));
 
     let mut slider_vars: Vec<(String, String)> = Vec::new();
@@ -640,7 +761,10 @@ fn load_theme_manifest(state: &mut ThemeState) {
                 // both JSON numbers and numeric strings.
                 let saved_val = saved_conditions
                     .and_then(|sc| sc.get(cond_name))
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok())));
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    });
                 // Millennium seed order (theme_cfg.cc setup_conditionals):
                 // saved -> condition-level default (string|number) -> slider.min -> 0
                 let fallback_val = cond
@@ -679,24 +803,30 @@ fn load_theme_manifest(state: &mut ThemeState) {
                         Err(_) => continue,
                     };
 
-                        if let Some(ref target_css) = entry.target_css {
-                            let affects = target_css.affects.clone().unwrap_or_default();
-                            if let Some(ref src) = target_css.src {
-                                if !src.is_empty() && !affects.is_empty() {
-                                    let abs_path = theme_dir.join(src).to_string_lossy().into_owned();
-                                    state.condition_css.push(ConditionEntry { affects, src: abs_path });
-                                }
+                    if let Some(ref target_css) = entry.target_css {
+                        let affects = target_css.affects.clone().unwrap_or_default();
+                        if let Some(ref src) = target_css.src {
+                            if !src.is_empty() && !affects.is_empty() {
+                                let abs_path = theme_dir.join(src).to_string_lossy().into_owned();
+                                state.condition_css.push(ConditionEntry {
+                                    affects,
+                                    src: abs_path,
+                                });
                             }
                         }
-                        if let Some(ref target_js) = entry.target_js {
-                            let affects = target_js.affects.clone().unwrap_or_default();
-                            if let Some(ref src) = target_js.src {
-                                if !src.is_empty() && !affects.is_empty() {
-                                    let abs_path = theme_dir.join(src).to_string_lossy().into_owned();
-                                    state.condition_js.push(ConditionEntry { affects, src: abs_path });
-                                }
+                    }
+                    if let Some(ref target_js) = entry.target_js {
+                        let affects = target_js.affects.clone().unwrap_or_default();
+                        if let Some(ref src) = target_js.src {
+                            if !src.is_empty() && !affects.is_empty() {
+                                let abs_path = theme_dir.join(src).to_string_lossy().into_owned();
+                                state.condition_js.push(ConditionEntry {
+                                    affects,
+                                    src: abs_path,
+                                });
                             }
                         }
+                    }
                 }
             }
         }
@@ -723,8 +853,12 @@ fn load_theme_manifest(state: &mut ThemeState) {
 
 /// Legacy fallback: read current.css/current.js from themes dir
 fn load_legacy_theme(state: &mut ThemeState) {
-    let Ok(local_appdata) = std::env::var("LOCALAPPDATA") else { return; };
-    let themes_dir = PathBuf::from(local_appdata).join("LumaForge").join("themes");
+    let Ok(local_appdata) = std::env::var("LOCALAPPDATA") else {
+        return;
+    };
+    let themes_dir = PathBuf::from(local_appdata)
+        .join("LumaForge")
+        .join("themes");
     let css_path = themes_dir.join("current.css");
     let js_path = themes_dir.join("current.js");
 
@@ -750,7 +884,9 @@ fn load_plugins(state: &mut ThemeState) {
     let Ok(local_appdata) = std::env::var("LOCALAPPDATA") else {
         return;
     };
-    let plugins_dir = PathBuf::from(local_appdata).join("LumaForge").join("plugins");
+    let plugins_dir = PathBuf::from(local_appdata)
+        .join("LumaForge")
+        .join("plugins");
 
     let dir_mtime = file_mtime_secs(&plugins_dir);
     if state.plugins_mtime.is_some() && dir_mtime == state.plugins_mtime {
@@ -786,7 +922,11 @@ fn load_plugins(state: &mut ThemeState) {
             fs::read_to_string(&config_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.get("enabled").and_then(|e| e.as_bool()).or_else(|| v.get("isEnabled").and_then(|e| e.as_bool())))
+                .and_then(|v| {
+                    v.get("enabled")
+                        .and_then(|e| e.as_bool())
+                        .or_else(|| v.get("isEnabled").and_then(|e| e.as_bool()))
+                })
                 .unwrap_or(true)
         } else {
             true
@@ -796,7 +936,8 @@ fn load_plugins(state: &mut ThemeState) {
             continue;
         }
 
-        let plugin_id = manifest.get("id")
+        let plugin_id = manifest
+            .get("id")
             .or_else(|| manifest.get("pluginId"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -818,29 +959,26 @@ fn load_plugins(state: &mut ThemeState) {
             None => continue,
         };
 
-        let target_url = cef_config
-            .and_then(|c| {
-                c.get("targetUrl")
-                    .or_else(|| c.get("target_url"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
+        let target_url = cef_config.and_then(|c| {
+            c.get("targetUrl")
+                .or_else(|| c.get("target_url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
-        let runtime_target_url = cef_config
-            .and_then(|c| {
-                c.get("runtimeTargetUrl")
-                    .or_else(|| c.get("runtime_target_url"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
+        let runtime_target_url = cef_config.and_then(|c| {
+            c.get("runtimeTargetUrl")
+                .or_else(|| c.get("runtime_target_url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
-        let inject_script_rel = cef_config
-            .and_then(|c| {
-                c.get("injectScript")
-                    .or_else(|| c.get("inject_script"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
+        let inject_script_rel = cef_config.and_then(|c| {
+            c.get("injectScript")
+                .or_else(|| c.get("inject_script"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
 
         let code = match fs::read_to_string(&inject_path) {
             Ok(s) => s,
@@ -865,17 +1003,39 @@ fn load_plugins(state: &mut ThemeState) {
 // ─── VFS ────────────────────────────────────────────────────────────────────
 
 fn guess_mime_type(path: &str) -> &str {
-    if path.ends_with(".css") { return "text/css"; }
-    if path.ends_with(".js") { return "application/javascript"; }
-    if path.ends_with(".json") { return "application/json"; }
-    if path.ends_with(".svg") { return "image/svg+xml"; }
-    if path.ends_with(".png") { return "image/png"; }
-    if path.ends_with(".jpg") || path.ends_with(".jpeg") { return "image/jpeg"; }
-    if path.ends_with(".gif") { return "image/gif"; }
-    if path.ends_with(".woff") { return "font/woff"; }
-    if path.ends_with(".woff2") { return "font/woff2"; }
-    if path.ends_with(".ttf") { return "font/ttf"; }
-    if path.ends_with(".html") || path.ends_with(".htm") { return "text/html"; }
+    if path.ends_with(".css") {
+        return "text/css";
+    }
+    if path.ends_with(".js") {
+        return "application/javascript";
+    }
+    if path.ends_with(".json") {
+        return "application/json";
+    }
+    if path.ends_with(".svg") {
+        return "image/svg+xml";
+    }
+    if path.ends_with(".png") {
+        return "image/png";
+    }
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        return "image/jpeg";
+    }
+    if path.ends_with(".gif") {
+        return "image/gif";
+    }
+    if path.ends_with(".woff") {
+        return "font/woff";
+    }
+    if path.ends_with(".woff2") {
+        return "font/woff2";
+    }
+    if path.ends_with(".ttf") {
+        return "font/ttf";
+    }
+    if path.ends_with(".html") || path.ends_with(".htm") {
+        return "text/html";
+    }
     "application/octet-stream"
 }
 
@@ -900,11 +1060,19 @@ fn handle_vfs_request(url: &str, theme_state: &ThemeState) -> Result<Vec<u8>, ()
             Err(_) => return Ok(Vec::new()),
         };
         let file_path = base.join(&decoded);
-        log_to_temp(&format!("[cef_hook] VFS plugins: {} -> {}", url, file_path.display()));
+        log_to_temp(&format!(
+            "[cef_hook] VFS plugins: {} -> {}",
+            url,
+            file_path.display()
+        ));
         return match fs::read(&file_path) {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
-                log_to_temp(&format!("[cef_hook] VFS plugins read error: {} -> {}", file_path.display(), e));
+                log_to_temp(&format!(
+                    "[cef_hook] VFS plugins read error: {} -> {}",
+                    file_path.display(),
+                    e
+                ));
                 Ok(Vec::new())
             }
         };
@@ -922,7 +1090,9 @@ fn handle_vfs_request(url: &str, theme_state: &ThemeState) -> Result<Vec<u8>, ()
     };
 
     // Strip query string / fragment so cache-busted URLs still map to a file
-    let cut = relative.find(|c| c == '?' || c == '#').unwrap_or(relative.len());
+    let cut = relative
+        .find(|c| c == '?' || c == '#')
+        .unwrap_or(relative.len());
     let relative = relative[..cut].to_string();
 
     // Decode URL encoding
@@ -935,12 +1105,20 @@ fn handle_vfs_request(url: &str, theme_state: &ThemeState) -> Result<Vec<u8>, ()
 
     let file_path = theme_dir.join(&decoded);
 
-    log_to_temp(&format!("[cef_hook] VFS: {} -> {}", url, file_path.display()));
+    log_to_temp(&format!(
+        "[cef_hook] VFS: {} -> {}",
+        url,
+        file_path.display()
+    ));
 
     match fs::read(&file_path) {
         Ok(bytes) => Ok(bytes),
         Err(e) => {
-            log_to_temp(&format!("[cef_hook] VFS read error: {} -> {}", file_path.display(), e));
+            log_to_temp(&format!(
+                "[cef_hook] VFS read error: {} -> {}",
+                file_path.display(),
+                e
+            ));
             // Return empty 200 instead of failing — missing CSS/JS files degrade gracefully
             Ok(Vec::new())
         }
@@ -953,7 +1131,7 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or("");
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
             if let Ok(byte) = u8::from_str_radix(hex, 16) {
                 result.push(byte);
                 i += 3;
@@ -973,7 +1151,9 @@ fn percent_decode(s: &str) -> String {
 // ─── Regex matching ─────────────────────────────────────────────────────────
 
 fn regex_matches(pattern: &str, text: &str) -> bool {
-    if pattern == ".*" { return true; }
+    if pattern == ".*" {
+        return true;
+    }
     match regex::Regex::new(pattern) {
         Ok(re) => re.is_match(text),
         Err(_) => text.contains(pattern),
@@ -1002,14 +1182,23 @@ fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
 ///   from <html class> + <body class> (Millennium: '.token'.includes(pattern))
 /// - alias: patches matching `^Steam$` also apply to "Steam Games List" windows
 ///   (only for patches; Millennium's EvaluatePatch skips the alias)
-fn window_matches(pattern: &str, title: &str, html_class: &str, body_class: &str, use_alias: bool) -> bool {
+fn window_matches(
+    pattern: &str,
+    title: &str,
+    html_class: &str,
+    body_class: &str,
+    use_alias: bool,
+) -> bool {
     if pattern == ".*" {
         return true;
     }
     if regex_matches(pattern, title) {
         return true;
     }
-    for token in html_class.split_whitespace().chain(body_class.split_whitespace()) {
+    for token in html_class
+        .split_whitespace()
+        .chain(body_class.split_whitespace())
+    {
         if format!(".{}", token).contains(pattern) {
             return true;
         }
@@ -1098,7 +1287,13 @@ fn inject_theme_html(
 
     // 3. Patches matching this window (title + html/body classes, Millennium alias)
     for patch in &theme_state.patches {
-        if window_matches(&patch.match_regex, window_title, html_class, body_class, true) {
+        if window_matches(
+            &patch.match_regex,
+            window_title,
+            html_class,
+            body_class,
+            true,
+        ) {
             if let Some(ref css_path) = patch.target_css {
                 let vfs_url = build_vfs_css_url(&theme_dir, css_path);
                 head_inject.push_str(&format!(
@@ -1187,9 +1382,10 @@ fn inject_theme_html(
     // 8. Plugins
     if !css_only {
         for plugin in plugins {
-            let matches = plugin.target_url.as_ref().map_or(true, |pattern| {
-                url.contains(pattern.as_str())
-            });
+            let matches = plugin
+                .target_url
+                .as_ref()
+                .map_or(true, |pattern| url.contains(pattern.as_str()));
             if matches {
                 body_inject.push_str(&format!(
                     "<script data-lumaforge-plugin=\"{}\">\n{}\n</script>\n",
@@ -1226,9 +1422,17 @@ fn inject_theme_html(
 // ─── CDP helpers ────────────────────────────────────────────────────────────
 
 fn get_browser_ws_url(port: u16) -> Option<String> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    // connect_timeout: without it a silently dropped loopback SYN hangs the
+    // thread for the OS connect timeout and the retry lines never get logged.
+    let addr = format!("127.0.0.1:{}", port)
+        .parse::<std::net::SocketAddr>()
+        .ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-    let request = format!("GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", port);
+    let request = format!(
+        "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        port
+    );
     stream.write_all(request.as_bytes()).ok()?;
 
     let mut reader = BufReader::new(stream);
@@ -1273,15 +1477,44 @@ fn check_theme_reload_signal(state: &mut ThemeState) -> bool {
     true
 }
 
-fn send_cdp(socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, msg: &Value) -> bool {
-    let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("?").to_string();
+fn send_cdp(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg: &Value,
+) -> bool {
+    let method = msg
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("?")
+        .to_string();
     let id = msg.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
     if let Err(e) = socket.send(Message::Text(msg.to_string())) {
+        let transient = matches!(
+            &e,
+            tungstenite::Error::Io(io)
+                if io.kind() == std::io::ErrorKind::WouldBlock
+                    || io.kind() == std::io::ErrorKind::TimedOut
+        );
+        if transient {
+            // With a short write timeout a full socket surfaces as TimedOut
+            // instead of blocking the dispatch loop for 30s (which froze every
+            // Fetch pause). tungstenite keeps the frame in its out_buffer, so
+            // no resend — the main loop retries with flush().
+            if !WS_WRITE_STALLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log_to_temp(&format!(
+                    "[cef_hook] WS write stalled, frame queued for retry ({} id={})",
+                    method, id
+                ));
+            }
+            return true;
+        }
         log_to_temp(&format!(
             "[cef_hook] WebSocket send error: {} (while sending {} id={})",
             e, method, id
         ));
         return false;
+    }
+    if WS_WRITE_STALLED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        log_to_temp("[cef_hook] WS write recovered");
     }
     CONN_STATS.with(|s| {
         let mut s = s.borrow_mut();
@@ -1317,7 +1550,10 @@ fn recv_cdp_response(
     let deadline = SystemTime::now() + Duration::from_secs(10);
     loop {
         if SystemTime::now() > deadline {
-            log_to_temp(&format!("[cef_hook] Timeout waiting for response id={}", expected_id));
+            log_to_temp(&format!(
+                "[cef_hook] Timeout waiting for response id={}",
+                expected_id
+            ));
             return None;
         }
         match socket.read() {
@@ -1337,7 +1573,8 @@ fn recv_cdp_response(
             }
             Ok(_) => {}
             Err(tungstenite::Error::Io(ref e))
-                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut =>
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
@@ -1400,15 +1637,34 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
 })();"#;
 
 fn proxy_bridge_request(path: &str, method: &str, body: Option<&str>) -> Result<String, String> {
+    let started = Instant::now();
     let mut last_err = String::new();
     // Bridge may bind the primary port or fall back (e.g. TIME_WAIT after a
     // flood of connections leaves 21775 unbindable) — try both.
     for port in [21775u16, 21776] {
         match proxy_bridge_request_on(path, method, body, port) {
-            Ok(v) => return Ok(v),
+            Ok(v) => {
+                if started.elapsed() >= Duration::from_secs(1) {
+                    log_to_temp(&format!(
+                        "[cef_hook] slow bridge request: {} {} took {}ms (port {})",
+                        method,
+                        path,
+                        started.elapsed().as_millis(),
+                        port
+                    ));
+                }
+                return Ok(v);
+            }
             Err(e) => last_err = e,
         }
     }
+    log_to_temp(&format!(
+        "[cef_hook] bridge request failed: {} {} after {}ms: {}",
+        method,
+        path,
+        started.elapsed().as_millis(),
+        last_err
+    ));
     Err(last_err)
 }
 
@@ -1420,7 +1676,7 @@ fn proxy_bridge_request_on(
 ) -> Result<String, String> {
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect({}): {}", addr, e))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
     let method_upper = method.to_uppercase();
     let req = match body {
@@ -1438,9 +1694,13 @@ fn proxy_bridge_request_on(
         ),
     };
 
-    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {}", e))?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write: {}", e))?;
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).map_err(|e| format!("read: {}", e))?;
+    stream
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("read: {}", e))?;
 
     let resp_str = String::from_utf8_lossy(&resp);
     if let Some(pos) = resp_str.find("\r\n\r\n") {
@@ -1599,9 +1859,9 @@ fn install_bridge_shim_session(
 
 fn js_escape_str(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('\'', "\\'")
-     .replace('\n', "\\n")
-     .replace('\r', "\\r")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Regex covering the CSS `@import` forms: `url('…')`, `url("…")`, `url(…)`,
@@ -1644,11 +1904,7 @@ fn url_re() -> &'static regex::Regex {
 /// and fragment refs are left untouched, as are refs that would escape the
 /// theme root. `file_dir` is the directory of the file being processed so
 /// each recursion level resolves against its own location.
-fn rewrite_css_urls(
-    css: &str,
-    file_dir: &std::path::Path,
-    theme_dir: &std::path::Path,
-) -> String {
+fn rewrite_css_urls(css: &str, file_dir: &std::path::Path, theme_dir: &std::path::Path) -> String {
     let rel_dir = match file_dir.strip_prefix(theme_dir) {
         Ok(r) => r.to_path_buf(),
         Err(_) => return css.to_string(),
@@ -1732,7 +1988,11 @@ fn expand_css_imports(
     let mut last = 0;
     for caps in re.captures_iter(css) {
         let m = caps.get(0).unwrap();
-        out.push_str(&rewrite_css_urls(&css[last..m.start()], base_dir, theme_dir));
+        out.push_str(&rewrite_css_urls(
+            &css[last..m.start()],
+            base_dir,
+            theme_dir,
+        ));
         last = m.end();
         let url = match (1..=6).find_map(|i| caps.get(i)) {
             Some(u) => u.as_str().trim(),
@@ -1936,7 +2196,11 @@ fn push_css_payload(
         "try{{window.__lumaCSS={};document.dispatchEvent(new CustomEvent('lumaforge:theme-reload'));}}catch(e){{}}",
         payload
     );
-    log_to_temp(&format!("[cef_hook] pushCSS: sid={} expr_len={}", sid, expr.len()));
+    log_to_temp(&format!(
+        "[cef_hook] pushCSS: sid={} expr_len={}",
+        sid,
+        expr.len()
+    ));
     let eval = json!({
         "id": *msg_id,
         "method": "Runtime.evaluate",
@@ -2312,8 +2576,16 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
         let (Some(vfs), Some(rt)) = (p.vfs_rel.as_ref(), p.runtime_target_url.as_ref()) else {
             continue;
         };
-        let safe_id: String = p.name.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        let safe_id: String = p
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         if safe_id.is_empty() || vfs.is_empty() || rt.is_empty() {
             continue;
@@ -2326,7 +2598,9 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     js = js.replace("PLUGINS_MANIFEST_PLACEHOLDER", &plugins_json);
 
     // 2. Webkit CSS
-    let webkit_url = theme_state.webkit_css_path.as_ref()
+    let webkit_url = theme_state
+        .webkit_css_path
+        .as_ref()
         .map(|css| build_vfs_css_url(&theme_dir, css))
         .unwrap_or_default();
     js = js.replace("WEBKITCSS_PLACEHOLDER", &webkit_url);
@@ -2342,7 +2616,8 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
             })
         })
         .collect();
-    let cond_css_json = serde_json::to_string(&cond_css_entries).unwrap_or_else(|_| "[]".to_string());
+    let cond_css_json =
+        serde_json::to_string(&cond_css_entries).unwrap_or_else(|_| "[]".to_string());
     js = js.replace("CONDITION_CSS_PLACEHOLDER", &cond_css_json);
 
     // 4. Slider CSS
@@ -2375,7 +2650,10 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
             Some(ref jsf) => format!("'{}'", js_escape_str(&build_vfs_css_url(&theme_dir, jsf))),
             None => "''".to_string(),
         };
-        patches_json.push_str(&format!("{{r:'{}',c:{},j:{}}},", regex_escaped, vfs_css, vfs_js));
+        patches_json.push_str(&format!(
+            "{{r:'{}',c:{},j:{}}},",
+            regex_escaped, vfs_css, vfs_js
+        ));
     }
     patches_json.push(']');
     js = js.replace("PATCHES_PLACEHOLDER", &patches_json);
@@ -2406,7 +2684,8 @@ fn register_theme_injection_script(
 
     log_to_temp(&format!(
         "[cef_hook] Registered theme injection script ({} bytes, {} patches)",
-        js.len(), theme_state.patches.len()
+        js.len(),
+        theme_state.patches.len()
     ));
 
     // Now inject into all EXISTING page targets
@@ -2449,7 +2728,11 @@ fn inject_into_existing_targets(
         }
     };
 
-    let targets = match resp.get("result").and_then(|r| r.get("targetInfos")).and_then(|t| t.as_array()) {
+    let targets = match resp
+        .get("result")
+        .and_then(|r| r.get("targetInfos"))
+        .and_then(|t| t.as_array())
+    {
         Some(arr) => arr,
         None => {
             log_to_temp("[cef_hook] No targets found");
@@ -2460,7 +2743,10 @@ fn inject_into_existing_targets(
     let mut injected_count = 0;
     for target in targets {
         let target_type = target.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let target_id = target.get("targetId").and_then(|t| t.as_str()).unwrap_or("");
+        let target_id = target
+            .get("targetId")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
         let target_url = target.get("url").and_then(|u| u.as_str()).unwrap_or("");
 
         log_to_temp(&format!(
@@ -2502,13 +2788,17 @@ fn inject_into_existing_targets(
                 continue;
             }
         };
-        let session_id = attach_resp.get("result")
+        let session_id = attach_resp
+            .get("result")
             .and_then(|r| r.get("sessionId"))
             .and_then(|s| s.as_str())
             .unwrap_or("");
 
         if session_id.is_empty() {
-            log_to_temp(&format!("[cef_hook] Failed to attach to target {}: no session", target_id));
+            log_to_temp(&format!(
+                "[cef_hook] Failed to attach to target {}: no session",
+                target_id
+            ));
             continue;
         }
 
@@ -2530,7 +2820,11 @@ fn inject_into_existing_targets(
             if send_cdp(socket, &eval) {
                 injected_count += 1;
             }
-            log_to_temp(&format!("Injected target: {} ({})", &target_url[..target_url.len().min(80)], target_id));
+            log_to_temp(&format!(
+                "Injected target: {} ({})",
+                &target_url[..target_url.len().min(80)],
+                target_id
+            ));
         } else {
             // Internal windows (about:blank popups, steamloopback UI, clientui):
             // evaluate the theme script directly — no reload, since reloading
@@ -2565,7 +2859,10 @@ fn register_webkit_js(
 ) {
     // Register webkit JS as persistent script if available
     if let Some(ref webkit_js_path) = theme_state.webkit_js_path {
-        if fs::metadata(webkit_js_path).map(|m| !m.is_file()).unwrap_or(true) {
+        if fs::metadata(webkit_js_path)
+            .map(|m| !m.is_file())
+            .unwrap_or(true)
+        {
             log_to_temp(&format!(
                 "[cef_hook] Webkit JS not readable: {}",
                 webkit_js_path
@@ -2591,30 +2888,176 @@ fn register_webkit_js(
         });
         *msg_id += 1;
         send_cdp(socket, &add_script);
-        log_to_temp(&format!("[cef_hook] Webkit JS registered for all documents ({})", url));
+        log_to_temp(&format!(
+            "[cef_hook] Webkit JS registered for all documents ({})",
+            url
+        ));
     }
 }
 
 // ─── Fetch handler ──────────────────────────────────────────────────────────
 
-/// Send a Fetch command, echoing the pause event's `sessionId` when it came
-/// from a session-scoped interception — interception IDs are only valid in
-/// the session that reported them (root-scope fulfill → InvalidInterceptionId).
+/// Scope candidates for a paused interception, in the order to try.
+///
+/// Interception ids live in the agent that issued the pause: session-scoped
+/// `Fetch.enable` patterns issue session ids, browser-level enables (the
+/// store's VFS/bridge requests, every response-stage pause) issue root ids.
+/// The pause event's `sessionId` attribute does NOT tell you who issued the
+/// id — store pauses carry the store sid while the id is a root id, and a
+/// root-scope fulfill then fails with InvalidInterceptionId (and vice versa).
+/// So each command is sent with `order[0]` and an InvalidInterceptionId
+/// response walks the list once.
+struct FetchScope {
+    order: Vec<Option<String>>,
+    stage: &'static str,
+}
+
+impl FetchScope {
+    fn for_pause(is_request_stage: bool, sid: Option<&str>) -> Self {
+        let event_sid = sid.map(|s| s.to_string());
+        let in_session_fetch = match &event_sid {
+            Some(s) => SESSION_FETCH
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(s),
+            None => false,
+        };
+        let stage = if is_request_stage {
+            "Request"
+        } else {
+            "Response"
+        };
+        let order = if is_request_stage && in_session_fetch {
+            // Paused by this session's own enable: session scope first.
+            vec![event_sid.clone(), None]
+        } else {
+            // Root-issued first (store requests, all response-stage pauses),
+            // session as the fallback when the id turns out to be theirs.
+            let mut v = vec![None];
+            if event_sid.is_some() {
+                v.push(event_sid.clone());
+            }
+            v
+        };
+        // One target can carry TWO attachedToTarget sessions (double attach),
+        // so a fulfill guessed for the wrong session must still find the
+        // other one — walk every session that has Fetch enabled, not just the
+        // event's sid. Scopes that don't own the id fail fast with
+        // InvalidInterceptionId and the retry walks the list.
+        let mut order = order;
+        if let Ok(sf) = SESSION_FETCH.lock() {
+            for s in sf.iter() {
+                let candidate = Some(s.clone());
+                if !order.contains(&candidate) {
+                    order.push(candidate);
+                }
+            }
+        }
+        FetchScope { order, stage }
+    }
+}
+
+/// A fire-and-forget Fetch command kept until its response arrives so an
+/// InvalidInterceptionId can be retried with the next scope in `order`.
+struct FetchRetry {
+    method: String,
+    params: Value,
+    order: Vec<Option<String>>,
+    idx: usize,
+    stage: &'static str,
+    url: String,
+}
+
+/// Send a Fetch command with `scope.order[0]` as the sessionId (None = root).
+/// The command is tracked so `retry_fetch_scope` can resend it once with the
+/// alternate scope if Chromium rejects the interception id.
 fn fetch_cmd(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
     method: &str,
     params: Value,
-    sid: Option<&str>,
+    scope: &FetchScope,
+    retry: &mut HashMap<u64, FetchRetry>,
+    url: &str,
 ) -> u64 {
+    let sid = scope.order.first().and_then(|s| s.as_deref());
     let id = *msg_id;
-    let mut m = json!({ "id": id, "method": method, "params": params });
+    let mut m = json!({ "id": id, "method": method, "params": params.clone() });
     if let Some(s) = sid {
         m["sessionId"] = Value::String(s.to_string());
     }
     *msg_id += 1;
     send_cdp(socket, &m);
+    retry.insert(
+        id,
+        FetchRetry {
+            method: method.to_string(),
+            params,
+            order: scope.order.clone(),
+            idx: 0,
+            stage: scope.stage,
+            url: url.to_string(),
+        },
+    );
     id
+}
+
+/// InvalidInterceptionId: the scope guess was wrong. Resend with the next
+/// scope from the list (once) — a paused request must never hang because of
+/// a scope mistake.
+fn retry_fetch_scope(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg_id: &mut u64,
+    msg: &Value,
+    fetch_retry: &mut HashMap<u64, FetchRetry>,
+) {
+    let Some(id) = msg.get("id").and_then(|i| i.as_u64()) else {
+        return;
+    };
+    let Some(mut entry) = fetch_retry.remove(&id) else {
+        log_to_temp(&format!(
+            "[cef_hook] no fetch_retry entry for bad-scope error id={}",
+            id
+        ));
+        return;
+    };
+    let next = entry.idx + 1;
+    let url_short = &entry.url[..entry.url.len().min(120)];
+    let rid = entry
+        .params
+        .get("requestId")
+        .and_then(|r| r.as_str())
+        .unwrap_or("?");
+    if next >= entry.order.len() {
+        log_to_temp(&format!(
+            "[cef_hook] InvalidInterceptionId unresolvable for {} (stage={}, rid={}, scopes_tried={}, url={})",
+            entry.method,
+            entry.stage,
+            rid,
+            entry.order.len(),
+            url_short
+        ));
+        return;
+    }
+    entry.idx = next;
+    let sid = entry.order[next].clone();
+    log_to_temp(&format!(
+        "[cef_hook] InvalidInterceptionId on {} (stage={}, rid={}) -> retry with scope {} ({}/{})",
+        entry.method,
+        entry.stage,
+        rid,
+        sid.as_deref().unwrap_or("root"),
+        next + 1,
+        entry.order.len()
+    ));
+    let new_id = *msg_id;
+    let mut m = json!({ "id": new_id, "method": entry.method, "params": entry.params.clone() });
+    if let Some(s) = &sid {
+        m["sessionId"] = Value::String(s.clone());
+    }
+    *msg_id += 1;
+    send_cdp(socket, &m);
+    fetch_retry.insert(new_id, entry);
 }
 
 fn handle_fetch_paused(
@@ -2624,34 +3067,45 @@ fn handle_fetch_paused(
     theme_state: &mut ThemeState,
     pending: &mut Vec<Value>,
     sid: Option<&str>,
+    fetch_retry: &mut HashMap<u64, FetchRetry>,
 ) {
     let params = match msg.get("params") {
         Some(p) => p,
         None => return,
     };
-    let request_id_str = params.get("requestId").and_then(|r| r.as_str()).unwrap_or("");
+    let request_id_str = params
+        .get("requestId")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
     let url = params
         .get("request")
         .and_then(|r| r.get("url"))
         .and_then(|u| u.as_str())
         .unwrap_or("");
-    let status = params
-        .get("responseStatusCode")
-        .and_then(|s| s.as_u64());
+    let status = params.get("responseStatusCode").and_then(|s| s.as_u64());
     let is_request_stage = status.is_none();
+    // Scope guess for every Fulfill/Continue/Fail below: see FetchScope.
+    let scope = FetchScope::for_pause(is_request_stage, sid);
     if is_request_stage && url.contains(VFS_HOST) {
-        log_to_temp(&format!("[cef_hook] FETCH-REQ: {}", url));
+        log_to_temp(&format!(
+            "[cef_hook] FETCH-REQ: {} (rid={}, sid={})",
+            url,
+            request_id_str,
+            sid.unwrap_or("<root>")
+        ));
     }
     let status_code = status.unwrap_or(200);
     let response_headers = params.get("responseHeaders").cloned();
 
     // ── Bridge proxy (request stage) ──
     if url.contains("/luma-bridge/") && is_request_stage {
-        let method = params.get("request")
+        let method = params
+            .get("request")
             .and_then(|r| r.get("method"))
             .and_then(|m| m.as_str())
             .unwrap_or("GET");
-        let post_data = params.get("request")
+        let post_data = params
+            .get("request")
             .and_then(|r| r.get("postData"))
             .and_then(|p| p.as_str());
         let idx = url.find("/luma-bridge/").unwrap_or(0) + "/luma-bridge".len();
@@ -2665,7 +3119,9 @@ fn handle_fetch_paused(
                     msg_id,
                     "Fetch.failRequest",
                     json!({"requestId": request_id_str, "errorReason": "Failed"}),
-                    sid,
+                    &scope,
+                    fetch_retry,
+                    url,
                 );
                 return;
             }
@@ -2688,7 +3144,9 @@ fn handle_fetch_paused(
                 "responseHeaders": resp_headers,
                 "body": body_b64
             }),
-            sid,
+            &scope,
+            fetch_retry,
+            url,
         );
         return;
     }
@@ -2716,7 +3174,9 @@ fn handle_fetch_paused(
                         "responseHeaders": resp_headers,
                         "body": body_b64
                     }),
-                    sid,
+                    &scope,
+                    fetch_retry,
+                    url,
                 );
                 return;
             }
@@ -2727,7 +3187,9 @@ fn handle_fetch_paused(
                     msg_id,
                     "Fetch.failRequest",
                     json!({"requestId": request_id_str, "errorReason": "NameNotResolved"}),
-                    sid,
+                    &scope,
+                    fetch_retry,
+                    url,
                 );
                 return;
             }
@@ -2741,7 +3203,9 @@ fn handle_fetch_paused(
             msg_id,
             "Fetch.continueRequest",
             json!({"requestId": request_id_str}),
-            sid,
+            &scope,
+            fetch_retry,
+            url,
         );
         return;
     }
@@ -2751,23 +3215,34 @@ fn handle_fetch_paused(
     let is_html_url = lower_url.ends_with(".html") || lower_url.ends_with(".htm");
 
     let mut content_type_str = String::new();
-    let is_html_content_type = response_headers.as_ref().and_then(|h| {
-        if let Value::Array(arr) = h {
-            for item in arr {
-                if let Value::Object(map) = item {
-                    let name = map.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                    let value = map.get("value").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                    if name == "content-type" {
-                        content_type_str = value.clone();
-                        if value.contains("text/html") {
-                            return Some(true);
+    let is_html_content_type = response_headers
+        .as_ref()
+        .and_then(|h| {
+            if let Value::Array(arr) = h {
+                for item in arr {
+                    if let Value::Object(map) = item {
+                        let name = map
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let value = map
+                            .get("value")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        if name == "content-type" {
+                            content_type_str = value.clone();
+                            if value.contains("text/html") {
+                                return Some(true);
+                            }
                         }
                     }
                 }
             }
-        }
-        None
-    }).unwrap_or(false);
+            None
+        })
+        .unwrap_or(false);
 
     let is_html = is_html_content_type || is_html_url;
 
@@ -2777,7 +3252,9 @@ fn handle_fetch_paused(
             msg_id,
             "Fetch.continueResponse",
             json!({"requestId": request_id_str}),
-            sid,
+            &scope,
+            fetch_retry,
+            url,
         );
         return;
     }
@@ -2813,32 +3290,44 @@ fn handle_fetch_paused(
     // }
 
     // ── HTML interception: inject theme ──
-    log_to_temp(&format!("[cef_hook] Intercepting HTML: {}", &url[..url.len().min(120)]));
+    log_to_temp(&format!(
+        "[cef_hook] Intercepting HTML: {}",
+        &url[..url.len().min(120)]
+    ));
 
     let current_id = fetch_cmd(
         socket,
         msg_id,
         "Fetch.getResponseBody",
         json!({"requestId": request_id_str}),
-        sid,
+        &scope,
+        fetch_retry,
+        url,
     );
 
     // Helper: always continueResponse on failure so the page doesn't hang
-    let do_continue = |socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>, msg_id: &mut u64| {
-        fetch_cmd(
-            socket,
-            msg_id,
-            "Fetch.continueResponse",
-            json!({"requestId": request_id_str}),
-            sid,
-        );
-    };
+    let mut do_continue =
+        |socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+         msg_id: &mut u64| {
+            fetch_cmd(
+                socket,
+                msg_id,
+                "Fetch.continueResponse",
+                json!({"requestId": request_id_str}),
+                &scope,
+                fetch_retry,
+                url,
+            );
+        };
 
     let body_response = recv_cdp_response(socket, pending, current_id);
     let body_msg = match body_response {
         Some(m) => m,
         None => {
-            log_to_temp(&format!("[cef_hook] Timeout getting body, continuing response: {}", &url[..url.len().min(80)]));
+            log_to_temp(&format!(
+                "[cef_hook] Timeout getting body, continuing response: {}",
+                &url[..url.len().min(80)]
+            ));
             do_continue(socket, msg_id);
             return;
         }
@@ -2847,7 +3336,10 @@ fn handle_fetch_paused(
     let result = match body_msg.get("result") {
         Some(r) => r,
         None => {
-            log_to_temp(&format!("[cef_hook] No result in body response, continuing: {}", &url[..url.len().min(80)]));
+            log_to_temp(&format!(
+                "[cef_hook] No result in body response, continuing: {}",
+                &url[..url.len().min(80)]
+            ));
             do_continue(socket, msg_id);
             return;
         }
@@ -2891,22 +3383,38 @@ fn handle_fetch_paused(
     // Original headers would tell the browser to double-decode
     if let Some(headers) = response_headers {
         if let Value::Array(arr) = &headers {
-            let filtered: Vec<Value> = arr.iter().filter(|item| {
-                if let Value::Object(map) = item {
-                    let name = map.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                    return name != "content-encoding"
-                        && name != "content-length"
-                        && name != "transfer-encoding";
-                }
-                true
-            }).cloned().collect();
+            let filtered: Vec<Value> = arr
+                .iter()
+                .filter(|item| {
+                    if let Value::Object(map) = item {
+                        let name = map
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        return name != "content-encoding"
+                            && name != "content-length"
+                            && name != "transfer-encoding";
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
             if let Some(obj) = fulfill_params.as_object_mut() {
                 obj.insert("responseHeaders".to_string(), Value::Array(filtered));
             }
         }
     }
 
-    fetch_cmd(socket, msg_id, "Fetch.fulfillRequest", fulfill_params, sid);
+    fetch_cmd(
+        socket,
+        msg_id,
+        "Fetch.fulfillRequest",
+        fulfill_params,
+        &scope,
+        fetch_retry,
+        url,
+    );
 }
 
 /// Extract window identity hints from raw HTML: <title> text plus the class
@@ -2918,7 +3426,9 @@ fn extract_window_identity(html: &str) -> (String, String, String) {
         let content_start = start + 7;
         if content_start < html.len() {
             if let Some(rel_end) = find_ascii_ci(&html[content_start..], "</title>") {
-                title = html[content_start..content_start + rel_end].trim().to_string();
+                title = html[content_start..content_start + rel_end]
+                    .trim()
+                    .to_string();
             }
         }
     }
@@ -2935,7 +3445,10 @@ fn extract_tag_class(html: &str, tag: &str) -> String {
         Some(s) => s,
         None => return String::new(),
     };
-    let tag_end = html[start..].find('>').map(|e| start + e).unwrap_or(html.len());
+    let tag_end = html[start..]
+        .find('>')
+        .map(|e| start + e)
+        .unwrap_or(html.len());
     let region = &html[start..tag_end];
     let lc_region = region.to_ascii_lowercase();
     if let Some(cs) = lc_region.find("class=\"") {
@@ -2959,6 +3472,7 @@ fn dispatch_cdp_message(
     msg_id: &mut u64,
     theme_state: &mut ThemeState,
     pending: &mut Vec<Value>,
+    fetch_retry: &mut HashMap<u64, FetchRetry>,
 ) {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -2968,11 +3482,27 @@ fn dispatch_cdp_message(
                 .get("sessionId")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
-            handle_fetch_paused(socket, msg, msg_id, theme_state, pending, sid.as_deref());
+            handle_fetch_paused(
+                socket,
+                msg,
+                msg_id,
+                theme_state,
+                pending,
+                sid.as_deref(),
+                fetch_retry,
+            );
         }
         "Runtime.bindingCalled" => {
-            let name = msg.get("params").and_then(|p| p.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-            let payload = msg.get("params").and_then(|p| p.get("payload")).and_then(|p| p.as_str()).unwrap_or("");
+            let name = msg
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let payload = msg
+                .get("params")
+                .and_then(|p| p.get("payload"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
             if name == "__lumaNativeBridge" {
                 let sid = msg.get("sessionId").and_then(|s| s.as_str());
                 let ecid = msg
@@ -2983,18 +3513,38 @@ fn dispatch_cdp_message(
             }
         }
         "Runtime.consoleAPICalled" => {
-            let args = msg.get("params").and_then(|p| p.get("args")).and_then(|a| a.as_array());
+            let args = msg
+                .get("params")
+                .and_then(|p| p.get("args"))
+                .and_then(|a| a.as_array());
             if let Some(arr) = args {
-                let parts: Vec<String> = arr.iter().filter_map(|a| a.get("value").and_then(|v| v.as_str()).map(|s| s.to_string())).collect();
+                let parts: Vec<String> = arr
+                    .iter()
+                    .filter_map(|a| {
+                        a.get("value")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect();
                 let text = parts.join(" ");
-                if text.contains("LUMA") || text.contains("Bridge") || text.contains("luma") || text.contains("bridge") {
-                    log_to_temp(&format!("[cef_hook] JS console: {}", &text[..text.len().min(200)]));
+                if text.contains("LUMA")
+                    || text.contains("Bridge")
+                    || text.contains("luma")
+                    || text.contains("bridge")
+                {
+                    log_to_temp(&format!(
+                        "[cef_hook] JS console: {}",
+                        &text[..text.len().min(200)]
+                    ));
                 }
             }
         }
         "Page.frameNavigated" => {
             let frame = msg.get("params").and_then(|p| p.get("frame"));
-            let _nav_url = frame.and_then(|f| f.get("url")).and_then(|u| u.as_str()).unwrap_or("");
+            let _nav_url = frame
+                .and_then(|f| f.get("url"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
             let is_main = frame.and_then(|f| f.get("parentId")).is_none();
 
             if is_main {
@@ -3020,11 +3570,7 @@ fn dispatch_cdp_message(
                 // is fresh (window.__lumaCSS gone) — re-push the payload. The
                 // patcher's delayed re-applies pick it up.
                 if let Some(sid) = msg.get("sessionId").and_then(|s| s.as_str()) {
-                    let needed = SESSION_URLS
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|(s, _)| s == sid);
+                    let needed = SESSION_URLS.lock().unwrap().iter().any(|(s, _)| s == sid);
                     log_to_temp(&format!(
                         "[cef_hook] frameNav main: sid={} needed={}",
                         sid, needed
@@ -3047,8 +3593,14 @@ fn dispatch_cdp_message(
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
             let tinfo = params.and_then(|p| p.get("targetInfo"));
-            let ttype = tinfo.and_then(|t| t.get("type")).and_then(|t| t.as_str()).unwrap_or("");
-            let turl = tinfo.and_then(|t| t.get("url")).and_then(|t| t.as_str()).unwrap_or("");
+            let ttype = tinfo
+                .and_then(|t| t.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let turl = tinfo
+                .and_then(|t| t.get("url"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
             let tid = tinfo
                 .and_then(|t| t.get("targetId"))
                 .and_then(|t| t.as_str())
@@ -3117,6 +3669,12 @@ fn dispatch_cdp_message(
                 });
                 *msg_id += 1;
                 send_cdp(socket, &fetch_enable);
+                // Remember that this session now owns request-stage
+                // interception: pauses it reports are session-scoped ids.
+                if let Ok(mut sf) = SESSION_FETCH.lock() {
+                    sf.retain(|s| s != &sid);
+                    sf.push(sid.to_string());
+                }
                 push_css_payload(socket, msg_id, theme_state, sid);
                 if let Ok(mut urls) = SESSION_URLS.lock() {
                     urls.retain(|(s, _)| s != sid);
@@ -3155,13 +3713,23 @@ fn dispatch_cdp_message(
         "Target.targetInfoChanged" => {
             let params = msg.get("params");
             let tinfo = params.and_then(|p| p.get("targetInfo"));
-            let ttype = tinfo.and_then(|t| t.get("type")).and_then(|t| t.as_str()).unwrap_or("");
-            let turl = tinfo.and_then(|t| t.get("url")).and_then(|t| t.as_str()).unwrap_or("");
+            let ttype = tinfo
+                .and_then(|t| t.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let turl = tinfo
+                .and_then(|t| t.get("url"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
             let tid = tinfo
                 .and_then(|t| t.get("targetId"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
-            if ttype != "page" || turl.is_empty() || turl.contains("lumaforge.local") || tid.is_empty() {
+            if ttype != "page"
+                || turl.is_empty()
+                || turl.contains("lumaforge.local")
+                || tid.is_empty()
+            {
                 return;
             }
             {
@@ -3172,7 +3740,10 @@ fn dispatch_cdp_message(
             }
             let sid = {
                 let sessions = SESSIONS.lock().unwrap();
-                sessions.iter().find(|(t, _)| t == tid).map(|(_, s)| s.clone())
+                sessions
+                    .iter()
+                    .find(|(t, _)| t == tid)
+                    .map(|(_, s)| s.clone())
             };
             if let Some(sid) = sid {
                 let js = build_theme_js(theme_state);
@@ -3203,17 +3774,36 @@ fn dispatch_cdp_message(
                 if let Ok(mut sessions) = SESSIONS.lock() {
                     sessions.retain(|(_, s)| s != sid);
                 }
+                if let Ok(mut sf) = SESSION_FETCH.lock() {
+                    sf.retain(|s| s != sid);
+                }
             }
         }
         "" => {
             // Response to a fire-and-forget command: surface errors/exceptions
             // (evaluating our script in a target must never fail silently).
             if let Some(err) = msg.get("error") {
+                // Chromium's message is "Invalid InterceptionId." (with a
+                // space); older wording had none — accept both so a paused
+                // request can never hang on a scope mistake.
+                let is_bad_scope = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|m| {
+                        m.contains("Invalid InterceptionId") || m.contains("InvalidInterceptionId")
+                    })
+                    .unwrap_or(false);
+                if is_bad_scope {
+                    retry_fetch_scope(socket, msg_id, msg, fetch_retry);
+                }
                 log_to_temp(&format!("[cef_hook] CDP command error: {}", err));
             }
             if let Some(ed) = msg.pointer("/result/exceptionDetails") {
                 let s = ed.to_string();
-                log_to_temp(&format!("[cef_hook] CDP exception: {}", &s[..s.len().min(300)]));
+                log_to_temp(&format!(
+                    "[cef_hook] CDP exception: {}",
+                    &s[..s.len().min(300)]
+                ));
             }
         }
         _ => {}
@@ -3272,14 +3862,21 @@ fn poll_new_targets(
         Some(r) => r,
         None => return,
     };
-    let targets = match resp.get("result").and_then(|r| r.get("targetInfos")).and_then(|t| t.as_array()) {
+    let targets = match resp
+        .get("result")
+        .and_then(|r| r.get("targetInfos"))
+        .and_then(|t| t.as_array())
+    {
         Some(arr) => arr,
         None => return,
     };
 
     for target in targets {
         let ttype = target.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let tid = target.get("targetId").and_then(|t| t.as_str()).unwrap_or("");
+        let tid = target
+            .get("targetId")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
         let url = target.get("url").and_then(|u| u.as_str()).unwrap_or("");
         if ttype != "page" || tid.is_empty() || url.is_empty() {
             continue;
@@ -3317,35 +3914,69 @@ fn poll_new_targets(
     }
 }
 
-fn handle_cdp_connection(port: u16) {
+fn handle_cdp_connection(direct: Option<u16>) {
+    const RELAY_PORT: u16 = 21778;
     let mut retry_count = 0u32;
+    let mut using_relay = false;
     loop {
-        let browser_ws_url = match get_browser_ws_url(port) {
-            Some(url) => url,
-            None => {
-                retry_count += 1;
-                let delay = if retry_count < 20 { 100 } else { 3000 };
-                log_to_temp(&format!("[cef_hook] Could not get browser WebSocket URL, retrying in {}ms (attempt {})", delay, retry_count));
-                std::thread::sleep(Duration::from_millis(delay));
-                continue;
+        let browser_ws_url = match direct.and_then(get_browser_ws_url) {
+            Some(url) => {
+                using_relay = false;
+                url
             }
+            None => match get_browser_ws_url(RELAY_PORT) {
+                Some(url) => {
+                    if !using_relay {
+                        log_to_temp(&format!(
+                            "[cef_hook] Direct port unavailable, using relay {}",
+                            RELAY_PORT
+                        ));
+                        using_relay = true;
+                    }
+                    url
+                }
+                None => {
+                    retry_count += 1;
+                    let delay = if retry_count < 20 { 100 } else { 3000 };
+                    log_to_temp(&format!(
+                        "[cef_hook] Could not get browser WebSocket URL (direct or relay), retrying in {}ms (attempt {})",
+                        delay, retry_count
+                    ));
+                    std::thread::sleep(Duration::from_millis(delay));
+                    continue;
+                }
+            },
         };
         log_to_temp(&format!("[cef_hook] Connecting to CDP: {}", browser_ws_url));
 
         let (mut socket, _) = match connect(&browser_ws_url) {
             Ok(conn) => conn,
             Err(e) => {
-                log_to_temp(&format!("[cef_hook] Failed to connect: {}, retrying in 3s", e));
+                log_to_temp(&format!(
+                    "[cef_hook] Failed to connect: {}, retrying in 3s",
+                    e
+                ));
                 std::thread::sleep(Duration::from_secs(3));
                 continue;
             }
         };
         log_to_temp("[cef_hook] Connected to CDP browser endpoint");
 
+        // Never block the dispatch loop on a full socket: a stalled relay must
+        // not freeze CDP handling (that froze Fetch pauses for a whole 30s
+        // session). Short write timeout + flush retry in the main loop.
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = socket.get_mut() {
+            s.set_write_timeout(Some(Duration::from_millis(500))).ok();
+        }
+        WS_WRITE_STALLED.store(false, std::sync::atomic::Ordering::Relaxed);
+
         let mut msg_id = 1u64;
         // Messages received while waiting for a specific response are queued
         // here and dispatched by the main loop (never discarded).
         let mut pending: Vec<Value> = Vec::new();
+        // In-flight fire-and-forget Fetch commands awaiting their response,
+        // so an InvalidInterceptionId can be retried with the other scope.
+        let mut fetch_retry: HashMap<u64, FetchRetry> = HashMap::new();
 
         // Enable Fetch interception
         let enable_fetch = json!({
@@ -3428,7 +4059,13 @@ fn handle_cdp_connection(port: u16) {
             if loop_iter % 5 == 0 {
                 if check_theme_reload_signal(&mut theme_state) {
                     register_webkit_js(&mut socket, &mut msg_id, &theme_state);
-                    register_theme_injection_script(&mut socket, &mut msg_id, &theme_state, &mut pending, true);
+                    register_theme_injection_script(
+                        &mut socket,
+                        &mut msg_id,
+                        &theme_state,
+                        &mut pending,
+                        true,
+                    );
                     // Re-push the (rebuilt) CSS payload to every session that
                     // carries it so the patcher sees the new CSS in existing docs.
                     let sids: Vec<String> = SESSION_URLS
@@ -3451,7 +4088,14 @@ fn handle_cdp_connection(port: u16) {
             while !pending.is_empty() && drained < 512 && !lost {
                 let queued = pending.remove(0);
                 drained += 1;
-                dispatch_cdp_message(&mut socket, &queued, &mut msg_id, &mut theme_state, &mut pending);
+                dispatch_cdp_message(
+                    &mut socket,
+                    &queued,
+                    &mut msg_id,
+                    &mut theme_state,
+                    &mut pending,
+                    &mut fetch_retry,
+                );
             }
             if lost {
                 break;
@@ -3462,11 +4106,43 @@ fn handle_cdp_connection(port: u16) {
                 poll_new_targets(&mut socket, &mut msg_id, &mut pending);
             }
 
+            // Retry a stalled write (frame retained by tungstenite). If the
+            // socket stays broken the flush error ends the connection here.
+            if WS_WRITE_STALLED.load(std::sync::atomic::Ordering::Relaxed) {
+                match socket.flush() {
+                    Ok(()) => {
+                        WS_WRITE_STALLED.store(false, std::sync::atomic::Ordering::Relaxed);
+                        log_to_temp("[cef_hook] WS write recovered");
+                    }
+                    Err(tungstenite::Error::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(e) => {
+                        log_to_temp(&format!(
+                            "[cef_hook] WebSocket flush error: {}, reconnecting... ({})",
+                            e,
+                            conn_stats_snapshot()
+                        ));
+                        lost = true;
+                    }
+                }
+                if lost {
+                    break;
+                }
+            }
+
             match socket.read() {
                 Ok(Message::Text(text)) => {
                     if let Ok(msg) = serde_json::from_str::<Value>(&text) {
                         note_rx(&msg);
-                        dispatch_cdp_message(&mut socket, &msg, &mut msg_id, &mut theme_state, &mut pending);
+                        dispatch_cdp_message(
+                            &mut socket,
+                            &msg,
+                            &mut msg_id,
+                            &mut theme_state,
+                            &mut pending,
+                            &mut fetch_retry,
+                        );
                     }
                 }
                 Ok(Message::Close(_)) => {
@@ -3501,15 +4177,12 @@ unsafe extern "system" fn dll_main_thread(_param: *mut c_void) -> u32 {
         std::process::id()
     ));
 
-    let port = match resolve_debug_port() {
-        Some(p) => p,
-        None => {
-            log_to_temp("[cef_hook] No debug port found, exiting");
-            return 0;
-        }
-    };
+    let direct = resolve_debug_port();
+    if direct.is_none() {
+        log_to_temp("[cef_hook] No debug port found, will try relay");
+    }
 
-    handle_cdp_connection(port);
+    handle_cdp_connection(direct);
 
     log_to_temp(&format!(
         "[cef_hook] CDP thread exiting (pid={})",
@@ -3550,7 +4223,13 @@ mod window_match_tests {
     #[test]
     fn steam_games_list_alias_only_for_patches() {
         assert!(window_matches("^Steam$", "Steam Games List", "", "", true));
-        assert!(!window_matches("^Steam$", "Steam Games List", "", "", false));
+        assert!(!window_matches(
+            "^Steam$",
+            "Steam Games List",
+            "",
+            "",
+            false
+        ));
     }
 
     #[test]
@@ -3569,7 +4248,13 @@ mod window_match_tests {
             "",
             false
         ));
-        assert!(!window_matches(".friendsui-container", "Steam", "", "", true));
+        assert!(!window_matches(
+            ".friendsui-container",
+            "Steam",
+            "",
+            "",
+            true
+        ));
     }
 
     #[test]
@@ -3665,8 +4350,16 @@ mod import_expand_tests {
         );
         t.write("elements/sidebar.css", ".sidebar{background:blue}");
         let out = expand(&t.0.join("main.css"), &[]);
-        assert!(out.contains(".sidebar{background:blue}"), "child not inlined: {}", out);
-        assert!(out.contains(".main{color:red}"), "parent rules lost: {}", out);
+        assert!(
+            out.contains(".sidebar{background:blue}"),
+            "child not inlined: {}",
+            out
+        );
+        assert!(
+            out.contains(".main{color:red}"),
+            "parent rules lost: {}",
+            out
+        );
         assert!(!out.contains("@import"), "import not removed: {}", out);
     }
 
@@ -3680,7 +4373,11 @@ mod import_expand_tests {
         let out = expand(&t.0.join("main.css"), &[]);
         assert!(out.contains("https://fonts.cdnfonts.com/css/x"));
         assert!(out.contains("/public/a.css"));
-        assert!(out.contains("@import"), "absolute imports must stay: {}", out);
+        assert!(
+            out.contains("@import"),
+            "absolute imports must stay: {}",
+            out
+        );
     }
 
     #[test]
@@ -3703,7 +4400,11 @@ mod import_expand_tests {
         let out = expand(&t.0.join("a.css"), &[]);
         assert!(out.contains(".a{}"));
         assert!(out.contains(".b{}"));
-        assert!(!out.contains("@import"), "cycle import must be dropped: {}", out);
+        assert!(
+            !out.contains("@import"),
+            "cycle import must be dropped: {}",
+            out
+        );
     }
 
     #[test]
@@ -3787,7 +4488,11 @@ mod import_expand_tests {
         );
         let out = expand(&t.0.join("main.css"), &[]);
         assert!(out.contains("url(data:font/woff2;base64,AAAA)"), "{}", out);
-        assert!(out.contains("url(https://cdn.example.com/x.png)"), "{}", out);
+        assert!(
+            out.contains("url(https://cdn.example.com/x.png)"),
+            "{}",
+            out
+        );
         assert!(out.contains("url(/shared/y.png)"), "{}", out);
         assert!(out.contains("url(#m)"), "{}", out);
         assert!(out.contains("url('//cdn.example.com/z.png')"), "{}", out);
@@ -3850,17 +4555,35 @@ mod condition_default_tests {
         assert!(manifest.steam_webkit.is_some());
         // Every condition must parse (numeric slider defaults used to drop the
         // whole condition via Option<String>).
-        let conds = manifest.conditions.as_ref().and_then(|c| c.as_object()).unwrap();
-        assert!(conds.len() > 40, "expected full Conditions block, got {}", conds.len());
+        let conds = manifest
+            .conditions
+            .as_ref()
+            .and_then(|c| c.as_object())
+            .unwrap();
+        assert!(
+            conds.len() > 40,
+            "expected full Conditions block, got {}",
+            conds.len()
+        );
         let mut sliders = 0;
         for (name, c) in conds {
             let cond: SkinCondition = serde_json::from_value(c.clone())
                 .unwrap_or_else(|e| panic!("condition '{}' failed to parse: {}", name, e));
             if cond.slider.is_some() {
                 sliders += 1;
-                assert!(cond.default.is_some(), "slider '{}' missing numeric default", name);
+                assert!(
+                    cond.default.is_some(),
+                    "slider '{}' missing numeric default",
+                    name
+                );
             }
         }
-        assert_eq!(sliders, 3, "Border radius / Mica Transparency / Max Width");
+        // At least the classic three (Border radius / Mica Transparency /
+        // Max Width); newer installed themes add more (e.g. Sidebar width).
+        assert!(
+            sliders >= 3,
+            "Border radius / Mica Transparency / Max Width, got {}",
+            sliders
+        );
     }
 }

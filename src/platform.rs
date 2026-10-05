@@ -45,7 +45,7 @@ pub fn find_steam_install() -> Option<PathBuf> {
 #[cfg(target_os = "windows")]
 fn registry_steam_path(subkey: &str, value_name: &str) -> Option<PathBuf> {
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
         KEY_READ, REG_SZ,
     };
 
@@ -112,10 +112,7 @@ pub fn find_steam_install() -> Option<PathBuf> {
     }
 
     // 2. Hardcoded common paths
-    let candidates = [
-        "C:\\Program Files (x86)\\Steam",
-        "C:\\Program Files\\Steam",
-    ];
+    let candidates = ["C:\\Program Files (x86)\\Steam", "C:\\Program Files\\Steam"];
     for c in &candidates {
         let p = PathBuf::from(c);
         if p.join("steam.exe").exists() {
@@ -146,10 +143,8 @@ pub fn local_data_dir() -> PathBuf {
 
 #[cfg(target_os = "windows")]
 pub fn local_data_dir() -> PathBuf {
-    PathBuf::from(
-        std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()),
-    )
-    .join("LumaForge")
+    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()))
+        .join("LumaForge")
 }
 
 /// Config directory.
@@ -196,15 +191,14 @@ pub fn temp_dir() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        PathBuf::from(
-            std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()),
-        )
+        PathBuf::from(std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()))
     }
 }
 
-/// Log file path for the CDP proxy.
+/// Log file path for the CDP proxy. Kept alongside the other runtime logs
+/// (`cef_hook.log`, `theme.log`, `steam-cdp.json`) instead of the temp dir.
 pub fn log_file_path() -> PathBuf {
-    temp_dir().join("steamcdp_proxy.log")
+    runtime_dir().join("steamcdp_proxy.log")
 }
 
 /// Config.json path (used by Lua backends).
