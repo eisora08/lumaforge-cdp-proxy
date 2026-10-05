@@ -31,11 +31,11 @@ echo Building wsock32.dll bootstrap...
 REM NOTE: keep the vcvars invocation at top level (not inside an if-block):
 REM VCVARS paths contain "(x86)" and cmd mis-parses parens inside blocks.
 if not defined VCVARS goto build_direct
-cmd /c ""%VCVARS%" >nul 2>&1 && cl /nologo /O2 /LD main.c /link /DEF:wsock32_proxy.def /OUT:wsock32.dll /NOLOGO kernel32.lib ws2_32.lib mswsock.lib"
+cmd /c ""%VCVARS%" >nul 2>&1 && cl /nologo /O2 /LD /MT main.c /link /DEF:wsock32_proxy.def /OUT:wsock32.dll /NOLOGO kernel32.lib ws2_32.lib mswsock.lib"
 goto check
 
 :build_direct
-cl /nologo /O2 /LD main.c /link /DEF:wsock32_proxy.def /OUT:wsock32.dll /NOLOGO kernel32.lib ws2_32.lib mswsock.lib
+cl /nologo /O2 /LD /MT main.c /link /DEF:wsock32_proxy.def /OUT:wsock32.dll /NOLOGO kernel32.lib ws2_32.lib mswsock.lib
 
 :check
 if %errorlevel% neq 0 (

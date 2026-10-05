@@ -1,0 +1,5 @@
+# Static CRT so the Windows artifacts (lumaforge.dll, lumaforge_cef_hook.dll)
+# are self-contained and run on machines without the VC++ Redistributable.
+# Applies to builds invoked from this repository (CI runs cargo from the root).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
