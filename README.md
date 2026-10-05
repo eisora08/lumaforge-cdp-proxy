@@ -47,6 +47,15 @@ LumaForge CDP Proxy is under active development. The plugin APIs, package
 installation pipeline, CEF integration, and runtime behavior may change between
 alpha releases.
 
+## Requirements
+
+- **Windows:** Windows 10 or 11 (x64) with Steam. Release archives from v0.4.1
+  onwards are self-contained — no extra runtimes are required. Builds up to
+  v0.4.0 load `vcruntime140.dll` from the system, so on machines that do not
+  have it yet they require the
+  [Visual C++ Redistributable 2015–2022 (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+- **Linux:** Steam for Linux, installed as described under Installation.
+
 ## Installation
 
 ### Windows
@@ -107,8 +116,11 @@ settings may change during alpha development.
 ## Logging
 
 Runtime logs cover the loader, CEF hook, CDP connection, plugins, providers, and
-package installation pipeline. Logs are written to the LumaForge log directory;
-on Linux the CDP proxy log is `/tmp/steamcdp_proxy.log`.
+package installation pipeline. All logs live in the LumaForge runtime directory
+(`%LOCALAPPDATA%\LumaForge\runtime` on Windows, `~/.local/share/LumaForge/runtime`
+on Linux): `steamcdp_proxy.log`, `cef_hook.log`, `theme.log` and `steam-cdp.json`
+sit side by side. Every proxy log line starts with a local `[HH:MM:SS.mmm]`
+timestamp.
 
 When reporting an issue, do not include API keys, authorization headers, private
 configuration values, or other sensitive information.
@@ -225,6 +237,77 @@ If Steam does not start or a plugin fails to load:
 5. Restore the previous release if the problem continues.
 6. Include the LumaForge version, Windows/Linux version, Steam version, relevant
    logs, and reproduction steps when opening an issue.
+
+### Which CDP transport is used
+
+On Windows the proxy speaks DevTools over LumaForge-injected **pipes**;
+the injected TCP port is currently disabled by default while the pipe path
+is validated:
+
+1. `lumaforge.dll` spawns the webhelper with `--remote-debugging-pipe` /
+   `--remote-debugging-io-pipes` and an inheritable handle pair declared via
+   `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so no debug port needs to bind.
+2. `--remote-debugging-port` is not injected unless `LUMAFORGE_CDP_TCP=1` is
+   set (or Steam provides its own port, which is adopted as-is). Without a
+   port the webhelper command line carries only the pipe flags.
+3. `steam-cdp.json` is written only after a real TCP connection succeeds, so
+   pipe-only sessions never advertise a port nobody listens on.
+4. `lumaforge_cef_hook.dll` keeps its own chain: the port from its launch
+   arguments first, then the local relay on `127.0.0.1:21778` that bridges to
+   the shared pipe session. The relay retries its bind for a few seconds, so
+   a busy port from a previous session does not disable CEF hook injection
+   for the whole session.
+
+Environment switches (set before starting Steam):
+
+- `LUMAFORGE_CDP_TCP=1` — re-enable the injected `--remote-debugging-port`
+  transport (TCP loop, discovery publishing). `=0` keeps it off explicitly;
+  unset uses the current default (off). A session with registered pipes never
+  falls back to TCP: the pipe watch loop waits for the helper to (re)spawn
+  with fresh pipes instead (Millennium parity).
+- `LUMAFORGE_NO_CDP_PIPES=1` — ignore the injected pipe flags and use TCP
+  only (previous-release behavior).
+- `LUMAFORGE_PIPE_PROBE=1` — verbose logging while probing spawned pipes.
+
+### Steam starts but there is no log file
+
+The proxy log lives in the LumaForge runtime directory:
+`%LOCALAPPDATA%\LumaForge\runtime\steamcdp_proxy.log` on Windows and
+`~/.local/share/LumaForge/runtime/steamcdp_proxy.log` on Linux, next to
+`cef_hook.log` and `theme.log`. Logging is buffered: the file appears once
+around ten lines have been written or after Steam exits cleanly from the tray.
+
+If `%LOCALAPPDATA%\LumaForge\runtime\` was never created, `lumaforge.dll`
+never loaded:
+
+1. Look for `lumaforge\load_error.txt` next to the DLL — it records the
+   loader's `GetLastError` (`126` = missing file or runtime dependency,
+   `193` = wrong architecture).
+2. Confirm the files sit in the Steam folder of the *running* `steam.exe`
+   (Task Manager → Open file location) and restart Steam from the tray.
+3. Let the files through antivirus and unblock them:
+   `Unblock-File wsock32.dll` and `Unblock-File lumaforge\lumaforge.dll`.
+
+### CDP connection fails with `10061` (connection refused)
+
+The debug port was injected but nothing accepted the connection yet:
+
+1. Check `%LOCALAPPDATA%\LumaForge\runtime\cef_hook.log`: `Using port from
+   args` means the flag reached the webhelper; repeated
+   `Could not get browser WebSocket URL` means CEF has not started its DevTools
+   server yet (recent builds keep retrying until it does).
+2. While Steam is running, run `netstat -ano | findstr <port>` with the port
+   from `%LOCALAPPDATA%\LumaForge\runtime\steam-cdp.json`. `LISTENING`
+   appearing only after the first failures means CEF started slower than the
+   client probed. If `netstat` never shows the port but
+   `%LOCALAPPDATA%\LumaForge\runtime\steamcdp_proxy.log` reports
+   `Pipe CDP connected`, that is expected: the session runs over inherited
+   pipes and the CEF hook reaches it through the relay on port 21778.
+3. `netsh interface ipv4 show excludedportrange protocol=tcp` — a port inside
+   an excluded range cannot be bound by CEF; set the `STEAMCDP_PORT`
+   environment variable to a port outside those ranges to force one.
+4. Some antivirus products filter loopback connections; try excluding the
+   Steam folder.
 
 Report problems through [GitHub Issues](https://github.com/eisora08/lumaforge-cdp-proxy/issues).
 
