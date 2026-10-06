@@ -282,6 +282,21 @@ fn fetch_manifests_op(app_id: u64) -> Result<(usize, usize), String> {
 }
 
 fn pin_op(app_id: u64, mode: &str) -> Result<String, String> {
+    crate::log_to_temp(&format!("[steam-keys] pin_op begin app={} mode={}", app_id, mode));
+    let result = pin_op_inner(app_id, mode);
+    crate::log_to_temp(&format!(
+        "[steam-keys] pin_op end app={} mode={} result={}",
+        app_id,
+        mode,
+        match &result {
+            Ok(m) => format!("OK({})", m),
+            Err(e) => format!("ERR({})", e),
+        }
+    ));
+    result
+}
+
+fn pin_op_inner(app_id: u64, mode: &str) -> Result<String, String> {
     let lua_path = lua_path_for(app_id)?;
     if !lua_path.exists() {
         return Err(format!(
@@ -340,6 +355,20 @@ fn pin_op(app_id: u64, mode: &str) -> Result<String, String> {
 }
 
 fn unpin_op(app_id: u64) -> Result<String, String> {
+    crate::log_to_temp(&format!("[steam-keys] unpin_op begin app={}", app_id));
+    let result = unpin_op_inner(app_id);
+    crate::log_to_temp(&format!(
+        "[steam-keys] unpin_op end app={} result={}",
+        app_id,
+        match &result {
+            Ok(m) => format!("OK({})", m),
+            Err(e) => format!("ERR({})", e),
+        }
+    ));
+    result
+}
+
+fn unpin_op_inner(app_id: u64) -> Result<String, String> {
     let lua_dir = lua_dir()?;
     if app_id == 0 {
         let mut total_count = 0u32;

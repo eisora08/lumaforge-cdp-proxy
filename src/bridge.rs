@@ -215,6 +215,24 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return (200, json!({"status": "ok", "bridge": "lumaforge-cdp-proxy"}).to_string());
     }
 
+    // JS-side forensic relay: the CEF console channel can die before an
+    // action completes (observed 11:25 session), losing ACTION logs. The
+    // injected JS POSTs here so action traces always reach steamcdp_proxy.log.
+    if clean_path == "/api/jslog" && method == "POST" {
+        let line = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if !line.is_empty() {
+            let truncated: String = line.chars().take(300).collect();
+            crate::log_to_temp(&format!("[js] {}", truncated));
+        }
+        return (200, json!({"ok": true}).to_string());
+    }
+
     let headers_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let lua_req = crate::lua_backend::LuaRequest {
         method: method.to_string(),
@@ -792,6 +810,7 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
         Some((200, json!({"ok": true, "files": files}).to_string()))
     } else if path.starts_with("/api/lua-files/") && method == "DELETE" {
         let app_id = path.trim_start_matches("/api/lua-files/");
+        crate::log_to_temp(&format!("[lua-files] DELETE begin app={}", app_id));
 
         let steam_root = match crate::depot_downloader::steam_root() {
             Some(r) => r,
@@ -830,6 +849,11 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
                 crate::log_to_temp(&format!("[lua-files] Warning: failed to remove from SLS config: {e}"));
             }
         }
+
+        crate::log_to_temp(&format!(
+            "[lua-files] DELETE end app={} removedFile={}",
+            app_id, removed_file
+        ));
 
         Some((200, json!({"ok": true, "removedFile": removed_file, "removedConfig": removed_config}).to_string()))
     } else {

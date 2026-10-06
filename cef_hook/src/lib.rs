@@ -2263,7 +2263,7 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
   // gate and the popup never becomes visible (WasHidden stays 1). Detect it
   // by title (window.name is empty) and strip any links we already added.
   function isSharedCtx(){ try{ return document.title==='SharedJSContext' || window.name==='SP Shared JS Context'; }catch(e){ return false; } }
-  function stripLmf(){ try{ var h=document.head; if(!h)return; var ls=h.querySelectorAll('link[data-lmf],style[data-lmf],script[data-lmf]'); for(var i=0;i<ls.length;i++){ ls[i].parentNode.removeChild(ls[i]); } }catch(e){} }
+  function stripLmf(){ try{ var ls=document.querySelectorAll('link[data-lmf],style[data-lmf],script[data-lmf]'); for(var i=0;i<ls.length;i++){ ls[i].parentNode.removeChild(ls[i]); } }catch(e){} }
   function waitForHead(cb){
     var tries=0;
     (function poll(){
@@ -2357,6 +2357,14 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
       }
     }
   }
+  // Cheap content signature of the live payload (never stringify the whole
+  // 400KB+ object — docs compare this to detect a theme change they missed).
+  function paySig(P){
+    if(!P)return 'off';
+    try{
+      return ''+((P.rootColors||'').length)+':'+((P.webkit||'').length)+':'+((P.slider||'').length)+':'+((P.files&&P.files.length)||0)+':'+((P.patches&&P.patches.length)||0)+':'+((P.conds&&P.conds.length)||0)+':'+((P.cjs&&P.cjs.length)||0);
+    }catch(e){ return 'x'; }
+  }
   function injectDoc(doc){
     var P=window.__lumaCSS||null;
     // RootColors/slider come from the live payload when available; the baked
@@ -2371,6 +2379,7 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     if(P&&P.webkitjs)addJS(doc,P.webkitjs);
     addStyle(doc,sl,'MillenniumSliderConditions');
     applyWindow(doc);
+    try{ doc.__lumaPs=paySig(P); }catch(e){}
     // Runtime plugin injection (library window). Store pages already receive
     // plugins via the HTML intercept; here we load via <script src> from the
     // VFS (no CORS concerns) when location.href matches the plugin's
@@ -2416,6 +2425,21 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
         }
       });
       obs2.observe(doc.documentElement||doc,{childList:true,subtree:true});
+      // Payload self-heal: if the theme changed but this document missed the
+      // lumaforge:theme-reload event (stale session, listener wiped by
+      // document.open), rebuild from the live payload on the next tick.
+      // paySig is content-based, so realms that track different-but-equal
+      // payloads never thrash.
+      setInterval(function(){
+        try{
+          var sig=paySig(window.__lumaCSS||null);
+          if(doc.__lumaPs!==undefined&&doc.__lumaPs!==sig){
+            var ls=document.querySelectorAll('style[data-lmf],link[data-lmf]');
+            for(var i=0;i<ls.length;i++){ ls[i].parentNode.removeChild(ls[i]); }
+            injectDoc(doc);
+          }
+        }catch(e){}
+      },3000);
     }catch(e){}
   }
   function startInjection(){
@@ -2503,12 +2527,14 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
   // keep scripts already in the DOM from being added twice.
   document.addEventListener('lumaforge:theme-reload',function(){
     try{
-      var h=document.head;if(!h)return;
-      // Only re-apply to documents we already themed: a popup mid-document
-      // .write() must keep waiting for its renderWhenReady gate, and docs
-      // that have not injected yet will read the fresh payload themselves.
-      if(!document.__lumaWatch)return;
-      var ls=h.querySelectorAll('style[data-lmf],link[data-lmf]');
+      // Strip over the WHOLE document: early injections (head still unparsed)
+      // land on documentElement via headOf()'s fallback and a head-only
+      // querySelector misses them — that is how fluenty survived a
+      // deactivate. Re-apply only for docs we already themed; a popup
+      // mid-document .write() with no styles yet keeps waiting for its
+      // renderWhenReady gate.
+      var ls=document.querySelectorAll('style[data-lmf],link[data-lmf]');
+      if(!document.__lumaWatch&&!ls.length)return;
       for(var i=0;i<ls.length;i++){ ls[i].parentNode.removeChild(ls[i]); }
       injectDoc(document);
     }catch(e){}
