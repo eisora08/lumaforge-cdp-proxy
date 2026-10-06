@@ -1395,6 +1395,15 @@ fn inject_theme_html(
         }
     }
 
+    // 9. Theme-active marker: themeColor.ts (steam-store-helper) gates its
+    //    surface adoption on --luma-theme-active, so a deactivated theme keeps
+    //    the panel on the stylesheet's navy defaults instead of scanning
+    //    Steam's own chrome. data-lmf so the live re-apply strip removes it on
+    //    deactivate and injectDoc re-adds only while the payload says active.
+    if theme_state.theme_name.is_some() {
+        head_inject.push_str("<style data-lumaforge=\"theme-active\" data-lmf=\"LmfThemeActive\" id=\"LmfThemeActive\">:root{--luma-theme-active:1}</style>\n");
+    }
+
     // Inject into HTML
     if !head_inject.is_empty() {
         if let Some(pos) = result.to_lowercase().rfind("</head>") {
@@ -2167,6 +2176,11 @@ fn theme_css_payload_json(state: &mut ThemeState) -> String {
         "conds": conds,
         "cjs": cjs,
         "patches": patches,
+        // Mirrored to --luma-theme-active by injectDoc: the extension only
+        // adopts a theme surface (themeColor resolveThemeColors) while this
+        // is true, so a deactivated theme falls back to the navy defaults
+        // instead of scanning Steam's own chrome.
+        "act": state.theme_name.is_some(),
     });
     let s = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     log_to_temp(&format!(
@@ -2289,6 +2303,22 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     s.setAttribute('data-lmf',id||'css');
     s.textContent=css;h.appendChild(s);
   }
+  // --luma-theme-active:1 marker for the extension's themeColor gate. data-lmf
+  // so the theme-reload strip removes it too — re-added here only while the
+  // payload says a theme is active.
+  function setThemeActive(doc,on){
+    var h=headOf(doc); if(!h)return;
+    var el=null; try{ el=h.querySelector('#LmfThemeActive'); }catch(e){}
+    if(on){
+      if(el)return;
+      var s=doc.createElement('style');
+      s.id='LmfThemeActive';
+      s.setAttribute('data-lmf','LmfThemeActive');
+      s.setAttribute('data-lumaforge','theme-active');
+      s.textContent=':root{--luma-theme-active:1}';
+      h.appendChild(s);
+    }else if(el&&el.parentNode){ el.parentNode.removeChild(el); }
+  }
   function addJS(doc,src){
     var h=headOf(doc);
     if(!src||!h||h.querySelector('script[data-lmf="'+src+'"]'))return;
@@ -2362,7 +2392,7 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
   function paySig(P){
     if(!P)return 'off';
     try{
-      return ''+((P.rootColors||'').length)+':'+((P.webkit||'').length)+':'+((P.slider||'').length)+':'+((P.files&&P.files.length)||0)+':'+((P.patches&&P.patches.length)||0)+':'+((P.conds&&P.conds.length)||0)+':'+((P.cjs&&P.cjs.length)||0);
+      return ''+((P.act)?1:0)+':'+((P.rootColors||'').length)+':'+((P.webkit||'').length)+':'+((P.slider||'').length)+':'+((P.files&&P.files.length)||0)+':'+((P.patches&&P.patches.length)||0)+':'+((P.conds&&P.conds.length)||0)+':'+((P.cjs&&P.cjs.length)||0);
     }catch(e){ return 'x'; }
   }
   function injectDoc(doc){
@@ -2371,6 +2401,10 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     // placeholders only cover the window before the first push lands.
     var rc=(P&&('rootColors' in P))?P.rootColors:'ROOTCOLORS_PLACEHOLDER';
     var sl=(P&&('slider' in P))?P.slider:'SLIDER_PLACEHOLDER';
+    // Theme-active marker: live payload wins, baked value covers the window
+    // before the first push lands (bare literal — must stay a boolean).
+    var act=(P&&('act' in P))?P.act:THEME_ACTIVE_PLACEHOLDER;
+    setThemeActive(doc,act);
     addStyle(doc,'ACCENT_PLACEHOLDER','SystemAccentColorInject');
     addStyle(doc,rc,'RootColors');
     addStyle(doc,'SSH_BRIDGE_PLACEHOLDER','LumaSshBridge');
@@ -2595,6 +2629,16 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
 
     // 1b. ssh-bridge (theme var -> --luma-ssh-* plugin vars)
     js = js.replace("SSH_BRIDGE_PLACEHOLDER", &js_escape_str(SSH_BRIDGE_CSS));
+
+    // 1d. baked theme-active marker (live payload's `act` supersedes it)
+    js = js.replace(
+        "THEME_ACTIVE_PLACEHOLDER",
+        if theme_state.theme_name.is_some() {
+            "true"
+        } else {
+            "false"
+        },
+    );
 
     // 1c. runtime plugin manifest (library-window injection via VFS)
     let mut plugins_json = String::from("[");
