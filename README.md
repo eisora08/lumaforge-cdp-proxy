@@ -9,7 +9,7 @@ Chromium Embedded Framework (CEF) integration.
 
 ## Latest release
 
-Current release: **v0.4.1**
+![Current release](https://img.shields.io/github/v/release/eisora08/lumaforge-cdp-proxy?label=current%20release)
 
 Download published builds from the [GitHub Releases](https://github.com/eisora08/lumaforge-cdp-proxy/releases) page.
 Every release publishes two archives:
@@ -19,8 +19,10 @@ Every release publishes two archives:
 
 ## Features
 
-- Detects Steam WebHelper process creation and injects a configurable Chrome DevTools
-  Protocol debugging port with dynamic port selection and fallback.
+- Detects Steam WebHelper process creation and injects the CDP transport: **pipes by
+  default** (`--remote-debugging-pipe` / `--remote-debugging-io-pipes` over inherited
+  handles); TCP (`--remote-debugging-port` + discovery publishing) stays available
+  behind `LUMAFORGE_CDP_TCP=1`.
 - Injects JavaScript into every Steam CEF surface (store, library, popups) with
   re-injection on navigation and URL-change detection.
 - HTTP bridge server (port `21775`) backing the injected UI: downloads queue,
@@ -30,7 +32,10 @@ Every release publishes two archives:
   queued and drained by the proxy so HTTPS store pages can reach HTTP endpoints.
 - Millennium-compatible theme engine: `skin.json` parsing, default patches, system
   accent colors, `active.json` theme state, popup patching, and `window.Millennium`
-  compatibility shims so existing Steam themes work unmodified.
+  compatibility shims so existing Steam themes work unmodified. The payload emits a
+  `--luma-theme-active` CSS marker (extensions gate theme-surface adoption on it) and
+  self-heals: a content-signature check re-applies the theme when a document misses
+  the theme-reload event.
 - Lua plugin runtime for Steam Store extensions (see
   [lumaforge-extensions](https://github.com/eisora08/lumaforge-extensions)).
 - Cross-platform loading — no `LD_PRELOAD` required:
@@ -120,7 +125,10 @@ package installation pipeline. All logs live in the LumaForge runtime directory
 (`%LOCALAPPDATA%\LumaForge\runtime` on Windows, `~/.local/share/LumaForge/runtime`
 on Linux): `steamcdp_proxy.log`, `cef_hook.log`, `theme.log` and `steam-cdp.json`
 sit side by side. Every proxy log line starts with a local `[HH:MM:SS.mmm]`
-timestamp.
+timestamp. Injected JS also POSTs fire-and-forget traces to `/api/jslog` on the
+bridge (up to 10 short lines per call), so action logs reach
+`steamcdp_proxy.log` even when the CEF console channel dies mid-action; pin and
+lua-file operations log begin/end with their results.
 
 When reporting an issue, do not include API keys, authorization headers, private
 configuration values, or other sensitive information.
