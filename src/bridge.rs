@@ -1,6 +1,8 @@
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const BRIDGE_PORT: u16 = 21775;
 const BRIDGE_PORT_FALLBACK: u16 = 21776;
@@ -110,12 +112,19 @@ fn handle_connection(mut stream: std::net::TcpStream) {
     let method = parts[0];
     let path = parts[1];
 
-    crate::log_to_temp(&format!(
-        "[bridge] {} {} from {:?}",
-        method,
-        path,
-        stream.peer_addr().ok()
-    ));
+    // High-frequency state polls (/health polled by the panel, queue polled
+    // by the extension every ~4s) drowned the log (~277 lines per 13 min) —
+    // leave them unlogged; every other endpoint still logs.
+    let is_state_poll = (method == "GET" && (path == "/health" || path == "/api/downloads-queue"))
+        || (method == "POST" && path == "/api/downloads-queue/start-next");
+    if !is_state_poll {
+        crate::log_to_temp(&format!(
+            "[bridge] {} {} from {:?}",
+            method,
+            path,
+            stream.peer_addr().ok()
+        ));
+    }
 
     let mut content_length: usize = 0;
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -150,13 +159,27 @@ fn handle_connection(mut stream: std::net::TcpStream) {
     };
 
     if method == "OPTIONS" {
-        send_response(&mut stream, 204, "", "");
+        send_response(&mut stream, 204, "", "", "");
         return;
     }
 
     let (status, response_body) = route_request(method, path, &body);
 
-    send_response(&mut stream, status, &response_body, "application/json");
+    // /api/art bodies are static per app (capsule art rarely changes): with
+    // Cache-Control the browser HTTP cache serves sidebar renders in FUTURE
+    // documents too, instead of refetching every image per document (~173
+    // requests per sidebar rebuild across webhelper document churn).
+    let cache_control = if path.starts_with("/api/art/") {
+        if status == 200 {
+            "Cache-Control: public, max-age=86400\r\n"
+        } else {
+            "Cache-Control: public, max-age=60\r\n"
+        }
+    } else {
+        ""
+    };
+
+    send_response(&mut stream, status, &response_body, "application/json", cache_control);
 }
 
 fn handle_open_url(body: &str) -> (u16, String) {
@@ -178,6 +201,20 @@ fn handle_open_url(body: &str) -> (u16, String) {
             400,
             json!({"ok": false, "message": "Only https:// URLs are allowed"}).to_string(),
         );
+    }
+
+    // Dedupe: every request spawns a browser tab, so a duplicate POST (double
+    // click, extension retry after a lost bridge resolve) must not open a
+    // second page. Same URL within 2s is swallowed.
+    static LAST_OPEN: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+    {
+        let mut last = LAST_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ref prev, at)) = *last {
+            if prev == url && at.elapsed() < Duration::from_secs(2) {
+                return (200, json!({"ok": true, "deduped": true}).to_string());
+            }
+        }
+        *last = Some((url.to_string(), Instant::now()));
     }
 
     #[cfg(target_os = "windows")]
@@ -861,7 +898,13 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
     }
 }
 
-fn send_response(stream: &mut std::net::TcpStream, status: u16, body: &str, content_type: &str) {
+fn send_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    body: &str,
+    content_type: &str,
+    extra_headers: &str,
+) {
     let status_text = match status {
         200 => "OK",
         204 => "No Content",
@@ -873,6 +916,7 @@ fn send_response(stream: &mut std::net::TcpStream, status: u16, body: &str, cont
     let response = format!(
         "HTTP/1.1 {} {}\r\n\
          {}\
+         {}\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
@@ -881,6 +925,7 @@ fn send_response(stream: &mut std::net::TcpStream, status: u16, body: &str, cont
         status,
         status_text,
         CORS_HEADERS,
+        extra_headers,
         if content_type.is_empty() {
             "text/plain"
         } else {
