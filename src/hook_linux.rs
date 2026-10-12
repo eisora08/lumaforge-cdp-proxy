@@ -263,6 +263,7 @@ pub fn start_cdp_injection_loop() {
                 crate::log_to_temp("[steamcdp] Watching for new targets...");
                 let theme_bundle = crate::injector::load_theme_patches();
                 let mut recheck_counter = 0u32;
+                let mut last_recheck_sig: Option<(usize, usize, usize)> = None;
                 // Track last-known URLs to detect store page navigations immediately
                 let mut known_urls: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
@@ -293,12 +294,22 @@ pub fn start_cdp_injection_loop() {
                                     .iter()
                                     .filter(|t| t.target_type == "page")
                                     .count();
-                                crate::log_to_temp(&format!(
-                                    "[steamcdp] Recheck: {} total targets ({} pages), {} injected",
+                                let recheck_sig = (
                                     all_targets.len(),
                                     page_count,
-                                    injected_targets.len()
-                                ));
+                                    injected_targets.len(),
+                                );
+                                if last_recheck_sig != Some(recheck_sig)
+                                    || (recheck_counter / 30) % 5 == 0
+                                {
+                                    crate::log_to_temp(&format!(
+                                        "[steamcdp] Recheck: {} total targets ({} pages), {} injected",
+                                        all_targets.len(),
+                                        page_count,
+                                        injected_targets.len()
+                                    ));
+                                    last_recheck_sig = Some(recheck_sig);
+                                }
 
                                 // Collect injected page targets, sort store pages first
                                 let mut pages: Vec<_> = all_targets
