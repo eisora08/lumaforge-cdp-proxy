@@ -1642,7 +1642,6 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
     }
     return _origFetch.apply(this,arguments);
   };
-  console.log('[LUMA] Bridge shim installed');
 })();"#;
 
 fn proxy_bridge_request(path: &str, method: &str, body: Option<&str>) -> Result<String, String> {

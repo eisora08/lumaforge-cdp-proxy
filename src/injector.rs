@@ -2,7 +2,9 @@ use crate::cdp::Target;
 use crate::transport::Transport;
 use regex::Regex;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(target_os = "windows")]
 fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
@@ -12,6 +14,21 @@ fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
 #[cfg(target_os = "linux")]
 fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
     crate::plugin_loader_linux::load_enabled_plugins()
+}
+
+/// Identifiers of the `Page.addScriptToEvaluateOnNewDocument` entries
+/// registered for a target by the previous inject cycle. Kept so the next
+/// cycle can remove them before re-adding: without removal every cycle
+/// stacked another copy and each new document evaluated the script once per
+/// stacked entry (64 duplicate extension injections per session).
+struct RegisteredScripts {
+    bridge: Option<String>,
+    plugins: Vec<(String, Option<String>)>,
+}
+
+fn registered_scripts() -> &'static Mutex<HashMap<String, RegisteredScripts>> {
+    static CELL: OnceLock<Mutex<HashMap<String, RegisteredScripts>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // â”€â”€â”€ Theme data (parsed from theme-manifest.json) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -717,6 +734,50 @@ pub fn inject_into_target(
 
     // â”€â”€â”€ Bridge proxy: intercept fetch() for HTTPSâ†’HTTP mixed content â”€â”€â”€
     // Register for future navigations
+    // Drop the registrations made by the previous inject cycle first:
+    // Page.addScriptToEvaluateOnNewDocument accumulates one entry per call,
+    // so re-adding every cycle made each new document evaluate the script
+    // once per stacked entry.
+    {
+        let prev = registered_scripts()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&target.id);
+        if let Some(prev) = prev {
+            let mut stale: Vec<String> =
+                prev.plugins.into_iter().filter_map(|(_, id)| id).collect();
+            if let Some(id) = prev.bridge {
+                stale.push(id);
+            }
+            for ident in stale {
+                let removed = client.send_cdp_wait(
+                    &json!({
+                        "id": msg_id,
+                        "method": "Page.removeScriptToEvaluateOnNewDocument",
+                        "params": {"identifier": ident}
+                    }),
+                    msg_id,
+                );
+                msg_id += 1;
+                match removed {
+                    Ok(resp) => {
+                        if let Some(err) = resp.get("error") {
+                            crate::log_to_temp(&format!(
+                                "[steamcdp] removeScript '{}' error: {}",
+                                ident, err
+                            ));
+                        }
+                    }
+                    Err(e) => crate::log_to_temp(&format!(
+                        "[steamcdp] removeScript '{}' failed: {}",
+                        ident, e
+                    )),
+                }
+            }
+        }
+    }
+    let mut plugin_idents: Vec<(String, Option<String>)> = Vec::new();
+
     let resp = client.send_cdp_wait(
         &json!({
             "id": msg_id,
@@ -734,6 +795,11 @@ pub fn inject_into_target(
         crate::log_to_temp("[steamcdp] Bridge proxy registered for new documents");
     }
     msg_id += 1;
+    let bridge_ident: Option<String> = resp
+        .get("result")
+        .and_then(|r| r.get("identifier"))
+        .and_then(|i| i.as_str())
+        .map(String::from);
 
     // Also execute immediately on current page
     let resp = client.send_cdp_wait(
@@ -781,11 +847,13 @@ pub fn inject_into_target(
             msg_id,
         )?;
 
-        let script_id = resp
+        let script_id_opt: Option<String> = resp
             .get("result")
             .and_then(|r| r.get("identifier"))
             .and_then(|i| i.as_str())
-            .unwrap_or("none");
+            .map(String::from);
+        plugin_idents.push((plugin.name.clone(), script_id_opt.clone()));
+        let script_id = script_id_opt.as_deref().unwrap_or("none");
 
         if let Some(err) = resp.get("error") {
             crate::log_to_temp(&format!(
@@ -889,6 +957,17 @@ pub fn inject_into_target(
         target_num, result_str
     ));
     msg_id += 1;
+
+    registered_scripts()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            target.id.clone(),
+            RegisteredScripts {
+                bridge: bridge_ident,
+                plugins: plugin_idents,
+            },
+        );
 
     Ok(())
 }
