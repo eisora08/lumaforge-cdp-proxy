@@ -1511,6 +1511,31 @@ fn download_and_install(request_id: String, provider: Provider, hint: Option<Rem
             }
         };
 
+    // --- Step 7.5: Register the package into SLSsteam config (Linux) ---
+    // Best-effort: must happen before the job flips to "completed" so
+    // config.yaml is ready by the time the success modal renders.
+    #[cfg(target_os = "linux")]
+    {
+        let lua_paths: Vec<PathBuf> = installed_meta_files
+            .iter()
+            .filter(|f| f.kind == "lua")
+            .map(|f| PathBuf::from(jpath(&lua_dir, &[f.filename.as_str()])))
+            .collect();
+        if !lua_paths.is_empty() {
+            match crate::slssteam::register_package(&app_id, &lua_paths) {
+                Ok(s) => crate::log_to_temp(&format!(
+                    "[slssteam] register_package {}: +{} apps, +{} depots, +{} keys, +{} manifests, +{} dlc names, {} plugins written",
+                    app_id, s.apps_added, s.depots_added, s.keys_added,
+                    s.manifests_added, s.dlc_named, s.plugins_written
+                )),
+                Err(e) => crate::log_to_temp(&format!(
+                    "[slssteam] register_package {} failed: {}",
+                    app_id, e
+                )),
+            }
+        }
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

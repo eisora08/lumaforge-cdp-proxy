@@ -609,6 +609,26 @@ fn start_steamkeys_job(app_id: u64) -> String {
             }
         }
 
+        // 4.5. Sync the generated .lua into ~/.config/SLSsteam/config.yaml
+        // (Linux). Best-effort, before "completed" so the config is ready by
+        // the time the success modal renders.
+        #[cfg(target_os = "linux")]
+        {
+            let reg = lua_path_for(app_id).and_then(|p| {
+                crate::slssteam::register_package(&app_id.to_string(), &[p])
+            });
+            match reg {
+                Ok(s) => crate::log_to_temp(&format!(
+                    "[slssteam] register_package {}: +{} apps, +{} depots, +{} keys, +{} manifests, +{} dlc names, {} plugins written",
+                    app_id, s.apps_added, s.depots_added, s.keys_added,
+                    s.manifests_added, s.dlc_named, s.plugins_written
+                )),
+                Err(e) => {
+                    crate::log_to_temp(&format!("[slssteam] register_package {} failed: {}", app_id, e))
+                }
+            }
+        }
+
         // 5. Complete
         let mut message = format!("Steam Keys setup complete for app {}", app_id);
         if !warnings.is_empty() {
