@@ -102,8 +102,17 @@ mod w {
         Some(steam_root()?.join("cloud_redirect"))
     }
 
+    /// Upstream CloudRedirect keeps everything under `~/.config/CloudRedirect`
+    /// on Linux (config, tokens *and* storage — `cloud_hooks.cpp`), while the
+    /// Windows build splits config into `%APPDATA%` and storage into
+    /// `{steam}/cloud_redirect/storage`. Scanning the Windows layout on Linux
+    /// hit an empty dir and reported 0 synced games.
     fn storage_root() -> Option<PathBuf> {
-        Some(cr_steam_dir()?.join("storage"))
+        if cfg!(target_os = "linux") {
+            Some(cr_dir()?.join("storage"))
+        } else {
+            Some(cr_steam_dir()?.join("storage"))
+        }
     }
 
     fn installed() -> bool {
@@ -112,9 +121,28 @@ mod w {
         } else {
             "cloud_redirect.dll"
         };
-        steam_root()
+        // Steam root: Windows layout and the panel's legacy deploy.
+        if steam_root()
             .map(|r| r.join(dll_name).exists())
             .unwrap_or(false)
+        {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Official Linux layout (headcrab / LumaForge panel): the .so
+            // lives outside the Steam root and is loaded via LD_AUDIT.
+            if let Some(home) = dirs::home_dir() {
+                if home
+                    .join(".local/share/CloudRedirect")
+                    .join(dll_name)
+                    .exists()
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn read_json_file(path: &Path) -> Option<Value> {
@@ -164,6 +192,31 @@ mod w {
             .to_string()
     }
 
+    /// Candidate token-file names for a provider, most specific first.
+    /// Upstream Linux writes `tokens_<provider>.json`; the Windows build and
+    /// LumaForge's own login flow use `<provider>_tokens.json`.
+    fn token_candidates(provider: &str) -> Option<&'static [&'static str]> {
+        Some(match provider {
+            "gdrive" => {
+                if cfg!(target_os = "linux") {
+                    &["tokens_gdrive.json", "google_tokens.json"]
+                } else {
+                    &["google_tokens.json"]
+                }
+            }
+            "onedrive" => {
+                if cfg!(target_os = "linux") {
+                    &["tokens_onedrive.json", "onedrive_tokens.json"]
+                } else {
+                    &["onedrive_tokens.json"]
+                }
+            }
+            "r2" => &["r2_credentials.json"],
+            "s3" => &["s3_credentials.json"],
+            _ => return None,
+        })
+    }
+
     fn token_path_for(provider: &str) -> Option<PathBuf> {
         if let Some(p) = read_config()
             .get("token_paths")
@@ -174,14 +227,16 @@ mod w {
                 return Some(PathBuf::from(p));
             }
         }
-        let name = match provider {
-            "gdrive" => "google_tokens.json",
-            "onedrive" => "onedrive_tokens.json",
-            "r2" => "r2_credentials.json",
-            "s3" => "s3_credentials.json",
-            _ => return None,
-        };
-        Some(cr_dir()?.join(name))
+        let dir = cr_dir()?;
+        // Prefer whichever candidate file exists, then default to the first.
+        let candidates = token_candidates(provider)?;
+        for name in candidates {
+            let p = dir.join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        Some(dir.join(candidates[0]))
     }
 
     fn set_token_path(cfg: &mut Value, provider: &str, path: &str) {
@@ -376,6 +431,7 @@ mod w {
                 | "file_tokens.dat"
                 | "file_tokens.cloudredirect"
                 | "pending_ops.cloudredirect"
+                | "deleted.cloudredirect"
                 | "manifest.cloudredirect"
         ) || (name.starts_with("manifest.") && name.ends_with(".cloudredirect"))
     }
@@ -1516,4 +1572,42 @@ mod w {
     }
 
     use std::io::{Read, Write};
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn meta_names_exclude_cloudredirect_metadata() {
+            assert!(is_meta_name("cn.cloudredirect"));
+            assert!(is_meta_name("cn.dat"));
+            assert!(is_meta_name("root_token.cloudredirect"));
+            assert!(is_meta_name("file_tokens.cloudredirect"));
+            assert!(is_meta_name("pending_ops.cloudredirect"));
+            assert!(is_meta_name("deleted.cloudredirect"));
+            assert!(is_meta_name("manifest.cloudredirect"));
+            assert!(is_meta_name("manifest.2.cloudredirect"));
+            assert!(!is_meta_name("savefile.vc2"));
+            assert!(!is_meta_name("settings.conf"));
+        }
+
+        #[test]
+        fn token_candidates_cover_all_providers() {
+            for provider in ["gdrive", "onedrive", "r2", "s3"] {
+                let c = token_candidates(provider).expect(provider);
+                assert!(!c.is_empty());
+            }
+            assert!(token_candidates("nope").is_none());
+        }
+
+        #[test]
+        fn token_candidates_platform_names() {
+            let gdrive = token_candidates("gdrive").unwrap();
+            if cfg!(target_os = "linux") {
+                assert_eq!(gdrive[0], "tokens_gdrive.json");
+            } else {
+                assert_eq!(gdrive[0], "google_tokens.json");
+            }
+        }
+    }
 }
