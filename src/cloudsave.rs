@@ -11,7 +11,11 @@ pub fn catalog_rows() -> Vec<serde_json::Value> {
     w::catalog_rows()
 }
 
-#[cfg(windows)]
+// Shared Windows/Linux implementation. The only platform-specific code is the
+// DPAPI token encryption (write_token_file), which becomes plain JSON on Linux
+// — the same on-disk format CloudRedirect's Linux build uses in
+// ~/.config/CloudRedirect (plaintext, mode 0600). read_token_file already
+// accepts plain JSON (leading '{'), so both directions work on both platforms.
 mod w {
     use serde_json::{json, Value};
     use std::net::{TcpListener, TcpStream};
@@ -190,9 +194,16 @@ mod w {
     }
 
     // -------------------------------------------------------------------------
-    // DPAPI (same blobs as .NET ProtectedData / CloudRedirect TokenFile)
+    // Token blob protection.
+    //
+    // Windows: DPAPI (same blobs as .NET ProtectedData / CloudRedirect
+    // TokenFile). Linux: no encryption — plain JSON on disk, which is exactly
+    // what CloudRedirect's Linux build writes (~/.config/CloudRedirect,
+    // plaintext, mode 0600). read_token_file short-circuits on a leading '{',
+    // so plain-JSON blobs are read without ever calling unprotect.
     // -------------------------------------------------------------------------
 
+    #[cfg(windows)]
     fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
@@ -232,6 +243,13 @@ mod w {
         }
     }
 
+    // Linux: passthrough — write plain JSON (no encryption layer).
+    #[cfg(not(windows))]
+    fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.to_vec())
+    }
+
+    #[cfg(windows)]
     fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
@@ -275,6 +293,14 @@ mod w {
         }
     }
 
+    // Linux: passthrough — files are already plain JSON (leading '{' means
+    // read_token_file never reaches this, so it only surfaces as a parse
+    // error for genuinely corrupt files).
+    #[cfg(not(windows))]
+    fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(data.to_vec())
+    }
+
     fn read_token_file(path: &Path) -> Result<Value, String> {
         let raw = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         let json_bytes = if raw.first() == Some(&b'{') {
@@ -289,7 +315,15 @@ mod w {
     fn write_token_file(path: &Path, v: &Value) -> Result<(), String> {
         let data = serde_json::to_vec_pretty(v).map_err(|e| e.to_string())?;
         let blob = dpapi_protect(&data)?;
-        atomic_write(path, &blob)
+        atomic_write(path, &blob)?;
+        // Linux: tighten perms to 0600 to match CloudRedirect's own token
+        // files (plaintext there must not be world-readable). Best-effort.
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -1482,26 +1516,4 @@ mod w {
     }
 
     use std::io::{Read, Write};
-}
-
-#[cfg(not(windows))]
-mod w {
-    pub(crate) fn handle(method: &str, path: &str, _body: &str) -> Option<(u16, String)> {
-        if path.starts_with("/api/cloudsave") {
-            let _ = method;
-            return Some((
-                200,
-                serde_json::json!({
-                    "ok": false,
-                    "message": "Cloud Saves is only available on Windows"
-                })
-                .to_string(),
-            ));
-        }
-        None
-    }
-
-    pub(crate) fn catalog_rows() -> Vec<serde_json::Value> {
-        Vec::new()
-    }
 }

@@ -234,6 +234,30 @@ pub fn start_cdp_injection_loop() {
                     "[steamcdp] Connected to CDP (attempt {})",
                     attempt
                 ));
+                // VFS interception must be live before injection: theme
+                // <link>/<script> fetches fire the moment the tags land.
+                // Hybrid coverage (mirrors cef_hook Windows — browser-scope
+                // Fetch only pauses store-origin docs): root pump for the
+                // store, per-target pumps for every non-store page.
+                let boot_bundle = crate::injector::load_theme_patches();
+                if !boot_bundle.is_empty() {
+                    crate::vfs_fetch::stop_all();
+                    crate::vfs_fetch::ensure_root_pump(port);
+                    if let Ok(ts) = client.get_targets() {
+                        let pages: std::collections::HashSet<String> = ts
+                            .iter()
+                            .filter(|t| {
+                                t.target_type == "page"
+                                    && t.title != "Shutdown"
+                                    && !t.url.contains("createflags=2")
+                                    && !t.url.contains("centerOnBrowserID")
+                                    && !t.url.contains("store.steampowered.com")
+                            })
+                            .map(|t| t.id.clone())
+                            .collect();
+                        crate::vfs_fetch::sync(&pages, port);
+                    }
+                }
                 match crate::injector::inject_all(&mut crate::transport::Transport::Tcp(
                     &mut client,
                 )) {
@@ -245,15 +269,19 @@ pub fn start_cdp_injection_loop() {
                     }
                 }
 
-                // Watch for new targets
+                // Watch for new targets. Unlike Windows (where cef_hook.dll has
+                // already injected every document in-process), on Linux nothing
+                // is injected until this loop does it — so only mark the
+                // skip-list as "seen"; every other existing page falls through
+                // to the new-target branch below and gets injected ~1s later.
                 let mut injected_targets: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 if let Ok(targets) = client.get_targets() {
                     for t in &targets {
                         if t.target_type == "page"
-                            && t.title != "Shutdown"
-                            && !t.url.contains("createflags=2")
-                            && !t.url.contains("centerOnBrowserID")
+                            && (t.title == "Shutdown"
+                                || t.url.contains("createflags=2")
+                                || t.url.contains("centerOnBrowserID"))
                         {
                             injected_targets.insert(t.id.clone());
                         }
@@ -308,6 +336,23 @@ pub fn start_cdp_injection_loop() {
                                         page_count,
                                         injected_targets.len()
                                     ));
+                                    // Surface pages the loop never managed to
+                                    // inject (failed injection, brand-new
+                                    // target between cycles, ...). This is the
+                                    // visibility Windows gets from cef_hook's
+                                    // in-process coverage.
+                                    for t in &all_targets {
+                                        if t.target_type == "page"
+                                            && !injected_targets.contains(&t.id)
+                                        {
+                                            crate::log_to_temp(&format!(
+                                                "[steamcdp] Untracked page: id={}, title=\"{}\", url={}",
+                                                t.id,
+                                                t.title,
+                                                &t.url[..t.url.len().min(100)]
+                                            ));
+                                        }
+                                    }
                                     last_recheck_sig = Some(recheck_sig);
                                 }
 
@@ -385,13 +430,40 @@ pub fn start_cdp_injection_loop() {
 
                     match client.get_targets() {
                         Ok(new_targets) => {
+                            // Reconcile VFS interception BEFORE injecting:
+                            // root pump restart if its WS died, and per-target
+                            // pumps for non-store pages (store is covered at
+                            // browser scope by the root pump). Having pumps
+                            // ready pre-inject kills the first-tag race.
+                            if !theme_bundle.is_empty() {
+                                crate::vfs_fetch::ensure_root_pump(port);
+                                let pages: std::collections::HashSet<String> = new_targets
+                                    .iter()
+                                    .filter(|t| {
+                                        t.target_type == "page"
+                                            && t.title != "Shutdown"
+                                            && !t.url.contains("createflags=2")
+                                            && !t.url.contains("centerOnBrowserID")
+                                            && !t.url.contains("store.steampowered.com")
+                                    })
+                                    .map(|t| t.id.clone())
+                                    .collect();
+                                crate::vfs_fetch::sync(&pages, port);
+                            }
                             for t in &new_targets {
-                                if t.target_type == "page"
-                                    && !injected_targets.contains(&t.id)
-                                    && crate::injector::is_real_steam_page(&t.url)
-                                {
+                                // Windows only injects real Steam pages here because
+                                // cef_hook.dll covers the client UI (Library, popups,
+                                // friends — documents with about:blank?createflags=N,
+                                // steamloopback.host, or empty URLs) in-process. On
+                                // Linux there is no cef_hook, so every page target
+                                // must come through this loop; the skip-list below
+                                // still keeps shutdown/internal windows out.
+                                if t.target_type == "page" && !injected_targets.contains(&t.id) {
                                     // Skip shutdown/close targets â€” injecting into these can destabilize Steam
-                                    if t.title == "Shutdown" || t.url.contains("createflags=2") {
+                                    if t.title == "Shutdown"
+                                        || t.url.contains("createflags=2")
+                                        || t.url.contains("centerOnBrowserID")
+                                    {
                                         injected_targets.insert(t.id.clone());
                                         continue;
                                     }
@@ -421,34 +493,33 @@ pub fn start_cdp_injection_loop() {
                                 } else if t.target_type == "page"
                                     && injected_targets.contains(&t.id)
                                 {
-                                    // Detect URL change on existing store target â†’ re-inject immediately
-                                    if t.url.contains("store.steampowered.com") {
-                                        if let Some(prev_url) = known_urls.get(&t.id) {
-                                            if prev_url != &t.url {
-                                                crate::log_to_temp(&format!(
-                                                    "[steamcdp] Store URL changed: id={}, prev={}, new={}",
-                                                    t.id,
-                                                    &prev_url[..prev_url.len().min(80)],
-                                                    &t.url[..t.url.len().min(80)]
-                                                ));
-                                                let plugins =
-                                                    crate::plugin_loader_linux::load_all_plugins()
-                                                        .unwrap_or_default();
-                                                if let Err(e) = crate::injector::inject_into_target(
-                                                    &mut crate::transport::Transport::Tcp(
-                                                        &mut client,
-                                                    ),
-                                                    t,
-                                                    &plugins,
-                                                    &theme_bundle,
-                                                    1,
-                                                ) {
-                                                    crate::log_to_temp(&format!("[steamcdp] URL-change re-inject failed: {}", e));
-                                                }
+                                    // Detect URL change on any injected page
+                                    // (store navigations, popup doc swaps
+                                    // about:blank -> steamloopback, ...) and
+                                    // re-inject immediately.
+                                    if let Some(prev_url) = known_urls.get(&t.id) {
+                                        if prev_url != &t.url {
+                                            crate::log_to_temp(&format!(
+                                                "[steamcdp] URL changed: id={}, prev={}, new={}",
+                                                t.id,
+                                                &prev_url[..prev_url.len().min(80)],
+                                                &t.url[..t.url.len().min(80)]
+                                            ));
+                                            let plugins =
+                                                crate::plugin_loader_linux::load_all_plugins()
+                                                    .unwrap_or_default();
+                                            if let Err(e) = crate::injector::inject_into_target(
+                                                &mut crate::transport::Transport::Tcp(&mut client),
+                                                t,
+                                                &plugins,
+                                                &theme_bundle,
+                                                1,
+                                            ) {
+                                                crate::log_to_temp(&format!("[steamcdp] URL-change re-inject failed: {}", e));
                                             }
                                         }
-                                        known_urls.insert(t.id.clone(), t.url.clone());
                                     }
+                                    known_urls.insert(t.id.clone(), t.url.clone());
                                 }
                             }
                         }
@@ -461,13 +532,22 @@ pub fn start_cdp_injection_loop() {
                                 Ok(mut new_client) => {
                                     crate::log_to_temp("[steamcdp] Reconnected to CDP");
                                     client = new_client;
+                                    // Pumps hold their own WS per target: they
+                                    // exit on their own when the target dies and
+                                    // sync reconciles the set below.
                                     injected_targets.clear();
                                     known_urls.clear();
+                                    // Same as the initial seed: only the
+                                    // skip-list counts as "seen"; everything
+                                    // else gets injected by the loop below.
                                     if let Ok(targets) = client.get_targets() {
                                         for t in &targets {
-                                            if t.target_type == "page" {
+                                            if t.target_type == "page"
+                                                && (t.title == "Shutdown"
+                                                    || t.url.contains("createflags=2")
+                                                    || t.url.contains("centerOnBrowserID"))
+                                            {
                                                 injected_targets.insert(t.id.clone());
-                                                known_urls.insert(t.id.clone(), t.url.clone());
                                             }
                                         }
                                     }

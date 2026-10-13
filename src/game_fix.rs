@@ -1590,7 +1590,7 @@ const ONLINE_FIX_CACHE_TTL_SECS: u64 = 86400;
 const ONLINE_FIX_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 const MAX_MANUAL_FILES: usize = 10;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OnlineFixEntry {
     url: String,
     display_name: String,
@@ -1610,6 +1610,59 @@ fn online_fix_cache() -> &'static Mutex<OnlineFixCache> {
             cached_at: SystemTime::UNIX_EPOCH,
         })
     })
+}
+
+fn online_fix_cache_fresh(cache: &OnlineFixCache) -> bool {
+    cache.cached_at.elapsed().unwrap_or_default().as_secs() < ONLINE_FIX_CACHE_TTL_SECS
+        && !cache.entries.is_empty()
+}
+
+fn online_fix_cache_path() -> PathBuf {
+    crate::platform::runtime_dir().join("online-fix-cache.json")
+}
+
+/// Populate the in-memory cache from disk when it is empty (Steam restarts
+/// drop the memory cache; the disk copy keeps has_online_fix accurate
+/// without a live perondepot fetch).
+fn load_online_fix_cache_from_disk() {
+    let Ok(mut cache) = online_fix_cache().lock() else {
+        return;
+    };
+    if !cache.entries.is_empty() {
+        return;
+    }
+    let Ok(data) = std::fs::read_to_string(online_fix_cache_path()) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return;
+    };
+    let Some(secs) = v.get("cached_at_unix").and_then(|x| x.as_u64()) else {
+        return;
+    };
+    let Ok(entries) =
+        serde_json::from_value::<Vec<OnlineFixEntry>>(v.get("entries").cloned().unwrap_or_default())
+    else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+    cache.entries = entries;
+    cache.cached_at = UNIX_EPOCH + Duration::from_secs(secs);
+}
+
+fn save_online_fix_cache_to_disk(entries: &[OnlineFixEntry], cached_at: SystemTime) {
+    let secs = cached_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let payload = json!({"cached_at_unix": secs, "entries": entries});
+    let path = online_fix_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, payload.to_string());
 }
 
 fn encode_non_ascii_href(input: &str) -> String {
@@ -1638,8 +1691,14 @@ fn encode_non_ascii_href(input: &str) -> String {
 fn fetch_online_fix_directory() -> Result<Vec<OnlineFixEntry>, String> {
     {
         let cache = online_fix_cache().lock().map_err(|e| e.to_string())?;
-        let age = cache.cached_at.elapsed().unwrap_or_default();
-        if age.as_secs() < ONLINE_FIX_CACHE_TTL_SECS && !cache.entries.is_empty() {
+        if online_fix_cache_fresh(&cache) {
+            return Ok(cache.entries.clone());
+        }
+    }
+    load_online_fix_cache_from_disk();
+    {
+        let cache = online_fix_cache().lock().map_err(|e| e.to_string())?;
+        if online_fix_cache_fresh(&cache) {
             return Ok(cache.entries.clone());
         }
     }
@@ -1700,6 +1759,7 @@ fn fetch_online_fix_directory() -> Result<Vec<OnlineFixEntry>, String> {
         let mut cache = online_fix_cache().lock().map_err(|e| e.to_string())?;
         cache.entries = entries.clone();
         cache.cached_at = SystemTime::now();
+        save_online_fix_cache_to_disk(&entries, cache.cached_at);
     }
     Ok(entries)
 }
@@ -2440,27 +2500,35 @@ fn handle_info(app_id: u64) -> (u16, String) {
         .map(|p| find_candidate_exes(p).iter().any(|exe| has_steamstub_drm(exe)))
         .unwrap_or(false);
 
-    // has_online_fix: cheap check — try cache only first; full fetch on demand
+    // has_online_fix: cache-only — a live perondepot fetch here can take
+    // tens of seconds on a cold cache and blow the bridge drain timeout
+    // (5s), which surfaced as "Unexpected end of JSON input" in the fixes
+    // modal. Warm the cache in the background and answer immediately.
     let has_online_fix = {
         let cache = online_fix_cache()
             .lock()
+            .map(|c| online_fix_cache_fresh(&c))
+            .unwrap_or(false);
+        if !cache {
+            load_online_fix_cache_from_disk();
+        }
+        let cached_match = online_fix_cache()
+            .lock()
+            .ok()
             .map(|c| {
-                let age = c.cached_at.elapsed().unwrap_or_default();
-                age.as_secs() < ONLINE_FIX_CACHE_TTL_SECS && !c.entries.is_empty()
+                online_fix_cache_fresh(&c) && fuzzy_match_game(&name, &c.entries, Some(app_id)).is_some()
             })
             .unwrap_or(false);
-        if cache {
-            online_fix_cache()
-                .lock()
-                .ok()
-                .map(|c| fuzzy_match_game(&name, &c.entries, Some(app_id)).is_some())
-                .unwrap_or(false)
-        } else {
-            // Best-effort: try live fetch (may take a moment on first open)
-            fetch_online_fix_directory()
-                .map(|files| fuzzy_match_game(&name, &files, Some(app_id)).is_some())
-                .unwrap_or(false)
+        if !cached_match {
+            static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::thread::spawn(move || {
+                    let _ = fetch_online_fix_directory();
+                    WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
         }
+        cached_match
     };
 
     let info = GameFixInfo {

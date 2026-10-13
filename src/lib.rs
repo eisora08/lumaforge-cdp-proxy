@@ -33,6 +33,8 @@ mod cdp_pipe_win;
 mod hook_linux;
 #[cfg(target_os = "linux")]
 mod plugin_loader_linux;
+#[cfg(target_os = "linux")]
+mod vfs_fetch;
 #[cfg(target_os = "windows")]
 mod relay;
 mod transport;

@@ -72,6 +72,68 @@ impl CdpClient {
         Ok(())
     }
 
+    /// Connect directly to one specific target, skipping the /json listing.
+    #[allow(dead_code)]
+    pub fn connect_to(port: u16, target_id: &str) -> Result<Self, String> {
+        let ws_url = format!("ws://127.0.0.1:{}/devtools/page/{}", port, target_id);
+        let (ws, _) =
+            connect(&ws_url).map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        Ok(CdpClient {
+            ws,
+            target_id: Some(target_id.to_string()),
+            port,
+        })
+    }
+
+    /// Connect to the browser-level WebSocket endpoint (no target session).
+    /// Browser-scope commands (e.g. Fetch.enable) apply to every target,
+    /// including ones created after connect — no per-target attach race.
+    /// Used by the Linux VFS root pump.
+    #[allow(dead_code)]
+    pub fn connect_browser(port: u16) -> Result<Self, String> {
+        let body = reqwest_get(port, "/json/version")?;
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("Failed to parse /json/version: {}", e))?;
+        let ws_url = v
+            .get("webSocketDebuggerUrl")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "no webSocketDebuggerUrl in /json/version: {}",
+                    &body[..body.len().min(200)]
+                )
+            })?
+            .to_string();
+        let (ws, _) =
+            connect(&ws_url).map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        Ok(CdpClient {
+            ws,
+            target_id: None,
+            port,
+        })
+    }
+
+    /// Blocking read of the next CDP event (a message carrying a "method").
+    /// Responses to our own commands are discarded; a dead connection returns
+    /// Err so the caller can exit its loop.
+    #[allow(dead_code)]
+    pub fn read_next_event(&mut self) -> Result<Value, String> {
+        loop {
+            match self.ws.read() {
+                Ok(Message::Text(text)) => {
+                    if let Ok(msg) = serde_json::from_str::<Value>(&text) {
+                        if msg.get("method").is_some() {
+                            return Ok(msg);
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) => return Err("connection closed".to_string()),
+                Ok(_) => {}
+                Err(e) => return Err(format!("Read error: {}", e)),
+            }
+        }
+    }
+
     pub fn get_targets(&self) -> Result<Vec<Target>, String> {
         let body = reqwest_get(self.port, "/json")?;
         let targets: Vec<Target> = serde_json::from_str(&body)

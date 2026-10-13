@@ -29,6 +29,10 @@ pub struct ActivationConfig {
     pub inject_script: String,
     #[serde(default, alias = "targetUrl")]
     pub target_url: Option<String>,
+    /// Extra URL pattern for client-UI documents (steamloopback.host — the
+    /// Library). Windows covers those via cef_hook; Linux via the CDP loop.
+    #[serde(default, alias = "runtimeTargetUrl")]
+    pub runtime_target_url: Option<String>,
 }
 
 fn default_inject_script() -> String {
@@ -72,6 +76,7 @@ pub struct LoadedPlugin {
     pub _version: String,
     pub code: String,
     pub target_url: Option<String>,
+    pub runtime_target_url: Option<String>,
     pub _dir: PathBuf,
     pub backend_config: Option<BackendConfig>,
 }

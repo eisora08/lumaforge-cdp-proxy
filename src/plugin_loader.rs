@@ -116,7 +116,10 @@ pub fn load_all_plugins() -> Result<Vec<LoadedPlugin>, String> {
         });
 
         let plugin_name = manifest.name.clone().unwrap_or_else(|| plugin_id.clone());
-        let target_url = activation.and_then(|a| a.target_url.clone());
+        let (target_url, runtime_target_url) = match activation {
+            Some(a) => (a.target_url.clone(), a.runtime_target_url.clone()),
+            None => (None, None),
+        };
 
         loaded.push(LoadedPlugin {
             _id: plugin_id,
@@ -124,6 +127,7 @@ pub fn load_all_plugins() -> Result<Vec<LoadedPlugin>, String> {
             _version: manifest.version.clone(),
             code,
             target_url,
+            runtime_target_url,
             _dir: path.clone(),
             backend_config: manifest.backend.clone(),
         });

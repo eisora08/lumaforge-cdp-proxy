@@ -24,6 +24,7 @@ fn load_enabled_plugins() -> Result<Vec<crate::plugin::LoadedPlugin>, String> {
 struct RegisteredScripts {
     bridge: Option<String>,
     plugins: Vec<(String, Option<String>)>,
+    theme: Option<String>,
 }
 
 fn registered_scripts() -> &'static Mutex<HashMap<String, RegisteredScripts>> {
@@ -370,13 +371,9 @@ fn eval_js(client: &mut Transport<'_>, msg_id: &mut u64, expression: String) -> 
     Ok(())
 }
 
-/// Add a <link rel=stylesheet> to the page, deduped via a data-lmf attribute.
-fn inject_stylesheet(
-    client: &mut Transport<'_>,
-    msg_id: &mut u64,
-    vfs_url: &str,
-) -> Result<(), String> {
-    let script = format!(
+/// Build a JS snippet that adds a <link rel=stylesheet>, deduped via data-lmf.
+fn stylesheet_js(vfs_url: &str) -> String {
+    format!(
         "(function(){{\
             var u='{}';\
             if(document.querySelector('[data-lmf=\"'+u+'\"]'))return;\
@@ -385,17 +382,12 @@ fn inject_stylesheet(
             (document.head||document.documentElement).appendChild(l);\
         }})();",
         vfs_url
-    );
-    eval_js(client, msg_id, script)
+    )
 }
 
-/// Add a <script type=module> to the page, deduped via a data-lmf attribute.
-fn inject_module_script(
-    client: &mut Transport<'_>,
-    msg_id: &mut u64,
-    vfs_url: &str,
-) -> Result<(), String> {
-    let script = format!(
+/// Build a JS snippet that adds a <script type=module>, deduped via data-lmf.
+fn module_script_js(vfs_url: &str) -> String {
+    format!(
         "(function(){{\
             var u='{}';\
             if(document.querySelector('[data-lmf=\"'+u+'\"]'))return;\
@@ -404,30 +396,59 @@ fn inject_module_script(
             (document.head||document.documentElement).appendChild(s);\
         }})();",
         vfs_url
-    );
-    eval_js(client, msg_id, script)
+    )
 }
 
-/// Add an inline <style> with the given id, deduped by id.
+/// Build a JS snippet that adds an inline <style> with the given id, deduped by id.
+fn inline_style_js(style_id: &str, css: &str) -> String {
+    format!(
+        "(function(){{\
+            if(document.getElementById('{}'))return;\
+            var s=document.createElement('style');\
+            s.id='{}';\
+            s.setAttribute('data-lmf','{}');\
+            s.textContent='{}';\
+            (document.head||document.documentElement).appendChild(s);\
+        }})();",
+        style_id,
+        style_id,
+        style_id,
+        js_escape_str(css)
+    )
+}
+
+/// Wrap each theme snippet in `try{…}catch(e){}` so one failing snippet
+/// can't skip the rest of the bundle (and the resulting string is valid JS).
+fn wrap_theme_body(snippets: &[String]) -> String {
+    snippets
+        .iter()
+        .map(|s| format!("try{{{}}}catch(e){{}}", s))
+        .collect()
+}
+
+fn inject_stylesheet(
+    client: &mut Transport<'_>,
+    msg_id: &mut u64,
+    vfs_url: &str,
+) -> Result<(), String> {
+    eval_js(client, msg_id, stylesheet_js(vfs_url))
+}
+
+fn inject_module_script(
+    client: &mut Transport<'_>,
+    msg_id: &mut u64,
+    vfs_url: &str,
+) -> Result<(), String> {
+    eval_js(client, msg_id, module_script_js(vfs_url))
+}
+
 fn inject_inline_style(
     client: &mut Transport<'_>,
     msg_id: &mut u64,
     style_id: &str,
     css: &str,
 ) -> Result<(), String> {
-    let script = format!(
-        "(function(){{\
-            if(document.getElementById('{}'))return;\
-            var s=document.createElement('style');\
-            s.id='{}';\
-            s.textContent='{}';\
-            (document.head||document.documentElement).appendChild(s);\
-        }})();",
-        style_id,
-        style_id,
-        js_escape_str(css)
-    );
-    eval_js(client, msg_id, script)
+    eval_js(client, msg_id, inline_style_js(style_id, css))
 }
 
 // â”€â”€â”€ Main injection entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -640,86 +661,119 @@ pub fn inject_into_target(
     };
     msg_id += 1;
 
-    // â”€â”€â”€ Theme: accent colors, root colors, webkit, slider vars â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if !bundle.is_empty() {
-        inject_inline_style(
-            client,
-            &mut msg_id,
-            "SystemAccentColorInject",
-            &accent_css(),
-        )?;
+    // SharedJSContext: never inject theme into its head. Steam mirrors that
+    // head into popups, so theme links there block the renderWhenReady gate
+    // and the popup never becomes visible (black window). Matches Windows
+    // cef_hook's isSharedCtx() skip. Bridge + plugins below still run.
+    let is_shared_ctx = win_title == "SharedJSContext" || win_title == "SP Shared JS Context";
+    if is_shared_ctx {
+        crate::log_to_temp(&format!(
+            "[steamcdp] Theme skipped (SharedJSContext) target#{}",
+            target_num
+        ));
+    }
+
+    // Popup documents (about:blank?createflags=N, steamloopback UI windows)
+    // are created blank and then document.write()'d by Steam. Their
+    // renderWhenReady gate tracks <link>/<style> elements present right after
+    // the write — injecting earlier races that gate and the popup never shows
+    // (black). Mirror Windows: defer theme application until #popup_target
+    // exists (= write finished, Q ctor ran) and the document is fully parsed.
+    let is_popup_doc = target.url.starts_with("about:")
+        || target.url.starts_with("data:")
+        || target.url.is_empty()
+        || target.url.contains("createflags")
+        || target.url.contains("steamloopback.host");
+
+    // Source registered via Page.addScriptToEvaluateOnNewDocument so the
+    // theme re-applies on every future document in this target (a refresh
+    // builds a new document; Runtime.evaluate snippets only live in the
+    // current one). Mirrors cef_hook's register_theme_injection_script.
+    let mut theme_reg_source: Option<String> = None;
+
+    if !bundle.is_empty() && !is_shared_ctx {
+        // Collect theme snippets so popups can defer them as one bootstrap
+        // (a per-snippet wait would race between injections) and store pages
+        // apply them immediately as before.
+        let mut theme_snippets: Vec<String> = Vec::new();
+
+        // --luma-theme-active:1 marker: the extension's themeColor.ts gates
+        // accent/panel adoption on it (parity with cef_hook's setThemeActive).
+        // Without it the plugin keeps its own defaults instead of the theme's.
+        theme_snippets.push(inline_style_js(
+            "LmfThemeActive",
+            ":root{--luma-theme-active:1}",
+        ));
+        theme_snippets.push(inline_style_js("SystemAccentColorInject", &accent_css()));
         if let Some(ref rc) = bundle.root_colors {
             match fs::read_to_string(rc) {
-                Ok(css) => inject_inline_style(client, &mut msg_id, "RootColors", &css)?,
+                Ok(css) => theme_snippets.push(inline_style_js("RootColors", &css)),
                 Err(e) => {
                     crate::log_to_temp(&format!("[steamcdp] rootColors read error ({}): {}", rc, e))
                 }
             }
         }
         if let Some(ref css) = bundle.webkit_css {
-            inject_stylesheet(client, &mut msg_id, css)?;
+            theme_snippets.push(stylesheet_js(&path_to_vfs_url(&bundle.dir, css)));
+        }
+        if let Some(ref js) = bundle.webkit_js {
+            theme_snippets.push(module_script_js(&path_to_vfs_url(&bundle.dir, js)));
         }
         if !bundle.slider_css.is_empty() {
-            inject_inline_style(
-                client,
-                &mut msg_id,
+            theme_snippets.push(inline_style_js(
                 "MillenniumSliderConditions",
                 &bundle.slider_css,
-            )?;
-        }
-    }
-
-    // â”€â”€â”€ Theme patches: inject <link>/<script type="module"> via VFS URLs â”€
-    for patch in &bundle.patches {
-        let matches = window_matches(
-            &patch.match_regex,
-            &win_title,
-            &html_class,
-            &body_class,
-            true,
-        ) || regex_matches(&patch.match_regex, &target.url);
-
-        if !matches {
-            continue;
-        }
-
-        // CSS: inject <link rel="stylesheet" href="VFS_URL"> (deduped)
-        if let Some(ref css_path) = patch.target_css {
-            let vfs_url = path_to_vfs_url(&bundle.dir, css_path);
-            inject_stylesheet(client, &mut msg_id, &vfs_url)?;
-            crate::log_to_temp(&format!(
-                "[steamcdp] Patch '{}' CSS link injected target#{}: {}",
-                patch.match_regex, target_num, vfs_url
             ));
         }
 
-        // JS: inject <script type="module" src="VFS_URL"> (deduped)
-        if let Some(ref js_path) = patch.target_js {
-            let vfs_url = path_to_vfs_url(&bundle.dir, js_path);
-            inject_module_script(client, &mut msg_id, &vfs_url)?;
-            crate::log_to_temp(&format!(
-                "[steamcdp] Patch '{}' JS module injected target#{}: {}",
-                patch.match_regex, target_num, vfs_url
-            ));
-        }
-    }
+        // Theme patches: collect <link>/<script type="module"> VFS URLs
+        for patch in &bundle.patches {
+            let matches = window_matches(
+                &patch.match_regex,
+                &win_title,
+                &html_class,
+                &body_class,
+                true,
+            ) || regex_matches(&patch.match_regex, &target.url);
 
-    // â”€â”€â”€ Conditions: selected value â†’ targetCss/targetJs with affects â”€â”€â”€â”€â”€â”€
-    for cond in &bundle.condition_css {
-        let matched = cond
-            .affects
-            .iter()
-            .any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
-        if matched {
-            let vfs_url = path_to_vfs_url(&bundle.dir, &cond.src);
-            inject_stylesheet(client, &mut msg_id, &vfs_url)?;
-            crate::log_to_temp(&format!(
-                "[steamcdp] Condition CSS injected target#{}: {}",
-                target_num, vfs_url
-            ));
+            if !matches {
+                continue;
+            }
+
+            if let Some(ref css_path) = patch.target_css {
+                let vfs_url = path_to_vfs_url(&bundle.dir, css_path);
+                theme_snippets.push(stylesheet_js(&vfs_url));
+                crate::log_to_temp(&format!(
+                    "[steamcdp] Patch '{}' CSS link collected target#{}: {}",
+                    patch.match_regex, target_num, vfs_url
+                ));
+            }
+
+            if let Some(ref js_path) = patch.target_js {
+                let vfs_url = path_to_vfs_url(&bundle.dir, js_path);
+                theme_snippets.push(module_script_js(&vfs_url));
+                crate::log_to_temp(&format!(
+                    "[steamcdp] Patch '{}' JS module collected target#{}: {}",
+                    patch.match_regex, target_num, vfs_url
+                ));
+            }
         }
-    }
-    if !bundle.condition_js.is_empty() {
+
+        // Conditions: selected value → targetCss/targetJs with affects
+        for cond in &bundle.condition_css {
+            let matched = cond
+                .affects
+                .iter()
+                .any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
+            if matched {
+                let vfs_url = path_to_vfs_url(&bundle.dir, &cond.src);
+                theme_snippets.push(stylesheet_js(&vfs_url));
+                crate::log_to_temp(&format!(
+                    "[steamcdp] Condition CSS collected target#{}: {}",
+                    target_num, vfs_url
+                ));
+            }
+        }
         for cond in &bundle.condition_js {
             let matched = cond
                 .affects
@@ -727,7 +781,77 @@ pub fn inject_into_target(
                 .any(|a| window_matches(a, &win_title, &html_class, &body_class, false));
             if matched {
                 let vfs_url = path_to_vfs_url(&bundle.dir, &cond.src);
-                inject_module_script(client, &mut msg_id, &vfs_url)?;
+                theme_snippets.push(module_script_js(&vfs_url));
+            }
+        }
+
+        if !theme_snippets.is_empty() {
+            // Each snippet isolated so one failure can't skip the rest.
+            let body = wrap_theme_body(&theme_snippets);
+
+            if is_popup_doc {
+                // Defer: one bootstrap that waits for the popup's
+                // renderWhenReady gate, then applies every snippet at once.
+                let defer_js = format!(
+                    "(function(){{\
+                        var apply=function(){{{}}};\
+                        var isPopup=(location.protocol==='about:'\
+                            ||location.href.indexOf('createflags')!==-1\
+                            ||location.href.indexOf('steamloopback.host')!==-1\
+                            ||location.href.indexOf('data:')===0\
+                            ||!document.getElementById('popup_target'));\
+                        if(!isPopup){{apply();return;}}\
+                        var started=false;\
+                        var go=function(){{if(started)return;started=true;apply();}};\
+                        var consider=function(){{\
+                            if(document.getElementById('popup_target')&&document.readyState==='complete')go();\
+                        }};\
+                        consider();\
+                        if(!started){{\
+                            window.addEventListener('load',consider);\
+                            try{{new MutationObserver(consider).observe(document,{{childList:true,subtree:true}});}}catch(e){{}}\
+                            var iv=setInterval(function(){{consider();if(started)clearInterval(iv);}},150);\
+                            setTimeout(go,5000);\
+                        }}\
+                    }})();",
+                    body
+                );
+                // Same bootstrap registered for future documents in this
+                // target (cleanup below drops the previous registration).
+                theme_reg_source = Some(defer_js.clone());
+                client.send_cdp_wait(
+                    &json!({
+                        "id": msg_id,
+                        "method": "Runtime.evaluate",
+                        "params": { "expression": defer_js, "returnByValue": true }
+                    }),
+                    msg_id,
+                )?;
+                msg_id += 1;
+                crate::log_to_temp(&format!(
+                    "[steamcdp] Theme deferred bootstrap ({} snippet(s)) target#{}",
+                    theme_snippets.len(),
+                    target_num
+                ));
+            } else {
+                // Registered source: wait for a root element (the script can
+                // run before parsing starts), then apply. Snippet dedupe
+                // makes a registration also running on the current document
+                // harmless alongside the immediate evaluation below.
+                theme_reg_source = Some(format!(
+                    "(function(){{\
+                        var apply=function(){{{}}};\
+                        var tries=0;\
+                        (function poll(){{\
+                            if(document.head||document.documentElement||tries++>250){{try{{apply();}}catch(e){{}}}}\
+                            else setTimeout(poll,20);\
+                        }})();\
+                    }})();",
+                    body
+                ));
+                for snippet in &theme_snippets {
+                    eval_js(client, &mut msg_id, snippet.clone())?;
+                }
             }
         }
     }
@@ -747,6 +871,9 @@ pub fn inject_into_target(
             let mut stale: Vec<String> =
                 prev.plugins.into_iter().filter_map(|(_, id)| id).collect();
             if let Some(id) = prev.bridge {
+                stale.push(id);
+            }
+            if let Some(id) = prev.theme {
                 stale.push(id);
             }
             for ident in stale {
@@ -777,6 +904,40 @@ pub fn inject_into_target(
         }
     }
     let mut plugin_idents: Vec<(String, Option<String>)> = Vec::new();
+
+    // Theme: register the snippets for every future document in this target
+    // so a refresh/navigation re-applies them (the immediate evaluation above
+    // only covers the current document). Registered before bridge/plugins so
+    // --luma-theme-active is in place when the extension resolves colors.
+    let mut theme_ident: Option<String> = None;
+    if let Some(src) = &theme_reg_source {
+        let resp = client.send_cdp_wait(
+            &json!({
+                "id": msg_id,
+                "method": "Page.addScriptToEvaluateOnNewDocument",
+                "params": {
+                    "source": src,
+                    "runImmediately": true
+                }
+            }),
+            msg_id,
+        )?;
+        if let Some(err) = resp.get("error") {
+            crate::log_to_temp(&format!("[steamcdp] Theme addScript error: {}", err));
+        } else {
+            theme_ident = resp
+                .get("result")
+                .and_then(|r| r.get("identifier"))
+                .and_then(|i| i.as_str())
+                .map(String::from);
+            crate::log_to_temp(&format!(
+                "[steamcdp] Theme registered for new documents (id={}) target#{}",
+                theme_ident.as_deref().unwrap_or("none"),
+                target_num
+            ));
+        }
+        msg_id += 1;
+    }
 
     let resp = client.send_cdp_wait(
         &json!({
@@ -822,18 +983,36 @@ pub fn inject_into_target(
 
     // â”€â”€â”€ Plugins â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for plugin in plugins {
-        // Respect activation.targetUrl â€” only inject into matching pages
-        if let Some(ref pattern) = plugin.target_url {
-            if !pattern.is_empty() && !target.url.contains(pattern.as_str()) {
-                crate::log_to_temp(&format!(
-                    "[steamcdp] Plugin '{}' skipped target#{} (targetUrl '{}' not in {})",
-                    plugin.name,
-                    target_num,
-                    pattern,
-                    &target.url[..target.url.len().min(80)]
-                ));
-                continue;
-            }
+        // activation.targetUrl gates the plugin on store pages;
+        // activation.runtimeTargetUrl (e.g. steamloopback.host) is an
+        // additional allowed pattern. Client-UI popup documents (Library,
+        // friends, settings) are opened with about:blank?createflags=N, an
+        // empty URL, or steamloopback.host — their real URL is not known to
+        // Rust when the target is first seen, so deliver the script and let
+        // the JS-side location.href check (same model as cef_hook) decide.
+        // On Windows this third clause is unreachable: every CDP target there
+        // is a real Steam store/community page.
+        let t_ok = match plugin.target_url.as_deref() {
+            Some(p) if !p.is_empty() => target.url.contains(p),
+            _ => true,
+        };
+        let r_ok = match plugin.runtime_target_url.as_deref() {
+            Some(p) if !p.is_empty() => target.url.contains(p),
+            _ => false,
+        };
+        let popup_ok = target.url.is_empty()
+            || target.url.starts_with("about:")
+            || target.url.starts_with("data:")
+            || target.url.contains("steamloopback.host");
+        if !(t_ok || r_ok || popup_ok) {
+            crate::log_to_temp(&format!(
+                "[steamcdp] Plugin '{}' skipped target#{} (targetUrl '{}' not in {})",
+                plugin.name,
+                target_num,
+                plugin.target_url.as_deref().unwrap_or(""),
+                &target.url[..target.url.len().min(80)]
+            ));
+            continue;
         }
         let resp = client.send_cdp_wait(
             &json!({
@@ -966,6 +1145,7 @@ pub fn inject_into_target(
             RegisteredScripts {
                 bridge: bridge_ident,
                 plugins: plugin_idents,
+                theme: theme_ident,
             },
         );
 
@@ -1005,5 +1185,26 @@ mod tests {
         assert!(css.contains("--SystemAccentColorAccent: #66c0ff"));
         assert!(css.contains("--SystemAccentColorLight1: #8fd1ff"));
         assert!(css.contains("--SystemAccentColor-RGB: 102, 192, 255"));
+    }
+
+    #[test]
+    fn wrap_theme_body_wraps_each_snippet_in_try_catch() {
+        let snippets = vec![
+            "(function(){var a=1;})();".to_string(),
+            "(function(){var b=2;})();".to_string(),
+        ];
+        let body = wrap_theme_body(&snippets);
+        assert_eq!(
+            body,
+            "try{(function(){var a=1;})();}catch(e){}try{(function(){var b=2;})();}catch(e){}"
+        );
+        // The wrapped body must be parseable: every `try{` has a matching catch.
+        assert_eq!(body.matches("try{").count(), body.matches("catch(e){").count());
+        assert_eq!(body.matches("try{").count(), snippets.len());
+    }
+
+    #[test]
+    fn wrap_theme_body_empty_is_empty() {
+        assert_eq!(wrap_theme_body(&[]), "");
     }
 }
