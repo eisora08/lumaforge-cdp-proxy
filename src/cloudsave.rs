@@ -218,6 +218,15 @@ mod w {
     }
 
     fn token_path_for(provider: &str) -> Option<PathBuf> {
+        let dir = cr_dir()?;
+        let candidates = token_candidates(provider)?;
+        // Linux: the native CloudRedirect module only reads the upstream
+        // `tokens_<provider>.json` name, so always resolve there and ignore
+        // any config override — sign-in, status, refresh and logout then
+        // converge on the one file the .so understands.
+        if cfg!(target_os = "linux") && (provider == "gdrive" || provider == "onedrive") {
+            return Some(dir.join(candidates[0]));
+        }
         if let Some(p) = read_config()
             .get("token_paths")
             .and_then(|m| m.get(provider))
@@ -225,15 +234,6 @@ mod w {
         {
             if !p.is_empty() {
                 return Some(PathBuf::from(p));
-            }
-        }
-        let dir = cr_dir()?;
-        // Prefer whichever candidate file exists, then default to the first.
-        let candidates = token_candidates(provider)?;
-        for name in candidates {
-            let p = dir.join(name);
-            if p.exists() {
-                return Some(p);
             }
         }
         Some(dir.join(candidates[0]))
