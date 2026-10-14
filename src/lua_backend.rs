@@ -638,3 +638,168 @@ pub fn reload_lua_backend(
     }
     load_lua_backend(plugin_id, plugin_dir, config)
 }
+
+
+// ─── Temporary gate: extension backend time budget ──────────────────────────
+// Loads the sibling steam-store-helper backend.lua and proves the two rules the
+// bridge depends on: GET /api/sources answers inside its own budget even when
+// every provider hangs, and GET /api/provider-stats stops hitting the network
+// on every poll. Removed once the Tanda A gates are green.
+#[cfg(test)]
+mod bridge_budget_tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn backend_source() -> Option<String> {
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lumaforge-extensions/extensions/steam-store-helper/backend.lua"
+        ));
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn fixture_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("luma-budget-{}", tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Four remote providers: a hung first check burns its full 5s cap and
+        // leaves 1s of the 6s budget — under the 2s floor, so the rest must be
+        // reported as not checked rather than started and failed as well.
+
+        let cfg = r#"{"downloads":{"providers":[
+            {"id":"hubcapdb","name":"Hubcapdb","baseUrl":"https://hubcapmanifest.com","enabled":true,"apiKey":"k"},
+            {"id":"ryuu","name":"Ryuu","baseUrl":"https://generator.ryuu.lol","enabled":true,"apiKey":"k"},
+            {"id":"custom","name":"Custom","baseUrl":"https://api.example.com","enabled":true,"apiKey":""},
+            {"id":"custom2","name":"Custom 2","baseUrl":"https://api.example.org","enabled":true,"apiKey":""},
+            {"id":"steamkeys","name":"Key Generator","baseUrl":"","enabled":true}
+        ]}}"#;
+        std::fs::write(dir.join("config.json"), cfg).unwrap();
+        dir
+    }
+
+    /// A provider that never answers: burns exactly the timeout it is handed
+    /// and reports a transport failure — the worst case a route must bound.
+    fn hang_http(lua: &Lua) {
+        let lc = lua.clone();
+        let stub = lc
+            .clone()
+            .create_function(
+                move |_, (_url, _hdrs, timeout): (String, Option<mlua::Table>, Option<u32>)| {
+                    std::thread::sleep(Duration::from_secs(timeout.unwrap_or(10) as u64));
+                    let tbl = lc.create_table()?;
+                    tbl.set("status", 0)?;
+                    tbl.set("ok", false)?;
+                    tbl.set("error", "simulated timeout")?;
+                    Ok(LuaValue::Table(tbl))
+                },
+            )
+            .unwrap();
+        lua.globals().set("http_get_headers", stub).unwrap();
+    }
+
+    fn load_backend(dir: &Path, source: &str) -> Lua {
+        let lua = Lua::new();
+        let dir_str = dir.to_string_lossy().to_string();
+        register_host_functions(&lua, &dir.to_path_buf()).unwrap();
+        lua.globals()
+            .set(
+                "local_appdata",
+                lua.create_function(move |_, ()| Ok(dir_str.clone())).unwrap(),
+            )
+            .unwrap();
+        lua.load(source)
+            .set_name("backend.lua")
+            .exec()
+            .expect("backend.lua must compile and run");
+        lua
+    }
+
+    fn call_route(lua: &Lua, method: &str, path: &str) -> (Duration, String) {
+        let routes: LuaTable = lua.globals().get("routes").expect("routes table");
+        let exact = format!("{} {}", method, path);
+        let handler: LuaFunction = match routes
+            .get::<Option<LuaFunction>>(exact.as_str())
+            .ok()
+            .flatten()
+        {
+            Some(f) => f,
+            None => {
+                // Same fallback handle_lua_request uses for ":id" patterns.
+                let mut found = None;
+                for pair in routes.pairs::<String, LuaFunction>().flatten() {
+                    let mut parts = pair.0.splitn(2, ' ');
+                    let pattern_method = parts.next().unwrap_or("");
+                    let pattern = parts.next().unwrap_or("");
+                    if pattern_method == method && path_matches(pattern, path) {
+                        found = Some(pair.1);
+                        break;
+                    }
+                }
+                found.expect("route")
+            }
+        };
+        let req = lua.create_table().unwrap();
+        req.set("method", method).unwrap();
+        req.set("path", path).unwrap();
+        req.set("body", "").unwrap();
+        req.set("query", "").unwrap();
+        req.set("headers", lua.create_table().unwrap()).unwrap();
+        let started = Instant::now();
+        let out: LuaValue = handler.call(req).unwrap();
+        let elapsed = started.elapsed();
+        let body = match out {
+            LuaValue::Table(t) => t.get::<String>("body").unwrap_or_default(),
+            other => format!("unexpected value: {}", other.type_name()),
+        };
+        (elapsed, body)
+    }
+
+    #[test]
+    fn sources_answer_inside_the_bridge_budget() {
+        let Some(src) = backend_source() else { return };
+        let dir = fixture_dir("sources");
+        let lua = load_backend(&dir, &src);
+        hang_http(&lua);
+
+        let (elapsed, body) = call_route(&lua, "GET", "/api/sources/976730");
+        assert!(
+            elapsed >= Duration::from_secs(4) && elapsed < Duration::from_millis(7500),
+            "sources took {:?} (expected ~5s of bounded checks)",
+            elapsed
+        );
+        // The transport failure must name itself (cap reached) instead of the
+        // blanket "Provider unreachable" that read like a dead provider.
+        assert!(
+            body.contains("No answer in 5s"),
+            "timeout detail missing, body: {}",
+            body
+        );
+        assert!(
+            body.contains("Not checked"),
+            "budget never spent, every provider was queried: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn provider_stats_stops_hitting_the_network_every_poll() {
+        let Some(src) = backend_source() else { return };
+        let dir = fixture_dir("stats");
+        let lua = load_backend(&dir, &src);
+        hang_http(&lua);
+
+        let (first, _) = call_route(&lua, "GET", "/api/provider-stats");
+        let (second, _) = call_route(&lua, "GET", "/api/provider-stats");
+        assert!(
+            first >= Duration::from_secs(2),
+            "first call took {:?} — the stub was never used",
+            first
+        );
+        assert!(
+            second < Duration::from_secs(1),
+            "cached call took {:?} — TTL cache is not serving the snapshot",
+            second
+        );
+    }
+}
