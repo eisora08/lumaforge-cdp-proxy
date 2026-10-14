@@ -22,6 +22,23 @@ static SESSION_URLS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex:
 // from the browser-level enable, so their interception ids are root ids even
 // though the pause event carries the store session's sid.
 static SESSION_FETCH: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+// Sessions that already received Runtime.enable + Runtime.addBinding for the
+// bridge shim. Re-sending them on every frameNav stacked registrations: each
+// extra Runtime.enable delivered every consoleAPICalled event N times (the
+// duplicated `JS console:` lines) and each extra addBinding made one
+// `__lumaNativeBridge` call fire N bindingCalled events — N HTTP requests to
+// the bridge for a single fetch (pairs of accepts 1ms apart in the proxy log,
+// double the load on HubcapDB).
+static SHIM_SESSIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+// Keys (sid|ecid|payload) of bridge binding calls already handled. Safety net
+// in case addBinding still stacks despite SHIM_SESSIONS: the duplicate event
+// can arrive long after the first call (the CDP loop is single-threaded, so a
+// duplicate queued behind a slow route is processed right when the first one
+// finishes) — hence the window is generous. Keying on executionContextId makes
+// false positives practically impossible: `_cid` is monotonic per document and
+// a new document always gets a fresh ecid.
+static BRIDGE_CALL_SEEN: std::sync::Mutex<Vec<(String, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
 /// The last `socket.send` hit a transient write error: the frame is retained
 /// in tungstenite's out_buffer and the main loop must retry with `flush()`.
 static WS_WRITE_STALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1637,7 +1654,10 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
       };
       var body=(opts&&opts.body)?(typeof opts.body==='string'?opts.body:JSON.stringify(opts.body)):null;
       var payload=JSON.stringify({id:id,path:path,method:(opts&&opts.method)||'GET',body:body});
-      window.__lumaNativeBridge(payload);
+      try{window.__lumaNativeBridge(payload);}catch(err){
+        if(_p[id]){delete _p[id];reject(err instanceof Error?err:new Error(err));}
+        if(window.console&&console.error)console.error('[LUMA_BRIDGE] native call failed: '+err);
+      }
     });
   };
   var _origFetch=window.fetch;
@@ -1653,9 +1673,16 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
 
 fn proxy_bridge_request(path: &str, method: &str, body: Option<&str>) -> Result<String, String> {
     let started = Instant::now();
+    // The bridge may bind the primary port or fall back (e.g. TIME_WAIT after a
+    // flood of connections leaves 21775 unbindable) — so both ports are tried,
+    // but ONLY when the first one refused the connection: that is the signal
+    // that nothing is listening there. A timeout on a listening port means the
+    // route itself is slow; retrying 21776 then can never help and used to
+    // overwrite the real cause — the log ended up showing
+    // "connect(...21776): refused" for a bridge that was up and merely slow,
+    // which is how a slow Lua route was mistaken for a dead bridge.
+    let mut attempts: Vec<String> = Vec::new();
     let mut last_err = String::new();
-    // Bridge may bind the primary port or fall back (e.g. TIME_WAIT after a
-    // flood of connections leaves 21775 unbindable) — try both.
     for port in [21775u16, 21776] {
         match proxy_bridge_request_on(path, method, body, port) {
             Ok(v) => {
@@ -1670,7 +1697,14 @@ fn proxy_bridge_request(path: &str, method: &str, body: Option<&str>) -> Result<
                 }
                 return Ok(v);
             }
-            Err(e) => last_err = e,
+            Err(e) => {
+                let not_listening = e.starts_with("connect(");
+                attempts.push(format!("port {}: {}", port, e));
+                last_err = e;
+                if !not_listening {
+                    break;
+                }
+            }
         }
     }
     log_to_temp(&format!(
@@ -1678,9 +1712,22 @@ fn proxy_bridge_request(path: &str, method: &str, body: Option<&str>) -> Result<
         method,
         path,
         started.elapsed().as_millis(),
-        last_err
+        attempts.join(" | ")
     ));
-    Err(last_err)
+    Err(bridge_err_for_ui(&last_err))
+}
+
+/// What the page sees instead of the raw io error. `connect(127.0.0.1:21776)`
+/// pointed at the *fallback* port, so a slow route on the live one reported
+/// itself as a refused connection to the UI; the log keeps the full detail.
+fn bridge_err_for_ui(raw: &str) -> String {
+    if raw.starts_with("read:") {
+        "bridge timeout".to_string()
+    } else if raw.starts_with("connect(") {
+        "bridge unreachable".to_string()
+    } else {
+        raw.to_string()
+    }
 }
 
 fn proxy_bridge_request_on(
@@ -1741,6 +1788,36 @@ fn handle_bridge_binding(
     sid: Option<&str>,
     ecid: Option<i64>,
 ) {
+    // Safety net against duplicate delivery of the same bindingCalled event:
+    // the same (session, context, payload) tuple can only originate from one
+    // JS call -- `_cid` is monotonic per document. Real duplicates arrive
+    // within milliseconds (stacked registrations), so a 2s window is enough.
+    // A longer window false-positives on document reloads: CEF reuses the
+    // executionContextId and the new document's first calls (health id=1,
+    // start-next id=2) get dropped as "duplicates" of the old document's.
+    // Cross-session duplicates no longer exist (attachedToTarget detaches
+    // zombie sessions), so the window does not need to span navigations.
+    {
+        let key = format!(
+            "{}|{}|{}",
+            sid.unwrap_or(""),
+            ecid.map(|e| e.to_string()).unwrap_or_default(),
+            payload
+        );
+        let mut seen = BRIDGE_CALL_SEEN.lock().unwrap();
+        let now = Instant::now();
+        seen.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(2));
+        if seen.iter().any(|(k, _)| k == &key) {
+            let path_hint = payload.get(0..120).unwrap_or(payload);
+            log_to_temp(&format!(
+                "[cef_hook] dropped duplicate binding call: {}",
+                path_hint
+            ));
+            return;
+        }
+        seen.push((key, now));
+    }
+
     let req: Value = match serde_json::from_str(payload) {
         Ok(v) => v,
         Err(_) => return,
@@ -1749,6 +1826,18 @@ fn handle_bridge_binding(
     let path = req.get("path").and_then(|p| p.as_str()).unwrap_or("/");
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
     let body = req.get("body").and_then(|b| b.as_str());
+
+    // Low-volume diagnostic: art fetches are high-frequency (skip), everything
+    // else (settings, catalog, pins, health...) proves the bindingCalled
+    // reached the hook — distinguishes "JS never sent" from "hook ate it".
+    if !path.starts_with("/api/art/") {
+        log_to_temp(&format!(
+            "[cef_hook] binding: {} {} sid={}",
+            method,
+            path,
+            sid.unwrap_or("")
+        ));
+    }
 
     // callFunctionOn requires an explicit target: use the execution context the
     // binding fired from (also correct when the shim runs inside an iframe).
@@ -1805,33 +1894,58 @@ fn handle_bridge_binding(
 ///   Re-sending it on every navigation would accumulate duplicate scripts, so
 ///   frameNav re-ensure calls pass `false` and only evaluate into the fresh
 ///   document (BRIDGE_SHIM_JS is idempotent).
+///
+/// `Runtime.enable`/`Runtime.addBinding` follow the same rule: they are sent
+/// once per session (see SHIM_SESSIONS), because re-sending them on every
+/// navigation stacked registrations and duplicated console events and
+/// bindingCalled HTTP requests.
 fn install_bridge_shim_session(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     msg_id: &mut u64,
     sid: &str,
     register_for_new_docs: bool,
 ) {
-    // bindingCalled events are only delivered when Runtime is enabled on the session.
-    let runtime_enable = json!({
-        "id": *msg_id,
-        "method": "Runtime.enable",
-        "params": {},
-        "sessionId": sid
-    });
-    *msg_id += 1;
-    if !send_cdp(socket, &runtime_enable) {
-        return;
-    }
+    // Only the FIRST call per session sends enable+binding. frameNav re-ensure
+    // calls used to re-send both, which stacked registrations (see
+    // SHIM_SESSIONS). The evaluate below still runs every time: it is what
+    // covers the fresh document, and BRIDGE_SHIM_JS is idempotent.
+    let fresh = SHIM_SESSIONS
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|s| s != sid);
 
-    let add_binding = json!({
-        "id": *msg_id,
-        "method": "Runtime.addBinding",
-        "params": {"name": "__lumaNativeBridge"},
-        "sessionId": sid
-    });
-    *msg_id += 1;
-    if !send_cdp(socket, &add_binding) {
-        return;
+    if fresh {
+        // bindingCalled events are only delivered when Runtime is enabled on the session.
+        let runtime_enable = json!({
+            "id": *msg_id,
+            "method": "Runtime.enable",
+            "params": {},
+            "sessionId": sid
+        });
+        *msg_id += 1;
+        if !send_cdp(socket, &runtime_enable) {
+            return;
+        }
+
+        let add_binding = json!({
+            "id": *msg_id,
+            "method": "Runtime.addBinding",
+            "params": {"name": "__lumaNativeBridge"},
+            "sessionId": sid
+        });
+        *msg_id += 1;
+        if !send_cdp(socket, &add_binding) {
+            return;
+        }
+
+        // Record only after both commands went out: a failed send must not
+        // poison the tracking (the next call would then skip enable forever).
+        if let Ok(mut ss) = SHIM_SESSIONS.lock() {
+            if !ss.iter().any(|s| s == sid) {
+                ss.push(sid.to_string());
+            }
+        }
     }
 
     if register_for_new_docs {
@@ -1859,8 +1973,8 @@ fn install_bridge_shim_session(
     send_cdp(socket, &eval);
 
     log_to_temp(&format!(
-        "[cef_hook] Bridge shim installed (sid={}, new_docs={})",
-        sid, register_for_new_docs
+        "[cef_hook] Bridge shim installed (sid={}, new_docs={}, fresh={})",
+        sid, register_for_new_docs, fresh
     ));
 }
 
@@ -2905,43 +3019,73 @@ fn inject_into_existing_targets(
             continue;
         }
 
-        // Attach to the target
-        let attach = json!({
-            "id": *msg_id,
-            "method": "Target.attachToTarget",
-            "params": {
-                "targetId": target_id,
-                "flatten": true
-            }
-        });
-        *msg_id += 1;
-        if !send_cdp(socket, &attach) {
-            continue;
-        }
-        let attach_resp = match recv_cdp_response(socket, pending, *msg_id - 1) {
-            Some(r) => r,
+        // Reuse the session we already hold for this target instead of
+        // attaching a second one. Nothing ever sends Target.detachFromTarget,
+        // so every extra attach leaves a live CEF session behind and the same
+        // console/bridge event is then delivered once per session: that is
+        // where the exactly-duplicated `JS console:` lines came from (2.05x
+        // measured) and where each extra session-scoped Fetch.enable in
+        // SESSION_FETCH grows every FetchScope order (InvalidInterceptionId
+        // retries). Injecting still happens — only the attach is skipped.
+        let held_session = {
+            let sessions = SESSIONS.lock().unwrap();
+            sessions
+                .iter()
+                .find(|(t, _)| t.as_str() == target_id)
+                .map(|(_, s)| s.clone())
+        };
+        let session_id = match held_session {
+            Some(sid) => sid,
             None => {
-                log_to_temp(&format!(
-                    "[cef_hook] No response attaching to target {} ({})",
-                    target_id,
-                    &target_url[..target_url.len().min(80)]
-                ));
-                continue;
+                let attach = json!({
+                    "id": *msg_id,
+                    "method": "Target.attachToTarget",
+                    "params": {
+                        "targetId": target_id,
+                        "flatten": true
+                    }
+                });
+                *msg_id += 1;
+                if !send_cdp(socket, &attach) {
+                    continue;
+                }
+                let attach_resp = match recv_cdp_response(socket, pending, *msg_id - 1) {
+                    Some(r) => r,
+                    None => {
+                        log_to_temp(&format!(
+                            "[cef_hook] No response attaching to target {} ({})",
+                            target_id,
+                            &target_url[..target_url.len().min(80)]
+                        ));
+                        continue;
+                    }
+                };
+                let sid = attach_resp
+                    .get("result")
+                    .and_then(|r| r.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if sid.is_empty() {
+                    log_to_temp(&format!(
+                        "[cef_hook] Failed to attach to target {}: no session",
+                        target_id
+                    ));
+                    continue;
+                }
+                // Record it right away: the attachedToTarget event is only
+                // dispatched by the main loop later, and a second injection
+                // pass in between (startup runs this twice within ~270ms)
+                // would otherwise attach again. The event handler replaces
+                // this entry with the same id, so it stays idempotent.
+                if let Ok(mut sessions) = SESSIONS.lock() {
+                    sessions.retain(|(t, _)| t.as_str() != target_id);
+                    sessions.push((target_id.to_string(), sid.clone()));
+                }
+                sid
             }
         };
-        let session_id = attach_resp
-            .get("result")
-            .and_then(|r| r.get("sessionId"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-
-        if session_id.is_empty() {
-            log_to_temp(&format!(
-                "[cef_hook] Failed to attach to target {}: no session",
-                target_id
-            ));
-            continue;
-        }
 
         if is_real_steam_page(target_url) {
             // Real web pages: evaluate directly. Reloading used to be needed so
@@ -3351,7 +3495,31 @@ fn handle_fetch_paused(
         return;
     }
 
-    // ── Check if response is HTML ──
+    // Response-stage media/CDN URLs: never Steam pages worth injecting.
+    // Broadcast segments report text/html (or fail body retrieval), so each
+    // pause used to cost a getResponseBody + InvalidInterceptionId retry
+    // cycle (~6 every 10s while a broadcast plays). Continue immediately.
+    {
+        let lu = url.to_lowercase();
+        if lu.contains("akamaized.net")
+            || lu.contains("/segment/")
+            || lu.contains("/broadcast/")
+            || lu.contains(".m3u8")
+            || lu.contains(".mpd")
+        {
+            fetch_cmd(
+                socket,
+                msg_id,
+                "Fetch.continueResponse",
+                json!({"requestId": request_id_str}),
+                &scope,
+                fetch_retry,
+                url,
+            );
+            return;
+        }
+    }
+
     let lower_url = url.to_lowercase();
     let is_html_url = lower_url.ends_with(".html") || lower_url.ends_with(".htm");
 
@@ -3705,6 +3873,16 @@ fn dispatch_cdp_message(
                 if let Some(sid) = msg.get("sessionId").and_then(|s| s.as_str()) {
                     if !sid.is_empty() {
                         install_bridge_shim_session(socket, msg_id, sid, false);
+                        // New document: CEF can reuse the executionContextId and
+                        // the fresh document's first calls (health id=1,
+                        // start-next id=2) would collide with the old document's
+                        // keys in BRIDGE_CALL_SEEN. Clear this session's keys --
+                        // frameNavigated is dispatched before any bindingCalled
+                        // of the new document, so the ordering is safe.
+                        if let Ok(mut seen) = BRIDGE_CALL_SEEN.lock() {
+                            let prefix = format!("{}|", sid);
+                            seen.retain(|(k, _)| !k.starts_with(&prefix));
+                        }
                     }
                 }
                 // New document: the window realm is fresh (window.__lumaCSS
@@ -3777,6 +3955,31 @@ fn dispatch_cdp_message(
 
             if sid.is_empty() || tid.is_empty() || turl.contains("lumaforge.local") {
                 return;
+            }
+            // One target must never carry TWO live sessions: every event of
+            // the target is then delivered once per session (duplicated console,
+            // bindingCalled with different sids, paired frameNav installs).
+            // Keep the incoming session and detach the old one;
+            // Target.detachedFromTarget then cleans SESSION_FETCH/SHIM_SESSIONS.
+            let zombie = {
+                let sessions = SESSIONS.lock().unwrap();
+                sessions
+                    .iter()
+                    .find(|(t, s)| t.as_str() == tid && s.as_str() != sid)
+                    .map(|(_, s)| s.clone())
+            };
+            if let Some(old_sid) = zombie {
+                log_to_temp(&format!(
+                    "[cef_hook] duplicate session for target {}, detaching old sid={}",
+                    tid, old_sid
+                ));
+                let detach = json!({
+                    "id": *msg_id,
+                    "method": "Target.detachFromTarget",
+                    "params": {"sessionId": old_sid}
+                });
+                *msg_id += 1;
+                send_cdp(socket, &detach);
             }
             if let Ok(mut sessions) = SESSIONS.lock() {
                 sessions.retain(|(t, _)| *t != tid);
@@ -3934,6 +4137,9 @@ fn dispatch_cdp_message(
                 if let Ok(mut sf) = SESSION_FETCH.lock() {
                     sf.retain(|s| s != sid);
                 }
+                if let Ok(mut ss) = SHIM_SESSIONS.lock() {
+                    ss.retain(|s| s != sid);
+                }
             }
         }
         "" => {
@@ -4089,11 +4295,43 @@ fn poll_new_targets(
             "params": {"targetId": tid, "flatten": true}
         });
         *msg_id += 1;
-        if send_cdp(socket, &attach) {
-            log_to_temp(&format!(
-                "[cef_hook] Poll: attaching to new target {} ({})",
-                tid, url
-            ));
+        if !send_cdp(socket, &attach) {
+            continue;
+        }
+        // Wait for the attach response and pre-record the session: a
+        // fire-and-forget attach left a window where inject_into_existing_targets
+        // (which also attaches, ~270ms apart at startup) saw an empty SESSIONS
+        // and attached a SECOND time. Two live sessions on one target deliver
+        // every console/bindingCalled/frameNavigated event twice.
+        let attach_resp = match recv_cdp_response(socket, pending, *msg_id - 1) {
+            Some(r) => r,
+            None => {
+                log_to_temp(&format!(
+                    "[cef_hook] Poll: no response attaching to {} ({})",
+                    tid, url
+                ));
+                continue;
+            }
+        };
+        let sid = attach_resp
+            .get("result")
+            .and_then(|r| r.get("sessionId"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if sid.is_empty() {
+            continue;
+        }
+        log_to_temp(&format!(
+            "[cef_hook] Poll: attaching to new target {} ({})",
+            tid, url
+        ));
+        // Same pre-record as inject_into_existing_targets: the attachedToTarget
+        // event is dispatched by the main loop later and replaces this entry
+        // with the same sid, so it stays idempotent.
+        if let Ok(mut sessions) = SESSIONS.lock() {
+            sessions.retain(|(t, _)| t.as_str() != tid);
+            sessions.push((tid.to_string(), sid));
         }
     }
 }
@@ -4151,6 +4389,12 @@ fn handle_cdp_connection(direct: Option<u16>) {
         // session). Short write timeout + flush retry in the main loop.
         if let tungstenite::stream::MaybeTlsStream::Plain(s) = socket.get_mut() {
             s.set_write_timeout(Some(Duration::from_millis(500))).ok();
+            // Without a read timeout a half-open relay/CEF socket blocks
+            // socket.read() forever: the whole hook freezes with zero logs
+            // (observed 2026-10-14: log stuck at [+816.764], /api/settings
+            // never reached the bridge). WouldBlock/TimedOut from this
+            // timeout are treated as "no data" by both read sites.
+            s.set_read_timeout(Some(Duration::from_millis(500))).ok();
         }
         WS_WRITE_STALLED.store(false, std::sync::atomic::Ordering::Relaxed);
 
@@ -4336,6 +4580,11 @@ fn handle_cdp_connection(direct: Option<u16>) {
                     ));
                     lost = true;
                 }
+                // Read timeout with no data: keep the loop alive (poll,
+                // pending dispatch, flush retry must still run).
+                Err(tungstenite::Error::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
                     log_to_temp(&format!(
                         "[cef_hook] WebSocket error: {}, reconnecting... ({})",
