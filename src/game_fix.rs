@@ -788,6 +788,25 @@ fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("Failed to create HTTP client: {e}"))
 }
 
+/// Routes the extension awaits through the bridge must answer well inside the
+/// native shim's 10s deadline. A cold `fetch_catalog` used to inherit the full
+/// connect+read budget (30s each), and because the fixes modal awaits
+/// info+status+catalog through a single CDP thread, the two disk-fast requests
+/// blew their own budget queueing behind it — that showed up as
+/// `bridge timeout` in the game fixes modal. Measured latency for the catalog
+/// endpoint is ~0.2s, so these bounds leave ~20x headroom.
+const SYNC_ROUTE_TIMEOUT_SECS: u64 = 4;
+const SYNC_ROUTE_CONNECT_TIMEOUT_SECS: u64 = 3;
+
+fn sync_http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .user_agent(APP_USER_AGENT)
+        .connect_timeout(Duration::from_secs(SYNC_ROUTE_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(SYNC_ROUTE_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))
+}
+
 fn download_file(url: &str, dest: &Path) -> Result<(), String> {
     let client = http_client(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))?;
     let resp = client
@@ -2182,7 +2201,7 @@ fn fetch_catalog() -> Result<String, String> {
             "Fixes catalog key missing. Set fixes.catalogKey in config.json.".to_string(),
         );
     }
-    let client = http_client(Duration::from_secs(CONNECT_TIMEOUT_SECS))?;
+    let client = sync_http_client()?;
     let resp = client
         .get(CATALOG_URL)
         .header("X-LumaForge-Key", &key)
