@@ -1584,7 +1584,10 @@ fn unfix_goldberg(game_path: &Path, app_id: u64) -> Result<GameFixResult, String
 // Online Fix — perondepot scrape + fuzzy match (phase 2, included here)
 // ---------------------------------------------------------------------------
 
-const ONLINE_FIX_URL: &str = "https://api.perondepot.xyz/all/";
+// Stable perondepot proxy on our Cloudflare Pages project. The upstream
+// domain lives in the Pages env var `UPSTREAM`, so a perondepot move is a
+// dashboard edit there — this constant never changes again.
+const ONLINE_FIX_BASE: &str = "https://lumaforge-fixes.pages.dev/of/";
 const ONLINE_FIX_RAR_PASSWORD: &str = "online-fix.me";
 const ONLINE_FIX_CACHE_TTL_SECS: u64 = 86400;
 const ONLINE_FIX_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
@@ -1710,7 +1713,7 @@ fn fetch_online_fix_directory() -> Result<Vec<OnlineFixEntry>, String> {
         .map_err(|e| format!("perondepot client: {e}"))?;
 
     let resp = client
-        .get(ONLINE_FIX_URL)
+        .get(format!("{ONLINE_FIX_BASE}all/"))
         .send()
         .map_err(|e| format!("Failed to connect to online-fix: {e}"))?;
     if !resp.status().is_success() {
@@ -1739,7 +1742,7 @@ fn fetch_online_fix_directory() -> Result<Vec<OnlineFixEntry>, String> {
             encode_non_ascii_href(href)
         } else {
             format!(
-                "https://api.perondepot.xyz/all/{}",
+                "{ONLINE_FIX_BASE}all/{}",
                 encode_non_ascii_href(href.trim_start_matches('/'))
             )
         };
@@ -1912,7 +1915,7 @@ fn apply_online_fix(
         if file_name.starts_with("http") {
             file_name.to_string()
         } else {
-            format!("https://api.perondepot.xyz/{}", file_name)
+            format!("{ONLINE_FIX_BASE}{}", file_name)
         }
     } else {
         let files = fetch_online_fix_directory()?;
