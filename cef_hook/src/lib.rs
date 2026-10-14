@@ -1599,6 +1599,10 @@ fn recv_cdp_response(
                     // Not the response we are waiting for — keep it for the
                     // main loop (events must never be discarded).
                     if pending.len() >= 4096 {
+                        log_to_temp(&format!(
+                            "[cef_hook] pending queue full (4096), dropping oldest event id={:?}",
+                            msg.get("id")
+                        ));
                         pending.remove(0);
                     }
                     pending.push(msg);
@@ -1644,10 +1648,13 @@ const BRIDGE_SHIM_JS: &str = r#"(function(){
     var id=++_cid;
     return new Promise(function(resolve,reject){
       // Safety net: if the native side never resolves (CDP error, detach),
-      // fail instead of hanging the page's fetch forever.
+      // fail instead of hanging the page's fetch forever. Must stay strictly
+      // above the Rust read timeout (10s) so the descriptive Rust error
+      // ("bridge timeout"/"bridge unreachable") always wins the race and
+      // this timer is only a backstop.
       var t=setTimeout(function(){
         if(_p[id]){delete _p[id];reject(new Error('bridge timeout'));}
-      },10000);
+      },15000);
       _p[id]={
         resolve:function(r){clearTimeout(t);resolve(r);},
         reject:function(e){clearTimeout(t);reject(e instanceof Error?e:new Error(e));}
