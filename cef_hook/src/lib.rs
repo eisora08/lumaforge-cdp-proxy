@@ -25,6 +25,13 @@ static SESSION_FETCH: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec:
 /// The last `socket.send` hit a transient write error: the frame is retained
 /// in tungstenite's out_buffer and the main loop must retry with `flush()`.
 static WS_WRITE_STALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Methods whose "-32601 wasn't found" errors were already logged once. This
+/// CEF build rejects `Page.addScriptToEvaluateOnNewDocument`, `Runtime.enable`,
+/// `Page.enable` and `Page.setBypassCSP` at browser level (and the per-session
+/// addScript too) — hundreds of identical lines per boot drowned out the real
+/// signal in cef_hook.log.
+static DEAD_METHODS_LOGGED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 mod accent;
 
@@ -2224,6 +2231,61 @@ fn push_css_payload(
     send_cdp(socket, &eval);
 }
 
+/// A document is themed through HTML-response rewriting (`inject_theme_html`
+/// adds `<link data-lmf>`) only when it is served over HTTP from a Steam web
+/// origin whose responses the browser-level Fetch.enable can pause. Every
+/// other document — `data:`, `about:`, `steamloopback.host`, popups — has no
+/// interceptable response and MUST receive the CSS payload as text.
+fn needs_css_payload(url: &str) -> bool {
+    !url.contains("store.steampowered.com")
+}
+
+/// Make `sid` a payload-carrying session: request-stage Fetch interception for
+/// `lumaforge.local` subresources, SESSION_URLS registration (so later
+/// frameNavigated / theme-reload know to re-push) and the `window.__lumaCSS`
+/// push. Idempotent for the Fetch part; the push is unconditional because a
+/// new document always starts with a fresh realm (no `window.__lumaCSS`).
+fn ensure_session_payload(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    msg_id: &mut u64,
+    theme_state: &mut ThemeState,
+    sid: &str,
+    url: &str,
+) {
+    // Request-stage interception must also be enabled per session: the
+    // browser-level Fetch.enable only pauses requests from store-origin
+    // documents — steamloopback docs (Shared, main window, popups) never pause,
+    // so their module scripts, fonts and images to lumaforge.local fell into
+    // DNS and failed. The response-stage "*" pattern stays browser-level only
+    // so this session's HTML responses are never rewritten (inject_theme_html
+    // must not touch the Steam shell).
+    if let Ok(mut sf) = SESSION_FETCH.lock() {
+        if !sf.iter().any(|s| s == sid) {
+            let fetch_enable = json!({
+                "id": *msg_id,
+                "method": "Fetch.enable",
+                "params": {
+                    "patterns": [
+                        {"urlPattern": format!("*{}*", VFS_HOST), "requestStage": "Request"},
+                        {"urlPattern": "*/luma-bridge/*", "requestStage": "Request"}
+                    ]
+                },
+                "sessionId": sid
+            });
+            *msg_id += 1;
+            send_cdp(socket, &fetch_enable);
+            // Remember that this session now owns request-stage interception:
+            // pauses it reports are session-scoped ids.
+            sf.push(sid.to_string());
+        }
+    }
+    push_css_payload(socket, msg_id, theme_state, sid);
+    if let Ok(mut urls) = SESSION_URLS.lock() {
+        urls.retain(|(s, _)| s != sid);
+        urls.push((sid.to_string(), url.to_string()));
+    }
+}
+
 fn build_theme_js(theme_state: &ThemeState) -> String {
     let theme_dir = theme_state.theme_dir_str();
 
@@ -2543,9 +2605,19 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
       console.log('[LUMA] popup created-hook installed');
     }catch(e){}
   }
-  function startPatcher(){
+  function startPatcher(tries){
     if(window.__luma_patcher)return;
-    if(typeof g_PopupManager==='undefined'||!g_PopupManager)return;
+    if(typeof g_PopupManager==='undefined'||!g_PopupManager){
+      // g_PopupManager is only defined once SharedJSContext's own scripts
+      // have run; the theme script is evaluated at attach time, well before
+      // that. A single silent return used to leave the popup patcher dead for
+      // the whole session (Shared never themed any popup — 'popup themed:'
+      // never appeared in the logs), so the library window only got its CSS
+      // from the theme toggle's force re-attach. Retry until Steam is ready.
+      tries=(tries||0)+1;
+      if(tries<120){ setTimeout(function(){ startPatcher(tries); },1000); }
+      return;
+    }
     window.__luma_patcher=1;
     ensureCreatedHook();
     sweepPopups();
@@ -3610,7 +3682,7 @@ fn dispatch_cdp_message(
         }
         "Page.frameNavigated" => {
             let frame = msg.get("params").and_then(|p| p.get("frame"));
-            let _nav_url = frame
+            let nav_url = frame
                 .and_then(|f| f.get("url"))
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
@@ -3635,17 +3707,36 @@ fn dispatch_cdp_message(
                         install_bridge_shim_session(socket, msg_id, sid, false);
                     }
                 }
-                // New document in a payload-carrying session: the window realm
-                // is fresh (window.__lumaCSS gone) — re-push the payload. The
-                // patcher's delayed re-applies pick it up.
+                // New document: the window realm is fresh (window.__lumaCSS
+                // gone) — re-push the payload. Two cases must both be covered:
+                //   * a session that already carries the payload (was attached
+                //     on a non-store URL) → re-push;
+                //   * a session first attached while the target was still on
+                //     store.steampowered.com (so it was skipped at attach) that
+                //     has since navigated to a document Fetch interception can
+                //     NOT rewrite (data:/about:/steamloopback). Without this,
+                //     Steam's library window — same target as the store, which
+                //     navigates from store.steampowered.com to a data: shell —
+                //     never receives __lumaCSS and renders unthemed until the
+                //     theme is toggled (the toggle force-re-attaches).
                 if let Some(sid) = msg.get("sessionId").and_then(|s| s.as_str()) {
-                    let needed = SESSION_URLS.lock().unwrap().iter().any(|(s, _)| s == sid);
-                    log_to_temp(&format!(
-                        "[cef_hook] frameNav main: sid={} needed={}",
-                        sid, needed
-                    ));
-                    if needed {
-                        push_css_payload(socket, msg_id, theme_state, sid);
+                    if !sid.is_empty() {
+                        let carried = SESSION_URLS
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(s, _)| s == sid);
+                        let needed = carried || needs_css_payload(nav_url);
+                        log_to_temp(&format!(
+                            "[cef_hook] frameNav main: sid={} url={} carried={} needed={}",
+                            sid,
+                            nav_url.get(..nav_url.len().min(60)).unwrap_or(nav_url),
+                            carried,
+                            needed
+                        ));
+                        if needed {
+                            ensure_session_payload(socket, msg_id, theme_state, sid, nav_url);
+                        }
                     }
                 }
             }
@@ -3713,42 +3804,8 @@ fn dispatch_cdp_message(
             // interception works from that origin). SESSION_URLS doubles as
             // the set of sessions that carry the payload, so frameNavigated
             // and theme-reload know who needs a re-push.
-            if ttype == "page"
-                && !turl.contains("devtools://")
-                && !turl.contains("store.steampowered.com")
-            {
-                // Request-stage interception must also be enabled per session:
-                // the browser-level Fetch.enable above only pauses requests
-                // from store-origin documents — steamloopback docs (Shared, main
-                // window, popups) never pause, so their module scripts, fonts
-                // and images to lumaforge.local fell into DNS and failed. The
-                // response-stage "*" pattern stays browser-level only so this
-                // session's HTML responses are never rewritten (inject_theme_html
-                // must not touch the Steam shell).
-                let fetch_enable = json!({
-                    "id": *msg_id,
-                    "method": "Fetch.enable",
-                    "params": {
-                        "patterns": [
-                            {"urlPattern": format!("*{}*", VFS_HOST), "requestStage": "Request"},
-                            {"urlPattern": "*/luma-bridge/*", "requestStage": "Request"}
-                        ]
-                    },
-                    "sessionId": sid
-                });
-                *msg_id += 1;
-                send_cdp(socket, &fetch_enable);
-                // Remember that this session now owns request-stage
-                // interception: pauses it reports are session-scoped ids.
-                if let Ok(mut sf) = SESSION_FETCH.lock() {
-                    sf.retain(|s| s != &sid);
-                    sf.push(sid.to_string());
-                }
-                push_css_payload(socket, msg_id, theme_state, sid);
-                if let Ok(mut urls) = SESSION_URLS.lock() {
-                    urls.retain(|(s, _)| s != sid);
-                    urls.push((sid.to_string(), turl.to_string()));
-                }
+            if ttype == "page" && !turl.contains("devtools://") && needs_css_payload(&turl) {
+                ensure_session_payload(socket, msg_id, theme_state, sid, &turl);
             }
             register_session_theme(socket, msg_id, theme_state, sid);
             if let Ok(mut reg) = REGISTERED_TARGETS.lock() {
@@ -3801,12 +3858,6 @@ fn dispatch_cdp_message(
             {
                 return;
             }
-            {
-                let reg = REGISTERED_TARGETS.lock().unwrap();
-                if reg.iter().any(|t| t == tid) {
-                    return;
-                }
-            }
             let sid = {
                 let sessions = SESSIONS.lock().unwrap();
                 sessions
@@ -3814,7 +3865,19 @@ fn dispatch_cdp_message(
                     .find(|(t, _)| t == tid)
                     .map(|(_, s)| s.clone())
             };
-            if let Some(sid) = sid {
+            let Some(sid) = sid else { return };
+            let carried = SESSION_URLS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(s, _)| s == &sid);
+            if !carried && needs_css_payload(&turl) {
+                // The target was first seen while still on store.steampowered.com
+                // (so the attach-time push was skipped) and has since navigated to
+                // a document Fetch interception can NOT rewrite — a data: shell,
+                // about:blank, steamloopback. Same failure mode as the library
+                // window; make the session payload-carrying now.
+                ensure_session_payload(socket, msg_id, theme_state, &sid, turl);
                 let js = build_theme_js(theme_state);
                 let eval = json!({
                     "id": *msg_id,
@@ -3825,13 +3888,38 @@ fn dispatch_cdp_message(
                 *msg_id += 1;
                 send_cdp(socket, &eval);
                 if let Ok(mut reg) = REGISTERED_TARGETS.lock() {
-                    reg.push(tid.to_string());
+                    if !reg.iter().any(|t| t == tid) {
+                        reg.push(tid.to_string());
+                    }
                 }
                 log_to_temp(&format!(
-                    "[cef_hook] targetInfoChanged → evaluated theme in target {} ({})",
+                    "[cef_hook] targetInfoChanged → payload+theme for {} ({})",
                     tid, turl
                 ));
+                return;
             }
+            {
+                let reg = REGISTERED_TARGETS.lock().unwrap();
+                if reg.iter().any(|t| t == tid) {
+                    return;
+                }
+            }
+            let js = build_theme_js(theme_state);
+            let eval = json!({
+                "id": *msg_id,
+                "method": "Runtime.evaluate",
+                "params": {"expression": js, "awaitPromise": false},
+                "sessionId": &sid
+            });
+            *msg_id += 1;
+            send_cdp(socket, &eval);
+            if let Ok(mut reg) = REGISTERED_TARGETS.lock() {
+                reg.push(tid.to_string());
+            }
+            log_to_temp(&format!(
+                "[cef_hook] targetInfoChanged → evaluated theme in target {} ({})",
+                tid, turl
+            ));
         }
         "Target.detachedFromTarget" => {
             let sid = msg
@@ -3865,7 +3953,34 @@ fn dispatch_cdp_message(
                 if is_bad_scope {
                     retry_fetch_scope(socket, msg_id, msg, fetch_retry);
                 }
-                log_to_temp(&format!("[cef_hook] CDP command error: {}", err));
+                // This CEF build rejects several Page.*/Runtime.* methods with
+                // "-32601 wasn't found" on every session attach and navigation.
+                // Log each distinct method once per process — the repeated
+                // lines carry no new information and bury real errors. Every
+                // other error keeps being logged as before.
+                let msg_text = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("");
+                let is_dead_method = msg_text.contains("wasn't found")
+                    || msg_text.contains("was not found");
+                let first_sighting = if is_dead_method {
+                    let method = msg_text
+                        .trim_start_matches('\'')
+                        .split('\'')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    match DEAD_METHODS_LOGGED.lock() {
+                        Ok(mut seen) => seen.insert(method),
+                        Err(_) => true,
+                    }
+                } else {
+                    true
+                };
+                if first_sighting {
+                    log_to_temp(&format!("[cef_hook] CDP command error: {}", err));
+                }
             }
             if let Some(ed) = msg.pointer("/result/exceptionDetails") {
                 let s = ed.to_string();
