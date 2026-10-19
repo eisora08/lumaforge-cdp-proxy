@@ -3,8 +3,11 @@
  *
  * Masquerades as wsock32.dll (NOT on KnownDLLs) in the Steam directory.
  * Forwards all real wsock32 exports to ws2_32.dll / MSWSOCK.dll via .def file.
- * Spawns a thread to load lumaforge/lumaforge.dll after DllMain returns
- * (avoids loader lock deadlock from calling LoadLibraryW inside DllMain).
+ * Loads lumaforge/lumaforge.dll SYNCHRONOUSLY inside DllMain so our hooks
+ * install before steam.exe's entry point runs — anything Steam spawns after
+ * that goes through the CreateProcessW hook (pipes on the first generation
+ * instead of a late one). Millennium uses the same pattern; at process start
+ * only the loader thread exists, so loader-lock recursion is safe here.
  */
 
 typedef unsigned long DWORD;
@@ -12,7 +15,6 @@ typedef int BOOL;
 typedef void *HANDLE;
 typedef void *HMODULE;
 typedef unsigned short WCHAR;
-typedef DWORD (__stdcall *LPTHREAD_START_ROUTINE)(void*);
 
 #define MAX_PATH 260
 #define DLL_PROCESS_ATTACH 1
@@ -23,8 +25,6 @@ typedef DWORD (__stdcall *LPTHREAD_START_ROUTINE)(void*);
 
 __declspec(dllimport) DWORD __stdcall GetModuleFileNameW(HANDLE hModule, WCHAR *lpFilename, DWORD nSize);
 __declspec(dllimport) HMODULE __stdcall LoadLibraryW(const WCHAR *lpLibFileName);
-__declspec(dllimport) HANDLE __stdcall CreateThread(void*, DWORD, LPTHREAD_START_ROUTINE, void*, DWORD, DWORD*);
-__declspec(dllimport) void __stdcall Sleep(DWORD);
 __declspec(dllimport) DWORD __stdcall GetLastError(void);
 __declspec(dllimport) HANDLE __stdcall CreateFileW(const WCHAR*, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
 __declspec(dllimport) BOOL __stdcall WriteFile(HANDLE, const void*, DWORD, DWORD*, void*);
@@ -72,7 +72,6 @@ static int u32_to_dec(DWORD v, char *out) {
 
 static DWORD __stdcall loader(void *param) {
     const WCHAR *dll_path = (const WCHAR *)param;
-    Sleep(200);
     HMODULE h = LoadLibraryW(dll_path);
 
     WCHAR err_path[MAX_PATH];
@@ -119,7 +118,7 @@ BOOL __stdcall DllMain(HANDLE hinstDLL, DWORD fdwReason, void *lpvReserved) {
             while (rel[k]) { dll_path[j++] = rel[k++]; }
             dll_path[j] = L'\0';
 
-            CreateThread(0, 0, loader, dll_path, 0, 0);
+            loader(dll_path);   // synchronous: hooks must beat steam.exe's entry point
         }
     }
     return 1;
