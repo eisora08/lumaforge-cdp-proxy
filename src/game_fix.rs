@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -353,14 +353,52 @@ fn parse_fix_blocks(content: &str) -> Vec<FixBlock> {
     blocks
 }
 
-fn has_fix_in_log(game_path: &Path, app_id: u64, types: &[&str]) -> bool {
-    let log_path = fix_log_path(game_path, app_id);
-    if !log_path.exists() {
-        return false;
+// One log read → every flag the UI needs. `handle_status` used to read the
+// same file six times; the applied list now uses this for its single pass.
+#[derive(Debug, Clone, Default, Serialize)]
+struct AppliedFixFlags {
+    #[serde(rename = "smokeApi")]
+    smoke_api: bool,
+    steamless: bool,
+    goldberg: bool,
+    #[serde(rename = "onlineFix")]
+    online_fix: bool,
+    #[serde(rename = "RockstarFix")]
+    rockstar_fix: bool,
+    #[serde(rename = "Voices38Fix")]
+    voices38_fix: bool,
+}
+
+impl AppliedFixFlags {
+    fn any(&self) -> bool {
+        self.smoke_api
+            || self.steamless
+            || self.goldberg
+            || self.online_fix
+            || self.rockstar_fix
+            || self.voices38_fix
     }
-    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let blocks = parse_fix_blocks(&content);
-    blocks.iter().any(|b| types.iter().any(|t| b.fix_type == *t))
+}
+
+fn applied_flags_from_types(types: &[String]) -> AppliedFixFlags {
+    let has = |candidates: &[&str]| types.iter().any(|t| candidates.contains(&t.as_str()));
+    AppliedFixFlags {
+        smoke_api: has(&["SmokeAPI", "smoke_api"]),
+        steamless: has(&["Steamless"]),
+        goldberg: has(&["Goldberg"]),
+        online_fix: has(&["OnlineFix", "online_fix"]),
+        rockstar_fix: has(&["RockstarFix"]),
+        voices38_fix: has(&["Voices38Fix"]),
+    }
+}
+
+fn applied_flags_from_log(game_path: &Path, app_id: u64) -> Option<AppliedFixFlags> {
+    let content = std::fs::read_to_string(fix_log_path(game_path, app_id)).ok()?;
+    let types: Vec<String> = parse_fix_blocks(&content)
+        .into_iter()
+        .map(|b| b.fix_type)
+        .collect();
+    Some(applied_flags_from_types(&types))
 }
 
 fn rewrite_log_without(game_path: &Path, app_id: u64, remove_types: &[&str]) {
@@ -2573,14 +2611,10 @@ fn handle_status(app_id: u64) -> (u16, String) {
     let tools = tool_install_status();
     let resolved = resolve_game_path(app_id);
 
-    let applied = json!({
-        "smokeApi": resolved.as_ref().map(|(p, _)| has_fix_in_log(p, app_id, &["SmokeAPI", "smoke_api"])).unwrap_or(false),
-        "steamless": resolved.as_ref().map(|(p, _)| has_fix_in_log(p, app_id, &["Steamless"])).unwrap_or(false),
-        "goldberg": resolved.as_ref().map(|(p, _)| has_fix_in_log(p, app_id, &["Goldberg"])).unwrap_or(false),
-        "onlineFix": resolved.as_ref().map(|(p, _)| has_fix_in_log(p, app_id, &["OnlineFix", "online_fix"])).unwrap_or(false),
-        "RockstarFix": resolved.as_ref().map(|(p, _)| has_fix_in_log(p, app_id, &["RockstarFix"])).unwrap_or(false),
-        "Voices38Fix": resolved.as_ref().map(|(p, _)| has_fix_in_log(p, app_id, &["Voices38Fix"])).unwrap_or(false),
-    });
+    let applied = resolved
+        .as_ref()
+        .and_then(|(p, _)| applied_flags_from_log(p, app_id))
+        .unwrap_or_default();
 
     // Jobs for this app
     let mut app_jobs = json!({});
@@ -2612,40 +2646,70 @@ fn handle_status(app_id: u64) -> (u16, String) {
     )
 }
 
-fn handle_applied() -> (u16, String) {
-    let mut applied = Vec::new();
+/// One pass over the installed appmanifests. Reading the ACF directly avoids
+/// `resolve_game_path` (which re-reads libraryfolders.vdf per app) and the
+/// old recursive `.bak` fallback (which walked entire game folders and took
+/// ~3.5s on a 50-game library, blocking the CDP loop). Fix logs are
+/// authoritative here — the per-app `/status` route already ignores `.bak`.
+fn scan_applied_games() -> Vec<(u64, String, AppliedFixFlags)> {
+    let mut games = Vec::new();
+    let mut seen = HashSet::new();
     for lib in library_roots() {
         let steamapps = lib.join("steamapps");
-        if let Ok(entries) = std::fs::read_dir(&steamapps) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let Some(id_str) = name
-                    .strip_prefix("appmanifest_")
-                    .and_then(|s| s.strip_suffix(".acf"))
-                {
-                    if let Ok(app_id) = id_str.parse::<u64>() {
-                        if applied.contains(&app_id) {
-                            continue;
-                        }
-                        if let Some((path, _)) = resolve_game_path(app_id) {
-                            let log = fix_log_path(&path, app_id);
-                            if log.exists() {
-                                applied.push(app_id);
-                            } else {
-                                // legacy: any bak
-                                let mut baks = Vec::new();
-                                find_bak_files_recursive(&path, &mut baks);
-                                if !baks.is_empty() {
-                                    applied.push(app_id);
-                                }
-                            }
-                        }
-                    }
-                }
+        let Ok(entries) = std::fs::read_dir(&steamapps) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Some(id_str) = file_name
+                .strip_prefix("appmanifest_")
+                .and_then(|s| s.strip_suffix(".acf"))
+            else {
+                continue;
+            };
+            let Ok(app_id) = id_str.parse::<u64>() else {
+                continue;
+            };
+            if seen.contains(&app_id) {
+                continue;
             }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Some(install_dir) = parse_acf_field(&content, "installdir") else {
+                continue;
+            };
+            let game_path = steamapps.join("common").join(install_dir);
+            if !game_path.is_dir() {
+                continue;
+            }
+            let Some(applied) = applied_flags_from_log(&game_path, app_id) else {
+                continue;
+            };
+            if !applied.any() {
+                continue;
+            }
+            if !seen.insert(app_id) {
+                continue;
+            }
+            let name = parse_acf_field(&content, "name").unwrap_or_else(|| format!("App {app_id}"));
+            games.push((app_id, name, applied));
         }
     }
-    (200, json!({"ok": true, "appIds": applied}).to_string())
+    games
+}
+
+fn handle_applied() -> (u16, String) {
+    let games = scan_applied_games();
+    let app_ids: Vec<u64> = games.iter().map(|(id, _, _)| *id).collect();
+    let apps: Vec<serde_json::Value> = games
+        .into_iter()
+        .map(|(app_id, name, applied)| json!({"appId": app_id, "name": name, "applied": applied}))
+        .collect();
+    (
+        200,
+        json!({"ok": true, "appIds": app_ids, "apps": apps}).to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2921,4 +2985,73 @@ pub fn try_handle_route(method: &str, path: &str, body: &str) -> Option<(u16, St
                 .to_string(),
         ),
     })
+}
+
+#[cfg(test)]
+mod applied_tests {
+    use super::*;
+
+    fn types(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_map_every_supported_fix_type() {
+        let flags = applied_flags_from_types(&types(&[
+            "SmokeAPI",
+            "Steamless",
+            "Goldberg",
+            "OnlineFix",
+            "RockstarFix",
+            "Voices38Fix",
+        ]));
+        assert!(flags.any());
+        assert!(flags.smoke_api);
+        assert!(flags.steamless);
+        assert!(flags.goldberg);
+        assert!(flags.online_fix);
+        assert!(flags.rockstar_fix);
+        assert!(flags.voices38_fix);
+    }
+
+    #[test]
+    fn flags_accept_legacy_log_names() {
+        let flags = applied_flags_from_types(&types(&["smoke_api", "online_fix"]));
+        assert!(flags.smoke_api);
+        assert!(flags.online_fix);
+        assert!(!flags.steamless);
+    }
+
+    #[test]
+    fn unknown_types_are_not_reported_as_applied() {
+        let flags = applied_flags_from_types(&types(&["SomethingElse"]));
+        assert!(!flags.any());
+    }
+
+    #[test]
+    fn serialized_keys_match_the_sidebar_contract() {
+        let flags = applied_flags_from_types(&types(&[
+            "SmokeAPI",
+            "Steamless",
+            "Goldberg",
+            "OnlineFix",
+            "RockstarFix",
+            "Voices38Fix",
+        ]));
+        let value = serde_json::to_value(flags).unwrap();
+        for key in [
+            "smokeApi",
+            "steamless",
+            "goldberg",
+            "onlineFix",
+            "RockstarFix",
+            "Voices38Fix",
+        ] {
+            assert_eq!(
+                value.get(key),
+                Some(&serde_json::Value::Bool(true)),
+                "{key}"
+            );
+        }
+    }
 }
