@@ -14,13 +14,16 @@ Access-Control-Max-Age: 86400\r\n";
 
 pub fn start_bridge_server() {
     std::thread::spawn(|| {
-        // Try primary port first, fall back to 21776. Retry the primary a few
-        // times: on Windows a flood of short-lived connections leaves the port
-        // in TIME_WAIT after a Steam restart, which makes a single bind() fail
-        // even though no listener exists (the sockets expire within ~2min).
+        // Try primary port first, fall back to 21776. Retry the primary
+        // quickly: on Windows a flood of short-lived connections leaves the
+        // port in TIME_WAIT after a Steam restart, which makes a single bind()
+        // fail even though no listener exists. Waiting 2s between attempts
+        // left the extension without a bridge for the first seconds of every
+        // restart (and a failed first fetch sticks in the sidebar), so keep
+        // the total retry window short (~3s) instead.
         let mut listener = None;
         let mut primary_err = String::new();
-        for attempt in 0..5 {
+        for attempt in 0..12 {
             match TcpListener::bind(format!("127.0.0.1:{}", BRIDGE_PORT)) {
                 Ok(l) => {
                     crate::log_to_temp(&format!(
@@ -39,7 +42,7 @@ pub fn start_bridge_server() {
                         attempt + 1,
                         e
                     ));
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             }
         }

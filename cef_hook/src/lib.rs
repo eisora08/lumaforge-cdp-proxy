@@ -14,6 +14,20 @@ use tungstenite::{connect, Message};
 // plus targets that already got the theme script registered/evaluated.
 static SESSIONS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 static REGISTERED_TARGETS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+// Sessions this process created via Target.attachToTarget. attachedToTarget
+// events are browser-wide, so another client (the proxy pipe session, or a
+// second cef_hook process) also sees our attach and we see theirs. Only a
+// session in this list belongs to us and may be detached when a newer one
+// replaces it; detaching an unowned session killed the other client's session
+// and left both dead (mutual "duplicate session" detach, 2026-10-20).
+static OWNED_SESSIONS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+// Sids we detached on purpose during a replacement. Their late detached/attached
+// events must not be mistaken for a lost session.
+static SUPERSEDED_SESSIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+// Targets whose session was found dead; skip reattach until this instant so a
+// persistent failure cannot turn the 1s poll into an attach storm.
+static REATTACH_AFTER: std::sync::Mutex<Vec<(String, Instant)>> =
+    std::sync::Mutex::new(Vec::new());
 // (sessionId, target url) — used to re-push the CSS payload to steamloopback
 // sessions after a theme reload.
 static SESSION_URLS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
@@ -1577,7 +1591,9 @@ fn recv_cdp_response(
         .iter()
         .position(|m| m.get("id").and_then(|i| i.as_u64()) == Some(expected_id))
     {
-        return Some(pending.remove(pos));
+        let msg = pending.remove(pos);
+        handle_cdp_error(&msg);
+        return Some(msg);
     }
 
     let deadline = SystemTime::now() + Duration::from_secs(10);
@@ -1594,6 +1610,7 @@ fn recv_cdp_response(
                 if let Ok(msg) = serde_json::from_str::<Value>(&text) {
                     note_rx(&msg);
                     if msg.get("id").and_then(|i| i.as_u64()) == Some(expected_id) {
+                        handle_cdp_error(&msg);
                         return Some(msg);
                     }
                     // Not the response we are waiting for — keep it for the
@@ -3025,6 +3042,9 @@ fn inject_into_existing_targets(
         if target_url.contains("lumaforge.local") {
             continue;
         }
+        if !reattach_ready(target_id) {
+            continue;
+        }
 
         // Reuse the session we already hold for this target instead of
         // attaching a second one. Nothing ever sends Target.detachFromTarget,
@@ -3086,10 +3106,7 @@ fn inject_into_existing_targets(
                 // pass in between (startup runs this twice within ~270ms)
                 // would otherwise attach again. The event handler replaces
                 // this entry with the same id, so it stays idempotent.
-                if let Ok(mut sessions) = SESSIONS.lock() {
-                    sessions.retain(|(t, _)| t.as_str() != target_id);
-                    sessions.push((target_id.to_string(), sid.clone()));
-                }
+                record_owned_session(target_id, &sid);
                 sid
             }
         };
@@ -3778,6 +3795,170 @@ fn extract_tag_class(html: &str, tag: &str) -> String {
 
 // ─── CDP main loop ──────────────────────────────────────────────────────────
 
+#[derive(Debug, PartialEq, Eq)]
+enum AttachAction {
+    Process,
+    Replace(String),
+    Ignore,
+}
+
+/// Decide what to do with an attachedToTarget event. `existing` is the sid we
+/// currently hold for the target (if any). Only sessions this process created
+/// may be replaced/detached; an unowned session belongs to another CDP client
+/// and must be left alone.
+fn attach_action(
+    existing: Option<&str>,
+    incoming: &str,
+    incoming_owned: bool,
+    existing_owned: bool,
+) -> AttachAction {
+    match existing {
+        Some(old) if old == incoming => AttachAction::Process,
+        Some(old) if incoming_owned => {
+            if existing_owned {
+                AttachAction::Replace(old.to_string())
+            } else {
+                AttachAction::Process
+            }
+        }
+        Some(_) => AttachAction::Ignore,
+        None if incoming_owned => AttachAction::Process,
+        None => AttachAction::Ignore,
+    }
+}
+
+fn session_for_target(target_id: &str) -> Option<String> {
+    let sessions = SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
+    sessions
+        .iter()
+        .find(|(t, _)| t == target_id)
+        .map(|(_, s)| s.clone())
+}
+
+fn is_owned_session(target_id: &str, sid: &str) -> bool {
+    let owned = OWNED_SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
+    owned.iter().any(|(t, s)| t == target_id && s == sid)
+}
+
+fn record_owned_session(target_id: &str, sid: &str) {
+    if let Ok(mut owned) = OWNED_SESSIONS.lock() {
+        owned.retain(|(t, _)| t != target_id);
+        owned.push((target_id.to_string(), sid.to_string()));
+    }
+    if let Ok(mut sessions) = SESSIONS.lock() {
+        sessions.retain(|(t, _)| t != target_id);
+        sessions.push((target_id.to_string(), sid.to_string()));
+    }
+    clear_reattach_cooldown(target_id);
+}
+
+fn mark_superseded(sid: &str) {
+    if let Ok(mut superseded) = SUPERSEDED_SESSIONS.lock() {
+        if !superseded.iter().any(|s| s == sid) {
+            superseded.push(sid.to_string());
+        }
+    }
+}
+
+fn take_superseded(sid: &str) -> bool {
+    let mut superseded = SUPERSEDED_SESSIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let was = superseded.iter().any(|s| s == sid);
+    superseded.retain(|s| s != sid);
+    was
+}
+
+fn clear_reattach_cooldown(target_id: &str) {
+    if let Ok(mut pending) = REATTACH_AFTER.lock() {
+        pending.retain(|(t, _)| t != target_id);
+    }
+}
+
+fn defer_reattach(target_id: &str) {
+    if let Ok(mut pending) = REATTACH_AFTER.lock() {
+        let until = Instant::now() + Duration::from_secs(2);
+        pending.retain(|(t, _)| t != target_id);
+        pending.push((target_id.to_string(), until));
+    }
+}
+
+fn reattach_ready(target_id: &str) -> bool {
+    let now = Instant::now();
+    let mut pending = REATTACH_AFTER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    pending.retain(|(_, until)| *until > now);
+    !pending.iter().any(|(t, _)| t == target_id)
+}
+
+fn forget_session_state(sid: &str) {
+    if let Ok(mut fetch) = SESSION_FETCH.lock() {
+        fetch.retain(|s| s != sid);
+    }
+    if let Ok(mut shim) = SHIM_SESSIONS.lock() {
+        shim.retain(|s| s != sid);
+    }
+    if let Ok(mut urls) = SESSION_URLS.lock() {
+        urls.retain(|(s, _)| s != sid);
+    }
+    if let Ok(mut seen) = BRIDGE_CALL_SEEN.lock() {
+        let prefix = format!("{}|", sid);
+        seen.retain(|(k, _)| !k.starts_with(&prefix));
+    }
+}
+
+/// A command sent to a session came back with "Session with given id not
+/// found". Drop the dead sid and unregister its target so poll_new_targets
+/// attaches again instead of re-injecting into the void every 30s.
+fn handle_cdp_error(msg: &Value) {
+    let Some(err) = msg.get("error") else { return };
+    let text = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    if !(text.contains("Session with given id not found")
+        || text.contains("Session with given id"))
+    {
+        return;
+    }
+    let sid = msg
+        .get("sessionId")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    if sid.is_empty() {
+        log_to_temp("[cef_hook] session-gone error without sessionId");
+        return;
+    }
+
+    let mut target = None;
+    if let Ok(mut sessions) = SESSIONS.lock() {
+        if let Some(pos) = sessions.iter().position(|(_, s)| s == sid) {
+            target = Some(sessions.remove(pos).0);
+        }
+    }
+    if let Ok(mut owned) = OWNED_SESSIONS.lock() {
+        if let Some(pos) = owned.iter().position(|(_, s)| s == sid) {
+            if target.is_none() {
+                target = Some(owned[pos].0.clone());
+            }
+            owned.remove(pos);
+        }
+    }
+    forget_session_state(sid);
+
+    if let Some(tid) = target {
+        if let Ok(mut reg) = REGISTERED_TARGETS.lock() {
+            reg.retain(|t| t != &tid);
+        }
+        defer_reattach(&tid);
+        log_to_temp(&format!(
+            "[cef_hook] stale session {} for target {}, scheduling reattach",
+            sid, tid
+        ));
+    }
+}
+
 /// Dispatch one received CDP message. Events are handled here; plain responses
 /// to our fire-and-forget commands are dropped. Messages that arrived while a
 /// recv_cdp_response wait was in progress were already queued into `pending`
@@ -3963,38 +4144,11 @@ fn dispatch_cdp_message(
             if sid.is_empty() || tid.is_empty() || turl.contains("lumaforge.local") {
                 return;
             }
-            // One target must never carry TWO live sessions: every event of
-            // the target is then delivered once per session (duplicated console,
-            // bindingCalled with different sids, paired frameNav installs).
-            // Keep the incoming session and detach the old one;
-            // Target.detachedFromTarget then cleans SESSION_FETCH/SHIM_SESSIONS.
-            let zombie = {
-                let sessions = SESSIONS.lock().unwrap();
-                sessions
-                    .iter()
-                    .find(|(t, s)| t.as_str() == tid && s.as_str() != sid)
-                    .map(|(_, s)| s.clone())
-            };
-            if let Some(old_sid) = zombie {
-                log_to_temp(&format!(
-                    "[cef_hook] duplicate session for target {}, detaching old sid={}",
-                    tid, old_sid
-                ));
-                let detach = json!({
-                    "id": *msg_id,
-                    "method": "Target.detachFromTarget",
-                    "params": {"sessionId": old_sid}
-                });
-                *msg_id += 1;
-                send_cdp(socket, &detach);
-            }
-            if let Ok(mut sessions) = SESSIONS.lock() {
-                sessions.retain(|(t, _)| *t != tid);
-                sessions.push((tid.clone(), sid.to_string()));
-            }
-            // Always release the target — CEF can hold a freshly created popup
+            // Always release the target - CEF can hold a freshly created popup
             // before its renderer starts (login window then never loads and the
-            // native window stays hidden forever).
+            // native window stays hidden forever). Done even for sessions owned
+            // by another client: the command is harmless and the popup must not
+            // stay paused.
             let resume = json!({
                 "id": *msg_id,
                 "method": "Runtime.runIfWaitingForDebugger",
@@ -4003,6 +4157,60 @@ fn dispatch_cdp_message(
             });
             *msg_id += 1;
             send_cdp(socket, &resume);
+
+            if take_superseded(sid) {
+                log_to_temp(&format!(
+                    "[cef_hook] ignoring superseded attachedToTarget sid={} for target {}",
+                    sid, tid
+                ));
+                return;
+            }
+
+            // attachedToTarget is browser-wide: the proxy pipe client and other
+            // cef_hook processes also attach to the same target. Never detach a
+            // sid we did not create - that killed the other client's session
+            // and produced the mutual-detach deadlock. Only our own duplicate
+            // (or a deliberate replacement) may be detached.
+            let existing = session_for_target(&tid);
+            let incoming_owned = is_owned_session(&tid, sid);
+            let existing_owned = existing
+                .as_deref()
+                .map(|s| is_owned_session(&tid, s))
+                .unwrap_or(false);
+            match attach_action(
+                existing.as_deref(),
+                sid,
+                incoming_owned,
+                existing_owned,
+            ) {
+                AttachAction::Ignore => {
+                    log_to_temp(&format!(
+                        "[cef_hook] ignoring attachedToTarget for target {} (sid={}, unowned)",
+                        tid, sid
+                    ));
+                    return;
+                }
+                AttachAction::Replace(old_sid) => {
+                    mark_superseded(&old_sid);
+                    if let Ok(mut owned) = OWNED_SESSIONS.lock() {
+                        owned.retain(|(t, s)| t != &tid || s != &old_sid);
+                    }
+                    forget_session_state(&old_sid);
+                    log_to_temp(&format!(
+                        "[cef_hook] replacing own session for target {}, detaching old sid={}",
+                        tid, old_sid
+                    ));
+                    let detach = json!({
+                        "id": *msg_id,
+                        "method": "Target.detachFromTarget",
+                        "params": {"sessionId": old_sid}
+                    });
+                    *msg_id += 1;
+                    send_cdp(socket, &detach);
+                }
+                AttachAction::Process => {}
+            }
+            record_owned_session(&tid, sid);
 
             // Popup targets attach as type=other with an empty URL before their
             // document exists; register the script right away (browser-side, no
@@ -4137,21 +4345,50 @@ fn dispatch_cdp_message(
                 .and_then(|p| p.get("sessionId"))
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
-            if !sid.is_empty() {
-                if let Ok(mut sessions) = SESSIONS.lock() {
-                    sessions.retain(|(_, s)| s != sid);
+            if sid.is_empty() {
+                return;
+            }
+            // A sid we detached on purpose is expected; do not unregister the
+            // target (the replacement session is already live in SESSIONS).
+            let superseded = take_superseded(sid);
+            let mut target = None;
+            if let Ok(mut sessions) = SESSIONS.lock() {
+                if let Some(pos) = sessions.iter().position(|(_, s)| s == sid) {
+                    target = Some(sessions.remove(pos).0);
                 }
-                if let Ok(mut sf) = SESSION_FETCH.lock() {
-                    sf.retain(|s| s != sid);
+            }
+            {
+                let mut owned = OWNED_SESSIONS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if let Some(pos) = owned.iter().position(|(_, s)| s == sid) {
+                    if target.is_none() {
+                        target = Some(owned[pos].0.clone());
+                    }
+                    owned.remove(pos);
                 }
-                if let Ok(mut ss) = SHIM_SESSIONS.lock() {
-                    ss.retain(|s| s != sid);
+            }
+            forget_session_state(sid);
+            if superseded {
+                return;
+            }
+            if let Some(tid) = target {
+                // Our live session was detached by someone else (or the target
+                // died): allow poll_new_targets to attach again.
+                if let Ok(mut reg) = REGISTERED_TARGETS.lock() {
+                    reg.retain(|t| t != &tid);
                 }
+                defer_reattach(&tid);
+                log_to_temp(&format!(
+                    "[cef_hook] session {} detached, scheduling reattach for target {}",
+                    sid, tid
+                ));
             }
         }
         "" => {
             // Response to a fire-and-forget command: surface errors/exceptions
             // (evaluating our script in a target must never fail silently).
+            handle_cdp_error(msg);
             if let Some(err) = msg.get("error") {
                 // Chromium's message is "Invalid InterceptionId." (with a
                 // space); older wording had none — accept both so a paused
@@ -4285,16 +4522,13 @@ fn poll_new_targets(
             continue;
         }
         {
-            let reg = REGISTERED_TARGETS.lock().unwrap();
-            if reg.iter().any(|t| t == tid) {
-                continue;
-            }
-        }
-        {
             let sessions = SESSIONS.lock().unwrap();
             if sessions.iter().any(|(t, _)| t == tid) {
                 continue;
             }
+        }
+        if !reattach_ready(tid) {
+            continue;
         }
         let attach = json!({
             "id": *msg_id,
@@ -4336,10 +4570,7 @@ fn poll_new_targets(
         // Same pre-record as inject_into_existing_targets: the attachedToTarget
         // event is dispatched by the main loop later and replaces this entry
         // with the same sid, so it stays idempotent.
-        if let Ok(mut sessions) = SESSIONS.lock() {
-            sessions.retain(|(t, _)| t.as_str() != tid);
-            sessions.push((tid.to_string(), sid));
-        }
+        record_owned_session(tid, &sid);
     }
 }
 
@@ -4954,6 +5185,64 @@ mod import_expand_tests {
             out
         );
         assert!(!out.contains("lumaforge.local"), "{}", out);
+    }
+}
+
+#[cfg(test)]
+mod attach_session_tests {
+    use super::{attach_action, AttachAction};
+
+    #[test]
+    fn same_session_is_idempotent() {
+        assert_eq!(
+            attach_action(Some("s1"), "s1", true, true),
+            AttachAction::Process
+        );
+    }
+
+    #[test]
+    fn own_duplicate_replaces_old_session() {
+        assert_eq!(
+            attach_action(Some("old"), "new", true, true),
+            AttachAction::Replace("old".to_string())
+        );
+    }
+
+    #[test]
+    fn own_session_wins_over_other_client_without_detach() {
+        assert_eq!(
+            attach_action(Some("proxy"), "mine", true, false),
+            AttachAction::Process
+        );
+    }
+
+    #[test]
+    fn other_client_session_is_ignored() {
+        assert_eq!(
+            attach_action(Some("mine"), "proxy", false, true),
+            AttachAction::Ignore
+        );
+    }
+
+    #[test]
+    fn two_other_client_sessions_are_ignored() {
+        assert_eq!(
+            attach_action(Some("proxy-a"), "proxy-b", false, false),
+            AttachAction::Ignore
+        );
+    }
+
+    #[test]
+    fn first_own_attach_is_processed() {
+        assert_eq!(attach_action(None, "mine", true, false), AttachAction::Process);
+    }
+
+    #[test]
+    fn first_foreign_attach_is_ignored() {
+        assert_eq!(
+            attach_action(None, "proxy", false, false),
+            AttachAction::Ignore
+        );
     }
 }
 
