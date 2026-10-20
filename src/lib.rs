@@ -1,4 +1,5 @@
 mod bridge;
+mod build_lua;
 mod catalog;
 mod cdp;
 mod cloudsave;

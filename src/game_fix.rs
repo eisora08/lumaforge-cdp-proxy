@@ -2185,7 +2185,7 @@ fn catalog_cache() -> &'static Mutex<CatalogCache> {
     })
 }
 
-fn fetch_catalog() -> Result<String, String> {
+pub(crate) fn fetch_catalog() -> Result<String, String> {
     {
         let cache = catalog_cache().lock().map_err(|e| e.to_string())?;
         let age = cache.cached_at.elapsed().unwrap_or_default();
@@ -2614,8 +2614,8 @@ fn handle_status(app_id: u64) -> (u16, String) {
 
 fn handle_applied() -> (u16, String) {
     let mut applied = Vec::new();
-    if let Some(steam_root) = crate::depot_downloader::steam_root() {
-        let steamapps = steam_root.join("steamapps");
+    for lib in library_roots() {
+        let steamapps = lib.join("steamapps");
         if let Ok(entries) = std::fs::read_dir(&steamapps) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -2624,6 +2624,9 @@ fn handle_applied() -> (u16, String) {
                     .and_then(|s| s.strip_suffix(".acf"))
                 {
                     if let Ok(app_id) = id_str.parse::<u64>() {
+                        if applied.contains(&app_id) {
+                            continue;
+                        }
                         if let Some((path, _)) = resolve_game_path(app_id) {
                             let log = fix_log_path(&path, app_id);
                             if log.exists() {

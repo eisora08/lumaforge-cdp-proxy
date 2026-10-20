@@ -285,6 +285,12 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return rust_resp;
     }
 
+    // Build-Locked Lua provider — intercept POST /api/download for
+    // sourceId==build-lua before package_installer (raw .lua is not a ZIP)
+    if let Some(rust_resp) = crate::build_lua::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
     // Rust-native routes: intercept binary-heavy operations before Lua
     if let Some(rust_resp) = crate::package_installer::try_handle_route(method, &clean_path, body) {
         return rust_resp;
