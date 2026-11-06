@@ -319,6 +319,11 @@ fn route_request(method: &str, path: &str, body: &str) -> (u16, String) {
         return rust_resp;
     }
 
+    // Real local Steam stats for the profile Games surface (Lua games)
+    if let Some(rust_resp) = crate::profile_games::try_handle_route(method, &clean_path, body) {
+        return rust_resp;
+    }
+
     // Unified catalog + artwork (librarycache, installed, cloudsave, lua)
     if let Some(rust_resp) = crate::catalog::try_handle_route(method, &clean_path, body) {
         return rust_resp;
@@ -783,6 +788,56 @@ fn handle_slssteam_route(method: &str, path: &str, body: &str) -> Option<(u16, S
 // Lua file management routes (cross-platform)
 // ---------------------------------------------------------------------------
 
+/// Display name for a Lua game from the generator comment near the top of the
+/// file (`-- <name>`). Shared by `/api/lua-files` and `/api/profile-games` so
+/// both surfaces show the same title.
+pub(crate) fn lua_display_name(content: &str) -> String {
+    for line in content.lines().take(3) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("--") && trimmed.len() > 3 {
+            let candidate = trimmed[2..].trim();
+            if !candidate.is_empty()
+                && !candidate.contains("Lua")
+                && !candidate.contains("LumaForge")
+                && !candidate.contains("Manifest")
+                && !candidate.contains("Created")
+                && !candidate.contains("Website")
+                && !candidate.contains("Total")
+                && !candidate.contains("MAIN APPLICATION")
+            {
+                return candidate.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Every `config/lua/*.lua` (backups excluded) as `(app_id, display_name)`.
+pub(crate) fn lua_game_entries() -> Vec<(String, String)> {
+    let Some(lua_dir) = crate::depot_downloader::steam_root().map(|r| r.join("config").join("lua"))
+    else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(lua_dir) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in rd.flatten() {
+        let name_str = entry.file_name().to_string_lossy().into_owned();
+        if !name_str.ends_with(".lua") || name_str.contains(".backup") {
+            continue;
+        }
+        let app_id = name_str.trim_end_matches(".lua").to_string();
+        let display = std::fs::read_to_string(entry.path())
+            .map(|c| lua_display_name(&c))
+            .unwrap_or_default();
+        out.push((app_id, display));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16, String)> {
     if path == "/api/lua-files" && method == "GET" {
         let steam_root = crate::depot_downloader::steam_root();
@@ -807,24 +862,7 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
                 // Extract game name from comment on line 2
                 let mut game_name = String::new();
                 if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    for line in content.lines().take(3) {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("--") && trimmed.len() > 3 {
-                            let candidate = trimmed[2..].trim();
-                            if !candidate.is_empty()
-                                && !candidate.contains("Lua")
-                                && !candidate.contains("LumaForge")
-                                && !candidate.contains("Manifest")
-                                && !candidate.contains("Created")
-                                && !candidate.contains("Website")
-                                && !candidate.contains("Total")
-                                && !candidate.contains("MAIN APPLICATION")
-                            {
-                                game_name = candidate.to_string();
-                                break;
-                            }
-                        }
-                    }
+                    game_name = lua_display_name(&content);
                 }
 
                 let meta = std::fs::metadata(entry.path()).ok();

@@ -199,6 +199,15 @@ fn detect_accounts() -> Result<Vec<Value>, String> {
     Ok(users)
 }
 
+/// Most recently signed-in account from `<steam>/config/loginusers.vdf`
+/// (newest timestamp first). Used to pick whose `localconfig.vdf` holds the
+/// real playtime/last-played data.
+pub fn most_recent_steam_id64() -> Option<String> {
+    let users = detect_accounts().ok()?;
+    let first = users.into_iter().next()?;
+    first.get("steamId64").and_then(opt_str)
+}
+
 pub fn try_handle_route(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
     if path == "/api/steam-account" {
         if method == "GET" {

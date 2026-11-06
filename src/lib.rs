@@ -12,6 +12,7 @@ mod lua_backend;
 mod manifest_parser;
 pub mod platform;
 mod plugin;
+mod profile_games;
 #[cfg(target_os = "linux")]
 mod slssteam;
 mod steam_account;
