@@ -86,6 +86,9 @@ fn build_body() -> String {
         .as_deref()
         .map(|d| steam_perfect_app_ids(d, &steam_app_ids))
         .unwrap_or_default();
+    // Real "past 2 weeks" total: the sum of `Playtime2wks` over every app in
+    // localconfig.vdf (Steam's Recent Activity header counts the same field).
+    let playtime2wks_total: u64 = steam_ids.iter().map(|(_, p2w, _)| *p2w).sum();
 
     json!({
         "ok": true,
@@ -97,6 +100,7 @@ fn build_body() -> String {
         "steamRecentAppIds": steam_recent_app_ids,
         "steamPerfectAppIds": steam_perfect_app_ids,
         "steamLastPlayed": steam_last_played,
+        "playtime2wksTotal": playtime2wks_total,
     })
     .to_string()
 }
