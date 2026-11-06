@@ -602,6 +602,11 @@ fn build_achievements_body(app_id: &str) -> String {
     json!({
         "ok": true,
         "appId": app_id,
+        // Only the games LumaForge installed through `config/lua/*.lua` are ours:
+        // every other app id is a real Steam game whose achievements page Steam
+        // already renders natively (and correctly) — the extension must leave
+        // those pages untouched.
+        "isLua": is_lua_game(app_id),
         "achieved": achieved_count,
         "total": total_count,
         "playtime": play.as_ref().map_or(0, |p| p.0),
@@ -807,6 +812,19 @@ fn build_games(localconfig: Option<&str>, user_dir: Option<&Path>) -> Vec<Value>
         })
     });
     games
+}
+
+/// True when the app id belongs to a LumaForge Lua game, i.e. there is a
+/// `<steam>/config/lua/<app_id>.lua` file. Those are the only games the
+/// profile surface may touch: every other app id is a real Steam game, and
+/// Steam already renders its achievements page natively.
+fn is_lua_game(app_id: &str) -> bool {
+    is_lua_app(&crate::bridge::lua_game_entries(), app_id)
+}
+
+/// Membership test over the lua entries, separated for testing.
+fn is_lua_app(entries: &[(String, String)], app_id: &str) -> bool {
+    entries.iter().any(|(id, _)| id == app_id)
 }
 
 /// Whose stats to read: the account Steam signed in last, else the userdata
@@ -1066,6 +1084,20 @@ mod tests {
         assert!(parse_achievement_times(b"not a vdf").is_empty());
         assert!(parse_achievement_times(&[]).is_empty());
         assert!(parse_achievement_times(&[0x00, b'x', 0x00, 0xEE]).is_empty());
+    }
+
+    #[test]
+    fn is_lua_app_only_matches_config_lua_entries() {
+        let entries = vec![
+            ("268910".to_string(), "Cuphead".to_string()),
+            ("1350650".to_string(), "FreshWomen".to_string()),
+        ];
+        assert!(is_lua_app(&entries, "268910"));
+        assert!(is_lua_app(&entries, "1350650"));
+        // A real Steam game the user owns: not in config/lua, so its
+        // achievements page must be left untouched.
+        assert!(!is_lua_app(&entries, "271590"));
+        assert!(!is_lua_app(&entries, ""));
     }
 
     // Runs against the real Steam install when one is present (locally) and
