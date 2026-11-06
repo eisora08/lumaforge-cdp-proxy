@@ -1420,10 +1420,15 @@ fn inject_theme_html(
     // 8. Plugins
     if !css_only {
         for plugin in plugins {
-            let matches = plugin
-                .target_url
-                .as_ref()
-                .map_or(true, |pattern| url.contains(pattern.as_str()));
+            // activation.targetUrl may be a comma list of host fragments
+            // ("store.steampowered.com,steamcommunity.com") — deliver when
+            // any entry matches the page URL.
+            let matches = plugin.target_url.as_ref().map_or(true, |pattern| {
+                pattern
+                    .split(',')
+                    .map(str::trim)
+                    .any(|p| !p.is_empty() && url.contains(p))
+            });
             if matches {
                 body_inject.push_str(&format!(
                     "<script data-lumaforge-plugin=\"{}\">\n{}\n</script>\n",

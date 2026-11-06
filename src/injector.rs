@@ -983,7 +983,8 @@ pub fn inject_into_target(
 
     // â”€â”€â”€ Plugins â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for plugin in plugins {
-        // activation.targetUrl gates the plugin on store pages;
+        // activation.targetUrl gates the plugin on store pages (it may be a
+        // comma list of host fragments — match if any entry hits);
         // activation.runtimeTargetUrl (e.g. steamloopback.host) is an
         // additional allowed pattern. Client-UI popup documents (Library,
         // friends, settings) are opened with about:blank?createflags=N, an
@@ -993,7 +994,10 @@ pub fn inject_into_target(
         // On Windows this third clause is unreachable: every CDP target there
         // is a real Steam store/community page.
         let t_ok = match plugin.target_url.as_deref() {
-            Some(p) if !p.is_empty() => target.url.contains(p),
+            Some(p) if !p.is_empty() => p
+                .split(',')
+                .map(str::trim)
+                .any(|pat| !pat.is_empty() && target.url.contains(pat)),
             _ => true,
         };
         let r_ok = match plugin.runtime_target_url.as_deref() {
