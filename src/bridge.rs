@@ -791,7 +791,17 @@ fn handle_slssteam_route(method: &str, path: &str, body: &str) -> Option<(u16, S
 /// Display name for a Lua game from the generator comment near the top of the
 /// file (`-- <name>`). Shared by `/api/lua-files` and `/api/profile-games` so
 /// both surfaces show the same title.
-pub(crate) fn lua_display_name(content: &str) -> String {
+///
+/// Two comment styles are read:
+///   * a standalone `-- <name>` line (Hubcap manifests put the title there);
+///   * the trailing comment of the game's own `addappid(<id>...)` line, which
+///     is how LumaForge's own generator writes the title (`addappid(1971870) --
+///     Mortal Kombat 1`). Only the line of that app id counts: a DLC line's
+///     comment would name the wrong game.
+///
+/// Files that carry no title at all (plain `addappid(678950)`) keep an empty
+/// name: the surfaces fall back to the app id instead of inventing one.
+pub(crate) fn lua_display_name(content: &str, app_id: &str) -> String {
     for line in content.lines().take(3) {
         let trimmed = line.trim();
         if trimmed.starts_with("--") && trimmed.len() > 3 {
@@ -807,6 +817,29 @@ pub(crate) fn lua_display_name(content: &str) -> String {
             {
                 return candidate.to_string();
             }
+        }
+    }
+    // Fallback: the title written as a trailing comment on the game's own
+    // `addappid` line (`addappid(105600, 1, "hash") -- Terraria`). Only that
+    // line counts: a DLC line's comment would name the wrong game.
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("addappid(") {
+            continue;
+        }
+        let Some(hash_idx) = trimmed.find("--") else { continue };
+        let candidate = trimmed[hash_idx + 2..].trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        // `addappid(<id>, ...)` — the game's own line is the reliable one.
+        let id = trimmed
+            .trim_start_matches("addappid(")
+            .split(|c: char| !(c.is_ascii_digit()))
+            .next()
+            .unwrap_or("");
+        if !app_id.is_empty() && id == app_id {
+            return candidate.to_string();
         }
     }
     String::new()
@@ -830,7 +863,7 @@ pub(crate) fn lua_game_entries() -> Vec<(String, String)> {
         }
         let app_id = name_str.trim_end_matches(".lua").to_string();
         let display = std::fs::read_to_string(entry.path())
-            .map(|c| lua_display_name(&c))
+            .map(|c| lua_display_name(&c, &app_id))
             .unwrap_or_default();
         out.push((app_id, display));
     }
@@ -862,7 +895,7 @@ fn handle_lua_files_route(method: &str, path: &str, _body: &str) -> Option<(u16,
                 // Extract game name from comment on line 2
                 let mut game_name = String::new();
                 if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    game_name = lua_display_name(&content);
+                    game_name = lua_display_name(&content, &app_id);
                 }
 
                 let meta = std::fs::metadata(entry.path()).ok();
@@ -984,4 +1017,43 @@ fn send_response(
 
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+#[cfg(test)]
+mod lua_display_name_tests {
+    use super::lua_display_name;
+
+    #[test]
+    fn reads_the_standalone_title_comment() {
+        let content = "-- 1008020's Lua and Manifest Created by Hubcap Manifest\n\
+                       -- Lust Epidemic\n\
+                       -- Created: September 18, 2026 at 17:42:03 EDT\n";
+        assert_eq!(lua_display_name(content, "1008020"), "Lust Epidemic");
+    }
+
+    #[test]
+    fn reads_the_addappid_trailing_comment() {
+        let content = "-- lua by LumaForge\n\
+                       \n\
+                       -- MAIN APPLICATION\n\
+                       addappid(1971870) -- Mortal Kombat 1\n";
+        assert_eq!(lua_display_name(content, "1971870"), "Mortal Kombat 1");
+    }
+
+    #[test]
+    fn ignores_the_comment_of_a_dlc_line() {
+        let content = "addappid(1145350)\n\
+                       addappid(1145352,0,\"hash\") -- Some DLC\n";
+        assert_eq!(lua_display_name(content, "1145350"), "");
+        let own = "addappid(1145350) -- The Game\n\
+                   addappid(1145352,0,\"hash\") -- Some DLC\n";
+        assert_eq!(lua_display_name(own, "1145350"), "The Game");
+    }
+
+    #[test]
+    fn keeps_an_empty_name_when_the_manifest_has_none() {
+        let content = "addappid(678950)\n\
+                       addappid(678951, 1, \"hash\")\n";
+        assert_eq!(lua_display_name(content, "678950"), "");
+    }
 }
