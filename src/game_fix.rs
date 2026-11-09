@@ -554,22 +554,56 @@ fn clean_empty_dirs_recursive(root: &Path) {
     }
 }
 
+/// The Steam client API DLLs. Catalog fixes (Voices38, Rockstar) sometimes
+/// carry their own copy; replacing the game's one makes Steam stop reporting
+/// achievements for it.
+fn is_steam_api_dll(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "steam_api64.dll" || lower == "steam_api.dll"
+}
+
 fn copy_dir_with_backup(
     src: &Path,
     dest_base: &Path,
     dest: &Path,
     installed: &mut Vec<String>,
+    keep_original_steam_api: bool,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(src).map_err(|e| format!("read dir: {e}"))? {
         let entry = entry.map_err(|e| format!("read entry: {e}"))?;
         let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
+        let file_name = entry.file_name();
+        let dest_path = dest.join(&file_name);
         if src_path.is_dir() {
             std::fs::create_dir_all(&dest_path).map_err(|e| format!("mkdir: {e}"))?;
-            copy_dir_with_backup(&src_path, dest_base, &dest_path, installed)?;
+            copy_dir_with_backup(
+                &src_path,
+                dest_base,
+                &dest_path,
+                installed,
+                keep_original_steam_api,
+            )?;
         } else {
             if let Some(parent) = dest_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
+            }
+            if keep_original_steam_api
+                && is_steam_api_dll(&file_name.to_string_lossy())
+                && dest_path.exists()
+            {
+                // Keep the game's own DLL (achievements keep working) and
+                // stash the fix's copy next to it under a name the Windows
+                // loader never picks up. It is logged so Unfix removes it.
+                let alt = dest_path.with_file_name(format!("{}.v38", file_name.to_string_lossy()));
+                let _ = std::fs::remove_file(&alt);
+                std::fs::copy(&src_path, &alt).map_err(|e| format!("copy: {e}"))?;
+                let relative = alt
+                    .strip_prefix(dest_base)
+                    .unwrap_or(&alt)
+                    .to_string_lossy()
+                    .to_string();
+                installed.push(relative);
+                continue;
             }
             backup_file_if_exists(&dest_path);
             std::fs::copy(&src_path, &dest_path).map_err(|e| format!("copy: {e}"))?;
@@ -1543,6 +1577,7 @@ fn apply_goldberg(game_path: &Path, app_id: u64) -> Result<Vec<String>, String> 
                 &game_steam_settings,
                 &game_steam_settings,
                 &mut tmp_installed,
+                false,
             )
             .is_ok()
             {
@@ -2139,7 +2174,7 @@ fn download_and_extract_rar(
     let mut installed = Vec::new();
     let effective_src = flatten_extracted_dir(&extract_dir).unwrap_or(extract_dir);
     let dest = online_fix_dest(game_path, &effective_src);
-    let result = copy_dir_with_backup(&effective_src, &dest, &dest, &mut installed);
+    let result = copy_dir_with_backup(&effective_src, &dest, &dest, &mut installed, false);
     let _ = std::fs::remove_dir_all(&temp_dir);
     result?;
     Ok(installed)
@@ -2414,7 +2449,10 @@ fn download_and_extract_catalog_archive(
 
     let mut installed = Vec::new();
     let effective_src = flatten_extracted_dir(&extract_dir).unwrap_or(extract_dir);
-    let result = copy_dir_with_backup(&effective_src, game_path, game_path, &mut installed);
+    // Catalog fixes (Voices38, Rockstar) sometimes replace `steam_api64.dll`
+    // with their emulator, which makes Steam stop reporting achievements.
+    // Keep the game's own DLL and stash the fix's copy as `.v38`.
+    let result = copy_dir_with_backup(&effective_src, game_path, game_path, &mut installed, true);
     let _ = std::fs::remove_dir_all(&temp_dir);
     result?;
     Ok(installed)
@@ -2559,7 +2597,7 @@ fn install_tool_from_github(
     std::fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
     let mut installed = Vec::new();
     let effective = flatten_extracted_dir(&extract_dir).unwrap_or(extract_dir);
-    copy_dir_with_backup(&effective, target_dir, target_dir, &mut installed)?;
+    copy_dir_with_backup(&effective, target_dir, target_dir, &mut installed, false)?;
     let _ = std::fs::remove_dir_all(&temp);
     Ok(installed)
 }
@@ -3195,5 +3233,127 @@ mod online_fix_dest_tests {
         touch(&src.path().join("winmm.dll"));
 
         assert_eq!(online_fix_dest(game.path(), src.path()), game.path());
+    }
+}
+
+#[cfg(test)]
+mod steam_api_copy_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "lumaforge_steam_api_{tag}_{}_{}",
+                std::process::id(),
+                stamp
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempTree(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn write(&self, rel: &str, body: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.0.join(rel)).unwrap()
+        }
+
+        fn has(&self, rel: &str) -> bool {
+            self.0.join(rel).exists()
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn copy(src: &TempTree, dst: &TempTree, keep: bool) -> Vec<String> {
+        let mut installed = Vec::new();
+        copy_dir_with_backup(src.path(), dst.path(), dst.path(), &mut installed, keep)
+            .expect("copy");
+        installed
+    }
+
+    #[test]
+    fn keeps_the_original_and_stashes_the_fix_copy() {
+        let game = TempTree::new("keep");
+        game.write("Engine/Binaries/Win64/steam_api64.dll", "original");
+        let fix = TempTree::new("keep_fix");
+        fix.write("Engine/Binaries/Win64/steam_api64.dll", "fix");
+
+        let installed = copy(&fix, &game, true);
+
+        assert_eq!(
+            game.read("Engine/Binaries/Win64/steam_api64.dll"),
+            "original"
+        );
+        assert_eq!(
+            game.read("Engine/Binaries/Win64/steam_api64.dll.v38"),
+            "fix"
+        );
+        assert!(!game.has("Engine/Binaries/Win64/steam_api64.dll.bak"));
+        let expected = PathBuf::from("Engine")
+            .join("Binaries")
+            .join("Win64")
+            .join("steam_api64.dll.v38")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(installed, vec![expected]);
+    }
+
+    #[test]
+    fn installs_the_fix_dll_when_the_game_has_none() {
+        let game = TempTree::new("none");
+        let fix = TempTree::new("none_fix");
+        fix.write("steam_api64.dll", "fix");
+
+        let installed = copy(&fix, &game, true);
+
+        assert_eq!(game.read("steam_api64.dll"), "fix");
+        assert!(!game.has("steam_api64.dll.v38"));
+        assert_eq!(installed, vec!["steam_api64.dll".to_string()]);
+    }
+
+    #[test]
+    fn without_the_flag_the_fix_dll_replaces_and_backs_up() {
+        let game = TempTree::new("replace");
+        game.write("steam_api64.dll", "original");
+        let fix = TempTree::new("replace_fix");
+        fix.write("steam_api64.dll", "fix");
+
+        let installed = copy(&fix, &game, false);
+
+        assert_eq!(game.read("steam_api64.dll"), "fix");
+        assert_eq!(game.read("steam_api64.dll.bak"), "original");
+        assert_eq!(installed, vec!["steam_api64.dll".to_string()]);
+    }
+
+    #[test]
+    fn handles_the_32bit_dll_name() {
+        let game = TempTree::new("x86");
+        game.write("steam_api.dll", "original");
+        let fix = TempTree::new("x86_fix");
+        fix.write("steam_api.dll", "fix");
+
+        copy(&fix, &game, true);
+
+        assert_eq!(game.read("steam_api.dll"), "original");
+        assert_eq!(game.read("steam_api.dll.v38"), "fix");
     }
 }
