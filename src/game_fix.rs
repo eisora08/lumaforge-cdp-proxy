@@ -2138,10 +2138,46 @@ fn download_and_extract_rar(
 
     let mut installed = Vec::new();
     let effective_src = flatten_extracted_dir(&extract_dir).unwrap_or(extract_dir);
-    let result = copy_dir_with_backup(&effective_src, game_path, game_path, &mut installed);
+    let dest = online_fix_dest(game_path, &effective_src);
+    let result = copy_dir_with_backup(&effective_src, &dest, &dest, &mut installed);
     let _ = std::fs::remove_dir_all(&temp_dir);
     result?;
     Ok(installed)
+}
+
+/// Pick where an OnlineFix package must be merged.
+///
+/// Most packages are laid out from the app manifest's install dir, which is
+/// also the exe's folder. Some installs nest the real game one level down (the
+/// ACF points at `common/How to Fish` while the exe lives in `common/How to
+/// Fish/How to Fish`): there the package (`How to Fish_Data/Plugins/...`, the
+/// proxy DLLs) belongs next to the exe. Decide by matching the package's
+/// top-level names against both candidates and only move down when the exe
+/// folder matches strictly better; ties and empty matches stay at the install
+/// root, so flat installs and root-relative packages keep their behaviour.
+fn online_fix_dest(game_path: &Path, src: &Path) -> PathBuf {
+    let exe_dir = find_game_exe_dir(game_path);
+    if exe_dir == game_path {
+        return game_path.to_path_buf();
+    }
+    let mut root_hits = 0usize;
+    let mut exe_hits = 0usize;
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if game_path.join(&name).exists() {
+                root_hits += 1;
+            }
+            if exe_dir.join(&name).exists() {
+                exe_hits += 1;
+            }
+        }
+    }
+    if exe_hits > root_hits {
+        exe_dir
+    } else {
+        game_path.to_path_buf()
+    }
 }
 
 fn unfix_online(game_path: &Path, app_id: u64) -> Result<GameFixResult, String> {
@@ -2155,10 +2191,18 @@ fn unfix_online(game_path: &Path, app_id: u64) -> Result<GameFixResult, String> 
             errors: vec![],
         });
     }
+    let game_exe_dir = find_game_exe_dir(game_path);
     let total = files.len();
     let mut removed = 0;
     for file_name in &files {
-        let file_path = game_path.join(file_name);
+        // Nested installs keep the fix next to the exe; flat installs and
+        // older logs keep it at the install root.
+        let in_exe_dir = game_exe_dir.join(file_name);
+        let file_path = if in_exe_dir.exists() {
+            in_exe_dir
+        } else {
+            game_path.join(file_name)
+        };
         if file_path.exists() {
             let _ = std::fs::remove_file(&file_path);
         }
@@ -3053,5 +3097,103 @@ mod applied_tests {
                 "{key}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod online_fix_dest_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "lumaforge_online_fix_{tag}_{}_{}",
+                std::process::id(),
+                stamp
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempTree(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn flat_install_keeps_the_install_root() {
+        let game = TempTree::new("flat");
+        touch(&game.path().join("Cuphead.exe"));
+        let src = TempTree::new("flat_src");
+        std::fs::create_dir_all(src.path().join("Cuphead_Data")).unwrap();
+        touch(&src.path().join("winmm.dll"));
+
+        assert_eq!(online_fix_dest(game.path(), src.path()), game.path());
+    }
+
+    #[test]
+    fn nested_install_moves_to_the_exe_folder() {
+        // Mirrors How to Fish: the manifest points at the parent folder, the
+        // exe and its `_Data` folder live one level down.
+        let game = TempTree::new("nested");
+        let exe_dir = game.path().join("How to Fish");
+        touch(&exe_dir.join("How to Fish.exe"));
+        std::fs::create_dir_all(exe_dir.join("How to Fish_Data")).unwrap();
+
+        let src = TempTree::new("nested_src");
+        std::fs::create_dir_all(src.path().join("How to Fish_Data")).unwrap();
+        touch(&src.path().join("winmm.dll"));
+
+        assert_eq!(online_fix_dest(game.path(), src.path()), exe_dir);
+    }
+
+    #[test]
+    fn root_relative_package_stays_at_the_install_root() {
+        // Unreal-style: exe nested in `Game/Binaries/Win64`, but the package
+        // ships `Engine/...` from the install root.
+        let game = TempTree::new("root_rel");
+        touch(
+            &game
+                .path()
+                .join("Game")
+                .join("Binaries")
+                .join("Win64")
+                .join("Game-Win64-Shipping.exe"),
+        );
+        std::fs::create_dir_all(game.path().join("Engine")).unwrap();
+
+        let src = TempTree::new("root_rel_src");
+        std::fs::create_dir_all(src.path().join("Engine")).unwrap();
+        touch(&src.path().join("winmm.dll"));
+
+        assert_eq!(online_fix_dest(game.path(), src.path()), game.path());
+    }
+
+    #[test]
+    fn unknown_package_defaults_to_the_install_root() {
+        let game = TempTree::new("unknown");
+        touch(&game.path().join("Nested").join("Nested.exe"));
+        let src = TempTree::new("unknown_src");
+        touch(&src.path().join("winmm.dll"));
+
+        assert_eq!(online_fix_dest(game.path(), src.path()), game.path());
     }
 }
