@@ -631,6 +631,26 @@ fn flatten_extracted_dir(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Flatten an extracted package unless its single top-level folder is a real
+/// folder of the game.
+///
+/// Catalog packages (Voices38, Rockstar) are laid out relative to the install
+/// root. Sonic Colors Ultimate's archive only contains `exec/` at the top level,
+/// and `exec` is a real folder of that game: flattening it dumped the exe, the
+/// DLLs and `steam_settings/` one folder above where the game looks for them.
+/// Treat the folder as a wrapper only when the game has no folder with that
+/// name, so `<GameName>/...` packages still flatten and multi-entry packages
+/// (Black Myth, Demon Slayer) keep working unchanged.
+fn flatten_package_dir(dir: &Path, game_path: &Path) -> Option<PathBuf> {
+    let inner = flatten_extracted_dir(dir)?;
+    let name = inner.file_name()?;
+    if game_path.join(name).is_dir() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EXE discovery (Win64 preference, non-game filter)
 // ---------------------------------------------------------------------------
@@ -2448,7 +2468,7 @@ fn download_and_extract_catalog_archive(
     }
 
     let mut installed = Vec::new();
-    let effective_src = flatten_extracted_dir(&extract_dir).unwrap_or(extract_dir);
+    let effective_src = flatten_package_dir(&extract_dir, game_path).unwrap_or(extract_dir);
     // Catalog fixes (Voices38, Rockstar) sometimes replace `steam_api64.dll`
     // with their emulator, which makes Steam stop reporting achievements.
     // Keep the game's own DLL and stash the fix's copy as `.v38`.
@@ -3355,5 +3375,106 @@ mod steam_api_copy_tests {
 
         assert_eq!(game.read("steam_api.dll"), "original");
         assert_eq!(game.read("steam_api.dll.v38"), "fix");
+    }
+}
+
+#[cfg(test)]
+mod flatten_package_dir_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "lumaforge_flatten_{tag}_{}_{}",
+                std::process::id(),
+                stamp
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempTree(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn dir(&self, rel: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        fn file(&self, rel: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn keeps_a_real_game_folder() {
+        // Sonic Colors Ultimate: the archive only holds `exec/` and the game
+        // also has `exec/` at its root.
+        let game = TempTree::new("sonic_game");
+        game.file("exec/SonicColorsUltimate.exe");
+        game.file("exec/steam_api64.dll");
+        game.dir("content");
+
+        let pkg = TempTree::new("sonic_pkg");
+        pkg.file("exec/SonicColorsUltimate.exe");
+        pkg.file("exec/voices38.dll");
+
+        assert_eq!(flatten_package_dir(pkg.path(), game.path()), None);
+    }
+
+    #[test]
+    fn flattens_a_wrapper_folder_the_game_lacks() {
+        let game = TempTree::new("wrapper_game");
+        game.file("Game.exe");
+        game.dir("Game_Data");
+
+        let pkg = TempTree::new("wrapper_pkg");
+        pkg.file("Some Release Name/Game.exe");
+        pkg.file("Some Release Name/steam_api64.dll");
+
+        let inner = flatten_package_dir(pkg.path(), game.path()).expect("flattened");
+        assert_eq!(
+            inner,
+            pkg.path().join("Some Release Name"),
+        );
+    }
+
+    #[test]
+    fn multi_entry_packages_are_never_flattened() {
+        let game = TempTree::new("multi_game");
+        game.dir("Engine");
+        game.dir("b1");
+
+        let pkg = TempTree::new("multi_pkg");
+        pkg.file("Engine/Binaries/Win64/steam_api64.dll");
+        pkg.file("b1/Content/pak0.pak");
+
+        assert_eq!(flatten_package_dir(pkg.path(), game.path()), None);
+    }
+
+    #[test]
+    fn single_file_packages_are_never_flattened() {
+        let game = TempTree::new("single_game");
+        let pkg = TempTree::new("single_pkg");
+        pkg.file("voices38.ini");
+
+        assert_eq!(flatten_package_dir(pkg.path(), game.path()), None);
     }
 }
