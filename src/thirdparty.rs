@@ -319,8 +319,7 @@ pub(crate) fn now_iso() -> String {
 }
 
 // Howard Hinnant's civil_from_days
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
+fn civil_from_days(z: i64) -> (i64, u32, u32) {    let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
@@ -332,10 +331,39 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Inverse of `civil_from_days` (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parse GitHub's `2026-11-05T21:58:20Z` into Unix seconds. Only the UTC form
+/// GitHub sends is supported; anything else is treated as unknown.
+fn parse_rfc3339_epoch(raw: &str) -> Option<u64> {
+    if raw.len() < 20 || !raw.ends_with('Z') {
+        return None;
+    }
+    let year: i64 = raw.get(0..4)?.parse().ok()?;
+    let month: u32 = raw.get(5..7)?.parse().ok()?;
+    let day: u32 = raw.get(8..10)?.parse().ok()?;
+    let hour: u64 = raw.get(11..13)?.parse().ok()?;
+    let minute: u64 = raw.get(14..16)?.parse().ok()?;
+    let second: u64 = raw.get(17..19)?.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86400 + hour * 3600 + minute * 60 + second)
+}
+
 // ---------------------------------------------------------------------------
 // Jobs
 // ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize)]
 struct ToolJob {
     op: String,
@@ -385,6 +413,11 @@ struct ReleaseInfo {
     zip_url: String,
     zip_name: String,
     archive_ext: String, // zip | 7z | dll
+    /// Release publication time (Unix seconds), used to date an install by mtime.
+    published_at: Option<u64>,
+    /// `sha256:<hex>` of the selected asset, when GitHub exposes it.
+    asset_digest: Option<String>,
+    asset_size: Option<u64>,
 }
 
 struct CachedRelease {
@@ -439,7 +472,7 @@ fn select_asset(
     assets: &[serde_json::Value],
     preferred_asset: Option<&str>,
     preferred_asset_contains: Option<&str>,
-) -> Option<(String, String, String)> {
+) -> Option<(String, String, String, Option<String>, Option<u64>)> {
     let contains_lower = preferred_asset_contains.map(|s| s.to_lowercase());
     let os_is_linux = cfg!(target_os = "linux");
     let lower_name = |a: &serde_json::Value| a["name"].as_str().map(|n| n.to_lowercase());
@@ -521,7 +554,21 @@ fn select_asset(
         "zip"
     }
     .to_string();
-    Some((name, url, archive_ext))
+
+    // GitHub reports digests as `sha256:<hex>`; keep the lowercase hex.
+    let digest = asset["digest"]
+        .as_str()
+        .map(|raw| {
+            raw.rsplit(':')
+                .next()
+                .unwrap_or(raw)
+                .trim()
+                .to_lowercase()
+        })
+        .filter(|d| !d.is_empty());
+    let size = asset["size"].as_u64();
+
+    Some((name, url, archive_ext, digest, size))
 }
 
 fn get_latest_github_release(
@@ -580,18 +627,23 @@ fn get_latest_github_release(
         .as_array()
         .ok_or_else(|| "No assets in release".to_string())?;
 
-    let Some((zip_name, zip_url, archive_ext)) =
+    let Some((zip_name, zip_url, archive_ext, asset_digest, asset_size)) =
         select_asset(assets, preferred_asset, preferred_asset_contains)
     else {
         cache_put(&cache_key, None);
         return Err("No ZIP/7z/DLL asset found in release".to_string());
     };
 
+    let published_at = release["published_at"].as_str().and_then(parse_rfc3339_epoch);
+
     let info = ReleaseInfo {
         tag_name,
         zip_url,
         zip_name,
         archive_ext,
+        published_at,
+        asset_digest,
+        asset_size,
     };
     cache_put(&cache_key, Some(info.clone()));
     Ok(info)
@@ -616,6 +668,180 @@ fn schedule_release_refresh() {
         }
         REFRESHING.store(false, Ordering::SeqCst);
     });
+}
+
+// ---------------------------------------------------------------------------
+// Installed-version detection (disk first, state last)
+// ---------------------------------------------------------------------------
+
+/// Zip entries keep their build timestamp, a few minutes before GitHub
+/// publishes; six hours absorbs build/timezone slack.
+const MTIME_TOLERANCE_SECS: u64 = 6 * 3600;
+
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_files(path: &Path, out: &mut Vec<PathBuf>) {
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                collect_files(&entry.path(), out);
+            }
+        }
+    } else if path.is_file() {
+        out.push(path.to_path_buf());
+    }
+}
+
+fn normalize_version(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('v')
+        .trim_start_matches('V')
+        .to_string()
+}
+
+fn versions_equal(a: &str, b: &str) -> bool {
+    normalize_version(a).eq_ignore_ascii_case(&normalize_version(b))
+}
+
+/// True when `a` is a build ahead of `b` (local/dev copies). Unparsable pairs
+/// never claim to be newer.
+fn is_newer(a: &str, b: &str) -> bool {
+    let split = |v: &str| -> Vec<String> {
+        normalize_version(v)
+            .split(['.', '-', '_'])
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let (left, right) = (split(a), split(b));
+    let numeric = |v: &Vec<String>| v.first().and_then(|s| s.parse::<u64>().ok()).is_some();
+    if !numeric(&left) || !numeric(&right) {
+        return false;
+    }
+    for (l, r) in left.iter().zip(right.iter()) {
+        match (l.parse::<u64>(), r.parse::<u64>()) {
+            (Ok(ln), Ok(rn)) if ln != rn => return ln > rn,
+            (Ok(_), Ok(_)) => {}
+            _ => {
+                let (ll, rl) = (l.to_lowercase(), r.to_lowercase());
+                if ll != rl {
+                    return ll > rl;
+                }
+            }
+        }
+    }
+    left.len() > right.len()
+}
+
+/// Files that were actually deployed: the payload directory and/or the DLLs
+/// copied into the Steam root by hand.
+fn installed_files(def: &ToolDef) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let dir = thirdparty_tool_dir(def.id);
+    if is_dir_populated(&dir) {
+        collect_files(&dir, &mut out);
+    }
+    if def.install_to_steam_root {
+        if let Some(root) = crate::depot_downloader::steam_root() {
+            for name in def.steam_dll_names {
+                let path = root.join(name);
+                if path.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn newest_mtime_epoch(files: &[PathBuf]) -> Option<u64> {
+    files
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok()?.modified().ok())
+        .filter_map(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .max()
+}
+
+fn read_marker_version(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let version = json["version"].as_str()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+/// Establish which release is on disk, without downloading anything:
+/// 1. SHA-256 of the deployed binary vs the release asset digest.
+/// 2. A `version.json` shipped with the payload.
+/// 3. Newest deployed file vs the release publication date.
+///
+/// `None` means "not conclusive", so the caller keeps the stored version.
+fn detect_installed_version(def: &ToolDef, release: &ReleaseInfo) -> Option<String> {
+    let files = installed_files(def);
+    if files.is_empty() {
+        return None;
+    }
+
+    if let (Some(expected), "dll") = (
+        release.asset_digest.as_deref(),
+        release.archive_ext.as_str(),
+    ) {
+        let wanted = release.zip_name.to_lowercase();
+        for path in &files {
+            let name_matches = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase() == wanted)
+                .unwrap_or(false);
+            if !name_matches {
+                continue;
+            }
+            if let Some(size) = release.asset_size {
+                if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) != size {
+                    continue;
+                }
+            }
+            if sha256_file(path).as_deref() == Some(expected) {
+                return Some(release.tag_name.clone());
+            }
+        }
+    }
+
+    for marker in [
+        thirdparty_tool_dir(def.id).join("version.json"),
+        thirdparty_tool_dir(def.id).join("manifest.json"),
+    ] {
+        if let Some(version) = read_marker_version(&marker) {
+            return Some(if release.tag_name.starts_with(['v', 'V']) {
+                format!("v{}", normalize_version(&version))
+            } else {
+                normalize_version(&version)
+            });
+        }
+    }
+
+    if let (Some(published), Some(newest)) =
+        (release.published_at, newest_mtime_epoch(&files))
+    {
+        if newest.saturating_add(MTIME_TOLERANCE_SECS) >= published {
+            return Some(release.tag_name.clone());
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,10 +1618,35 @@ fn handle_list() -> (u16, String) {
 
         let (owner, repo, _pref, _pref_contains) = def.resolve_github();
         let cache_key = format!("{owner}/{repo}");
-        let latest_version = cache_get(&cache_key).and_then(|i| i).map(|r| r.tag_name);
+        let release = cache_get(&cache_key).flatten();
+        let latest_version = release.as_ref().map(|r| r.tag_name.clone());
 
-        // Auto-detect: installed but no state entry
-        if installed && installed_version.is_none() {
+        // Disk wins over state: a manual install/update is still the truth.
+        let detected = if installed {
+            release
+                .as_ref()
+                .and_then(|info| detect_installed_version(def, info))
+        } else {
+            None
+        };
+
+        if let Some(version) = detected {
+            let previous = state.tools.get(def.id);
+            let differs = installed_version.as_deref() != Some(version.as_str());
+            if differs {
+                let entry = ToolStateEntry {
+                    version: version.clone(),
+                    installed_at: previous
+                        .map(|e| e.installed_at.clone())
+                        .unwrap_or_else(now_iso),
+                    enabled: previous.map(|e| e.enabled).unwrap_or(true),
+                };
+                state.tools.insert(def.id.to_string(), entry);
+                state_updated = true;
+            }
+            installed_version = Some(version);
+        } else if installed && installed_version.is_none() {
+            // Auto-detect fallback: installed but no state entry.
             let ver = latest_version.clone().unwrap_or_else(|| "detected".to_string());
             state.tools.insert(
                 def.id.to_string(),
@@ -1411,7 +1662,9 @@ fn handle_list() -> (u16, String) {
 
         let update_available = match (&installed_version, &latest_version) {
             (Some(installed_v), Some(latest_v)) => {
-                installed_v != latest_v && installed_v != "detected"
+                installed_v != "detected"
+                    && !versions_equal(installed_v, latest_v)
+                    && !is_newer(installed_v, latest_v)
             }
             _ => false,
         };
@@ -1471,4 +1724,51 @@ pub fn try_handle_route(method: &str, path: &str, _body: &str) -> Option<(u16, S
         });
     }
     None
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn parses_github_publication_time() {
+        // 2026-11-05T21:58:20Z
+        assert_eq!(parse_rfc3339_epoch("2026-11-05T21:58:20Z"), Some(1793915900));
+        assert_eq!(parse_rfc3339_epoch("2026-11-05T21:58:20+01:00"), None);
+        assert_eq!(parse_rfc3339_epoch("garbage"), None);
+    }
+
+    #[test]
+    fn compares_versions_ignoring_the_tag_prefix() {
+        assert!(versions_equal("v2.6.7.1", "2.6.7.1"));
+        assert!(!versions_equal("v2.6.7.0", "v2.6.7.1"));
+        assert!(is_newer("v1.4.8.9", "v1.4.8.6"));
+        assert!(!is_newer("v2.6.7.0", "v2.6.7.1"));
+        assert!(!is_newer("detected", "v2.7.0"));
+    }
+
+    #[test]
+    fn detects_a_deployed_binary_by_digest() {
+        let dir = std::env::temp_dir().join("lumaforge-proxy-digest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cloud_redirect.dll");
+        std::fs::write(&file, b"abc").unwrap();
+
+        let release = ReleaseInfo {
+            tag_name: "v9.9.9".to_string(),
+            zip_url: String::new(),
+            zip_name: "cloud_redirect.dll".to_string(),
+            archive_ext: "dll".to_string(),
+            published_at: None,
+            asset_digest: Some(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
+            ),
+            asset_size: Some(3),
+        };
+
+        assert_eq!(sha256_file(&file).as_deref(), release.asset_digest.as_deref());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

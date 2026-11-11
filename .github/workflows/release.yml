@@ -37,6 +37,7 @@ jobs:
           Copy-Item bootstrap\wsock32.dll "$stage\"
           Copy-Item target\release\lumaforge.dll "$stage\lumaforge\"
           Copy-Item cef_hook\target\release\lumaforge_cef_hook.dll "$stage\lumaforge\"
+          @{ version = "${{ github.ref_name }}" } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 "$stage\lumaforge\version.json"
           foreach ($f in @('README.md', 'LICENSE', 'LICENSE.md', 'THIRD_PARTY_NOTICES.md')) {
             if (Test-Path $f) { Copy-Item $f "$stage\" }
           }
@@ -79,6 +80,7 @@ jobs:
           mkdir -p stage/ubuntu12_32
           cp target/i686-unknown-linux-gnu/release/liblumaforge.so stage/ubuntu12_32/
           cp hook/target/i686-unknown-linux-gnu/release/libXtst.so stage/ubuntu12_32/libXtst.so.6
+          printf '{"version":"%s"}\n' "${{ github.ref_name }}" > stage/ubuntu12_32/version.json
           (cd stage && zip -r ../lumaforge-proxy-linux-i686.zip .)
 
       - uses: actions/upload-artifact@v7
