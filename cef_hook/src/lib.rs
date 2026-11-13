@@ -1474,13 +1474,19 @@ fn inject_theme_html(
 // ─── CDP helpers ────────────────────────────────────────────────────────────
 
 fn get_browser_ws_url(port: u16) -> Option<String> {
-    // connect_timeout: without it a silently dropped loopback SYN hangs the
-    // thread for the OS connect timeout and the retry lines never get logged.
+    // The webhelper accepts the debug-port socket well before CEF's /json/*
+    // endpoints answer (during startup the HTTP response can lag behind the
+    // connect). Long read timeouts used to burn 3s on the first attempt, so the
+    // hook only attached ~3.5s after the process started — by then Steam had
+    // already painted the unthemed client. Retry fast instead: the loop below
+    // re-tries every 100ms and the endpoint answers in tens of ms once ready.
     let addr = format!("127.0.0.1:{}", port)
         .parse::<std::net::SocketAddr>()
         .ok()?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
     let request = format!(
         "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
         port
@@ -2501,7 +2507,10 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
   function addStyle(doc,css,id){
     var h=headOf(doc);
     if(!css||!h)return;
-    if(id&&h.querySelector('#'+id))return;
+    // Document-wide dedupe: the pre-paint palette is written on
+    // documentElement (no <head> yet) and a head-only query would add a
+    // duplicate of every node when injectDoc() runs at DOMContentLoaded.
+    if(id&&doc.getElementById(id))return;
     var s=doc.createElement('style');
     if(id)s.id=id;
     s.setAttribute('data-lmf',id||'css');
@@ -2741,11 +2750,32 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
       },3000);
     }catch(e){}
   }
+  // Pre-paint palette for the client shell. At document start there is no
+  // <head> yet and the window title/body classes are still unknown, so only
+  // the payload-independent colors are written (no links, no scripts, no
+  // per-window matching). Nodes go on documentElement on purpose: Steam
+  // mirrors SharedJSContext's <head> into popups, and anything there would be
+  // cloned as inert markup. injectDoc() completes the theme at DCL.
+  function applyBaseEarly(doc){
+    try{
+      if(doc.__lumaBaseEarly)return;
+      doc.__lumaBaseEarly=1;
+      var P=window.__lumaCSS||null;
+      var rc=(P&&('rootColors' in P))?P.rootColors:'ROOTCOLORS_PLACEHOLDER';
+      var sl=(P&&('slider' in P))?P.slider:'SLIDER_PLACEHOLDER';
+      var act=(P&&('act' in P))?P.act:THEME_ACTIVE_PLACEHOLDER;
+      setThemeActive(doc,act);
+      addStyle(doc,'ACCENT_PLACEHOLDER','SystemAccentColorInject');
+      addStyle(doc,rc,'RootColors');
+      addStyle(doc,sl,'MillenniumSliderConditions');
+    }catch(e){}
+  }
   function startInjection(){
     waitForHead(function(){
       if(isSharedCtx()) return;
       injectDoc(document);
       watchDoc(document);
+      try{ console.log('[LUMA] theme applied: title="'+(document.title||'?')+'" at='+Math.round(performance.now())+'ms'); }catch(e){}
     });
   }
   // ── SharedJSContext popup patcher (Millennium-style) ──
@@ -2856,13 +2886,22 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
     [100,500,1500].forEach(function(d){ setTimeout(stripLmf,d); });
     return;
   }
-  // Popup documents (about:blank?createflags=... or steamloopback UI windows)
-  // are created blank and then document.write()'d by Steam; their
-  // renderWhenReady gate tracks <link> elements present right after the
-  // write. Adding theme links earlier races that gate (login window never
-  // shows). Wait until #popup_target exists (= write finished, Q ctor ran)
-  // and the document is fully parsed before injecting.
-  var isPopupDoc=(location.protocol==='about:'||location.href.indexOf('createflags')!==-1||location.href.indexOf('steamloopback.host')!==-1);
+  // Popup documents (about:blank?createflags=...) are created blank and then
+  // document.write()'d by Steam; their renderWhenReady gate tracks <link>
+  // elements present right after the write. Adding theme links earlier races
+  // that gate (login window never shows). Wait until #popup_target exists
+  // (= write finished, Q ctor ran) and the document is fully parsed.
+  //
+  // The client shell (steamloopback.host/index.html: the main window and the
+  // headless SharedJSContext) is a normal navigation, not a document.write'd
+  // popup. It used to wait for readyState==='complete' too; after Steam's
+  // 2026-11 startup rewrite that lands after the client is already painted,
+  // so the shell flashed unthemed (no colors, no Fluent icons) for seconds.
+  // There we apply the palette at document start and the full theme at
+  // DOMContentLoaded, which is still after Steam's popup gate but no longer
+  // waits for every image/font.
+  var isPopupDoc=(location.protocol==='about:'||location.href.indexOf('createflags')!==-1);
+  var isShellDoc=(location.href.indexOf('steamloopback.host')!==-1);
   if(isPopupDoc){
     var started=false;
     var go=function(){ if(started)return; started=true; startInjection(); };
@@ -2880,6 +2919,25 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
       }catch(e){}
       var iv=setInterval(function(){ consider(); if(started) clearInterval(iv); },150);
       setTimeout(go,5000);
+    }
+  }else if(isShellDoc){
+    // Palette before first paint (no <head> needed, colors only).
+    applyBaseEarly(document);
+    var shellDone=false;
+    var finishShell=function(){
+      if(shellDone)return;
+      // SharedJSContext only reveals itself via <title>; until then we do not
+      // touch it beyond the palette written above.
+      if(isSharedCtx()){ shellDone=true; stripLmf(); return; }
+      if(document.readyState==='loading')return; // wait for DCL
+      shellDone=true;
+      startInjection();
+    };
+    finishShell();
+    if(!shellDone){
+      document.addEventListener('DOMContentLoaded',finishShell);
+      window.addEventListener('load',finishShell);
+      var siv=setInterval(function(){ finishShell(); if(shellDone)clearInterval(siv); },100);
     }
   }else{
     startInjection();
@@ -4644,6 +4702,7 @@ fn handle_cdp_connection(direct: Option<u16>) {
     const RELAY_PORT: u16 = 21778;
     let mut retry_count = 0u32;
     let mut using_relay = false;
+    let connect_started = Instant::now();
     loop {
         let browser_ws_url = match direct.and_then(get_browser_ws_url) {
             Some(url) => {
@@ -4686,7 +4745,10 @@ fn handle_cdp_connection(direct: Option<u16>) {
                 continue;
             }
         };
-        log_to_temp("[cef_hook] Connected to CDP browser endpoint");
+        log_to_temp(&format!(
+            "[cef_hook] Connected to CDP browser endpoint ({}ms after start)",
+            connect_started.elapsed().as_millis()
+        ));
 
         // Never block the dispatch loop on a full socket: a stalled relay must
         // not freeze CDP handling (that froze Fetch pauses for a whole 30s
