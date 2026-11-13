@@ -2599,6 +2599,63 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
       return ''+((P.act)?1:0)+':'+((P.rootColors||'').length)+':'+((P.webkit||'').length)+':'+((P.slider||'').length)+':'+((P.files&&P.files.length)||0)+':'+((P.patches&&P.patches.length)||0)+':'+((P.conds&&P.conds.length)||0)+':'+((P.cjs&&P.cjs.length)||0);
     }catch(e){ return 'x'; }
   }
+  // Plugin <script> injection with liveness tracking.
+  //
+  // Steam mirrors the SharedJSContext <head> into the popup documents it
+  // creates, so a popup can end up with an INERT copy of our plugin tag
+  // (cloned markup never runs its script). The old getElementById() dedupe
+  // then refused to add a live tag and the plugin stayed dead for the whole
+  // session — after the 2026-11 client update the main library window showed
+  // no sidebar/gear at all while store pages kept working. Only tags WE
+  // created carry __lumaLive; mirrored clones are dropped and replaced, and
+  // a tag that never fires load is retried with a cache-busting query.
+  function injectPluginScript(doc,sid,url,tries){
+    tries=tries||0;
+    var h=headOf(doc);
+    if(!h)return;
+    var live=null;
+    var list=doc.querySelectorAll('script[id="'+sid+'"]');
+    for(var i=0;i<list.length;i++){
+      var el=list[i];
+      if(el.__lumaLive){ if(!live)live=el; }
+      else{ try{ el.parentNode&&el.parentNode.removeChild(el); }catch(e){} }
+    }
+    // A live tag that loaded (or is still retrying) wins: nothing to do.
+    if(live&&(live.__lumaLoaded||tries>=3))return;
+    if(live){ try{ live.parentNode&&live.parentNode.removeChild(live); }catch(e){} }
+    var s=doc.createElement('script');
+    s.id=sid;
+    s.setAttribute('data-lmf',sid);
+    s.__lumaLive=1;
+    s.onload=function(){ try{ s.__lumaLoaded=1; }catch(e){} };
+    s.onerror=function(){
+      try{ s.parentNode&&s.parentNode.removeChild(s); }catch(e){}
+      setTimeout(function(){ try{ injectPluginScript(doc,sid,url,tries+1); }catch(e){} },700);
+    };
+    s.src=url+(tries?('?_luma_r='+(Date.now())):'');
+    h.appendChild(s);
+    // Backstop: a dropped load (or a resumed inert clone) leaves the element
+    // without a load event. Re-append once the document settles.
+    setTimeout(function(){
+      try{
+        if(!s.__lumaLoaded&&s.isConnected) injectPluginScript(doc,sid,url,tries+1);
+      }catch(e){}
+    },3000+tries*1500);
+  }
+  function recheckPlugins(doc){
+    try{
+      var href=''; try{ href=(doc.defaultView||window).location.href||''; }catch(e){}
+      if(!href){ try{ href=location.href||''; }catch(e2){} }
+      for(var i=0;i<_lumaPlugins.length;i++){
+        var pl=_lumaPlugins[i];
+        if(!pl||!pl.u||!pl.t||!pl.t.length)continue;
+        var m=false;
+        for(var z=0;z<pl.t.length;z++){ if(href.indexOf(pl.t[z])>-1){ m=true; break; } }
+        if(!m)continue;
+        injectPluginScript(doc,'LumaPlugin_'+pl.i,'https://lumaforge.local/plugins/'+pl.u,0);
+      }
+    }catch(e){}
+  }
   function injectDoc(doc){
     var P=window.__lumaCSS||null;
     // RootColors/slider come from the live payload when available; the baked
@@ -2630,15 +2687,19 @@ fn build_theme_js(theme_state: &ThemeState) -> String {
         for(var _z=0;_z<pl.t.length;_z++){ if(_href.indexOf(pl.t[_z])>-1){m=true;break;} }
         if(!m)return;
         var sid='LumaPlugin_'+pl.i;
-        if(doc.getElementById(sid))return;
-        var h=headOf(doc);
-        if(!h)return;
-        var s=doc.createElement('script');
-        s.id=sid;
-        s.src='https://lumaforge.local/plugins/'+pl.u;
-        s.setAttribute('data-lmf',sid);
-        h.appendChild(s);
+        injectPluginScript(doc,sid,'https://lumaforge.local/plugins/'+pl.u,0);
       })(_lumaPlugins[_pi]);}
+    }catch(e){}
+    // Late liveness sweeps: the popup's head can keep getting re-mirrored
+    // after our first pass, and the document may swap under us. Re-checking
+    // is cheap (a live tag returns immediately).
+    try{
+      if(!doc.__lumaPluginSweeps){
+        doc.__lumaPluginSweeps=1;
+        [2000,6000,15000].forEach(function(ms){
+          setTimeout(function(){ try{ recheckPlugins(doc); }catch(e){} },ms);
+        });
+      }
     }catch(e){}
   }
   function watchDoc(doc){
